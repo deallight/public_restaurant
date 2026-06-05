@@ -80,6 +80,35 @@ def _category_from_naver(value: str) -> str:
     return category_from_text(value)
 
 
+def _clean_place_query(value: str) -> str:
+    text = re.sub(r"\([^)]*\)", " ", value or "")
+    text = re.sub(r"(주식회사|유한회사|㈜|\(주\))", " ", text)
+    text = re.sub(r"\s*외\s*\d+.*$", " ", text)
+    text = re.sub(r"\s*(일원|등)\s*$", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _search_queries(row: NormalizedExpenseRow) -> list[str]:
+    raw_place = (row.place_name or "").strip()
+    cleaned_place = _clean_place_query(raw_place)
+    place_values = [value for value in [cleaned_place, raw_place] if value]
+    queries: list[str] = []
+    for place in place_values:
+        if row.address:
+            queries.extend([f"{place} {row.address}", f"{place} 부산"])
+        else:
+            queries.append(f"{place} 부산")
+        queries.append(place)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for query in queries:
+        key = normalize_text(query)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(query)
+    return deduped
+
+
 @dataclass(frozen=True)
 class NaverSearchLocalClient:
     client_id: str
@@ -89,13 +118,10 @@ class NaverSearchLocalClient:
     def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
         if not self.client_id or not self.client_secret:
             raise IntegrationError("Naver Search credentials are missing")
-        queries = [f"{row.place_name} {row.address}", f"{row.place_name} 부산", row.place_name]
-        if not row.address:
-            queries = [f"{row.place_name} 부산", row.place_name]
         seen: set[str] = set()
         places: list[PlaceCandidate] = []
-        for query in queries:
-            params = urlencode({"query": query, "display": 5, "start": 1, "sort": "random"})
+        for query in _search_queries(row):
+            params = urlencode({"query": query, "display": 10, "start": 1, "sort": "random"})
             payload = _get_json(
                 f"{self.endpoint}?{params}",
                 headers={

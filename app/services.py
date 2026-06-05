@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .alias_memory import remember_aliases
 from .database import Database
 from .utils import normalize_text, safe_json_dumps, safe_json_loads, stable_hash, utc_now
 
@@ -513,7 +514,12 @@ class RestaurantService:
                     """
                     SELECT *
                     FROM batch_jobs
-                    WHERE job_name IN ('daily_busan_city_expense_v1', 'verify_pending')
+                    WHERE job_name IN (
+                      'daily_busan_city_expense_v1',
+                      'verify_pending',
+                      'alias_memory_recheck',
+                      'purpose_rule_recheck'
+                    )
                     ORDER BY id DESC
                     LIMIT 5
                     """
@@ -733,6 +739,11 @@ class RestaurantService:
                 f"manual_{status}",
             ),
         )
+        restaurant = conn.execute("SELECT canonical_name FROM restaurants WHERE id = ?", (restaurant_id,)).fetchone()
+        alias_texts = [candidate["original_place_name"]]
+        if restaurant is not None:
+            alias_texts.append(restaurant["canonical_name"])
+        remember_aliases(conn, restaurant_id, alias_texts, source=f"manual_{status}", confidence=1.0)
         conn.execute(
             """
             UPDATE restaurant_candidates

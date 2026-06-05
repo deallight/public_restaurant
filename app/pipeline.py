@@ -18,7 +18,9 @@ from .agents import (
     PlaceCandidate,
     VerificationDecision,
     VerifierAgent,
+    non_food_purpose_decision,
 )
+from .alias_memory import alias_memory_decision, remember_aliases
 from .config import BASE_DIR, Settings
 from .database import Database
 from .integrations import (
@@ -556,7 +558,11 @@ class DailyPipeline:
                             )
                             if self._candidate_is_resolved(conn, candidate_id):
                                 continue
-                            decision = verifier.verify(normalized)
+                            decision = (
+                                non_food_purpose_decision(normalized)
+                                or alias_memory_decision(conn, normalized)
+                                or verifier.verify(normalized)
+                            )
                             self._persist_decision(conn, source, expense_id, candidate_id, decision)
                             summary[decision.decision] += 1
                         except Exception as exc:  # pragma: no cover - defensive DLQ guard
@@ -623,7 +629,11 @@ class DailyPipeline:
                             normalized_place_name=row["normalized_place_name"] or normalize_text(row["original_place_name"]),
                             normalized_address=row["normalized_address"] or normalize_address(row["original_address"]),
                         )
-                        decision = verifier.verify(normalized)
+                        decision = (
+                            non_food_purpose_decision(normalized)
+                            or alias_memory_decision(conn, normalized)
+                            or verifier.verify(normalized)
+                        )
                         self._persist_decision(
                             conn,
                             {"region_id": row["region_id"]},
@@ -838,6 +848,13 @@ class DailyPipeline:
             restaurant_id = self._upsert_restaurant(
                 conn, source["region_id"], verification_id, decision.selected_candidate, decision
             )
+            remember_aliases(
+                conn,
+                restaurant_id,
+                [before["original_place_name"], decision.selected_candidate.name],
+                source=f"auto_{decision.approved_by}",
+                confidence=decision.confidence,
+            )
             self._link_expense(conn, restaurant_id, expense_id, candidate_id)
             conn.execute(
                 """
@@ -851,7 +868,7 @@ class DailyPipeline:
                 """,
                 (decision.category, utc_now(), candidate_id),
             )
-            self._resolve_manual_task(conn, candidate_id, "auto_approved")
+            self._resolve_manual_task(conn, candidate_id, "auto_approved", ",".join(decision.reason_codes))
         elif decision.decision == "rejected":
             conn.execute(
                 """
@@ -866,7 +883,7 @@ class DailyPipeline:
                 """,
                 (decision.category, ",".join(decision.reason_codes), utc_now(), candidate_id),
             )
-            self._resolve_manual_task(conn, candidate_id, "auto_rejected")
+            self._resolve_manual_task(conn, candidate_id, "auto_rejected", ",".join(decision.reason_codes))
         else:
             conn.execute(
                 """
@@ -883,8 +900,14 @@ class DailyPipeline:
             )
             conn.execute(
                 """
-                INSERT OR IGNORE INTO manual_review_tasks (candidate_id, status, reason)
+                INSERT INTO manual_review_tasks (candidate_id, status, reason)
                 VALUES (?, 'pending', ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                  status = 'pending',
+                  reason = excluded.reason,
+                  reviewer_note = NULL,
+                  reviewed_by = NULL,
+                  reviewed_at = NULL
                 """,
                 (candidate_id, ",".join(decision.reason_codes) or "needs_review"),
             )
@@ -912,14 +935,23 @@ class DailyPipeline:
             ),
         )
 
-    def _resolve_manual_task(self, conn: sqlite3.Connection, candidate_id: int, status: str) -> None:
+    def _resolve_manual_task(
+        self,
+        conn: sqlite3.Connection,
+        candidate_id: int,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
         conn.execute(
             """
             UPDATE manual_review_tasks
-            SET status = ?, reviewed_by = 'pipeline', reviewed_at = ?
+            SET status = ?,
+                reason = COALESCE(?, reason),
+                reviewed_by = 'pipeline',
+                reviewed_at = ?
             WHERE candidate_id = ? AND status = 'pending'
             """,
-            (status, utc_now(), candidate_id),
+            (status, reason, utc_now(), candidate_id),
         )
 
     def _upsert_verification(
@@ -932,6 +964,18 @@ class DailyPipeline:
         candidate = decision.selected_candidate
         if candidate is None:
             raise RuntimeError("verification evidence requires selected candidate")
+        name_similarity = float(
+            decision.evidence.get("name_similarity", 0.0 if verification_status != "success" else 1.0)
+        )
+        address_similarity = float(
+            decision.evidence.get("address_similarity", 0.0 if verification_status != "success" else 1.0)
+        )
+        is_success = verification_status == "success"
+        is_name_match = 1 if is_success or name_similarity >= 0.78 else 0
+        is_address_match = 1 if is_success or address_similarity >= 0.72 else 0
+        is_category_valid = 1 if is_success and candidate.category in {"restaurant", "cafe", "bar"} else 0
+        verification_reason = ",".join(decision.reason_codes)
+        raw_response_json = safe_json_dumps(decision.evidence)
         existing = conn.execute(
             """
             SELECT id FROM place_verifications
@@ -940,12 +984,50 @@ class DailyPipeline:
             (candidate_id, candidate.provider_place_id),
         ).fetchone()
         if existing:
+            conn.execute(
+                """
+                UPDATE place_verifications
+                SET provider_place_name = ?,
+                    provider_category = ?,
+                    provider_address = ?,
+                    provider_road_address = ?,
+                    normalized_provider_name = ?,
+                    normalized_provider_address = ?,
+                    longitude = ?,
+                    latitude = ?,
+                    name_similarity = ?,
+                    address_similarity = ?,
+                    is_name_match = ?,
+                    is_address_match = ?,
+                    is_coordinate_valid = 1,
+                    is_category_valid = ?,
+                    verification_status = ?,
+                    verification_reason = ?,
+                    raw_response_json = ?,
+                    verified_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    candidate.name,
+                    candidate.category,
+                    candidate.address,
+                    candidate.road_address,
+                    normalize_text(candidate.name),
+                    normalize_address(candidate.address),
+                    candidate.longitude,
+                    candidate.latitude,
+                    name_similarity,
+                    address_similarity,
+                    is_name_match,
+                    is_address_match,
+                    is_category_valid,
+                    verification_status,
+                    verification_reason,
+                    raw_response_json,
+                    int(existing["id"]),
+                ),
+            )
             return int(existing["id"])
-        name_similarity = float(decision.evidence.get("name_similarity", 0.0 if verification_status != "success" else 1.0))
-        address_similarity = float(
-            decision.evidence.get("address_similarity", 0.0 if verification_status != "success" else 1.0)
-        )
-        is_success = verification_status == "success"
         cur = conn.execute(
             """
             INSERT INTO place_verifications
@@ -969,12 +1051,12 @@ class DailyPipeline:
                 candidate.latitude,
                 name_similarity,
                 address_similarity,
-                1 if is_success or name_similarity >= 0.78 else 0,
-                1 if is_success or address_similarity >= 0.72 else 0,
-                1 if is_success and candidate.category in {"restaurant", "cafe", "bar"} else 0,
+                is_name_match,
+                is_address_match,
+                is_category_valid,
                 verification_status,
-                ",".join(decision.reason_codes),
-                safe_json_dumps(decision.evidence),
+                verification_reason,
+                raw_response_json,
             ),
         )
         return int(cur.lastrowid)
