@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+var/
+.env
+.env.*
+!.env.example
