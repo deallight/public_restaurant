@@ -12,12 +12,14 @@ from app.agents import (
     PermitSnapshot,
     PlaceCandidate,
     VerifierAgent,
+    alias_keys_for_place,
     non_food_purpose_reason,
 )
 from app.database import Database
 from app.integrations import DataGoKrPermitClient, _search_queries
-from app.pipeline import CachedPermitClient, DailyPipeline, RawExpenseRow, SourceDocument
+from app.pipeline import CachedPermitClient, DailyPipeline, RawExpenseRow, SourceDocument, existing_provider_evidence_decision
 from app.source_catalog import iter_source_catalog
+from app.utils import normalized_address_similarity, strip_address_detail, structured_address_match
 
 
 class PipelineTests(unittest.TestCase):
@@ -210,6 +212,31 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("cond%5BROAD_NM_ADDR%3A%3ALIKE%5D=", requested_urls[0])
         self.assertNotIn("OPN_ATMY_GRP_CD", requested_urls[0])
 
+    def test_structured_address_matching_ignores_floor_and_room_details(self) -> None:
+        self.assertEqual(strip_address_detail("부산광역시 연제구 토곡로 7 1층"), "부산광역시 연제구 토곡로 7")
+        self.assertTrue(
+            structured_address_match(
+                "부산광역시 연제구 토곡로 7",
+                "부산광역시 연제구 토곡로 7 201호",
+            )
+        )
+        self.assertTrue(
+            structured_address_match(
+                "부산광역시 연제구 연산동 490-30 1층",
+                "부산광역시 연제구 연산동 490-30",
+            )
+        )
+        self.assertFalse(
+            structured_address_match(
+                "부산광역시 연제구 토곡로 7",
+                "부산광역시 연제구 토곡로 9",
+            )
+        )
+        self.assertEqual(
+            normalized_address_similarity("부산광역시 연제구 토곡로 7 1층", "부산광역시 연제구 토곡로 7"),
+            1.0,
+        )
+
     def test_verify_pending_can_auto_approve_addressless_live_candidate(self) -> None:
         DailyPipeline(
             self.db,
@@ -296,6 +323,27 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(round(verification["name_similarity"], 2), 1.0)
         self.assertEqual(round(verification["address_similarity"], 2), 0.0)
         self.assertEqual(pending_count, 1)
+
+    def test_manual_review_stores_multiple_naver_candidates(self) -> None:
+        result = DailyPipeline(
+            self.db,
+            adapter=GenericAddresslessAdapter(),
+            verifier=VerifierAgent(MultiCandidateNaverClient(), EmptyPermitClient()),
+        ).run()
+
+        self.assertEqual(result["summary"]["approved"], 0)
+        self.assertEqual(result["summary"]["needs_review"], 1)
+        with self.db.session() as conn:
+            verifications = conn.execute(
+                """
+                SELECT provider_place_name, verification_status
+                FROM place_verifications
+                ORDER BY name_similarity DESC, id ASC
+                """
+            ).fetchall()
+
+        self.assertEqual([row["provider_place_name"] for row in verifications], ["씨드", "씨드커피"])
+        self.assertEqual({row["verification_status"] for row in verifications}, {"ambiguous"})
 
     def test_reverification_updates_ambiguous_evidence_to_success_and_visible_map(self) -> None:
         DailyPipeline(
@@ -405,6 +453,143 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rejected["rejection_reason"], "NON_FOOD_PURPOSE_GIFT")
         self.assertEqual(pending_count, 0)
 
+    def test_verify_pending_auto_approves_pending_task_with_existing_success_evidence(self) -> None:
+        DailyPipeline(self.db).run()
+        with self.db.session() as conn:
+            conn.execute("UPDATE manual_review_tasks SET status = 'test_ignored'")
+            candidate = conn.execute(
+                """
+                SELECT id
+                FROM restaurant_candidates
+                WHERE original_place_name = '부산돼지국밥 시청점'
+                """
+            ).fetchone()
+            conn.execute(
+                """
+                UPDATE restaurant_candidates
+                SET status = 'needs_review',
+                    verification_status = 'ambiguous',
+                    manual_review_status = 'pending'
+                WHERE id = ?
+                """,
+                (candidate["id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO manual_review_tasks (candidate_id, status, reason)
+                VALUES (?, 'pending', 'reset_from_test_approval')
+                ON CONFLICT(candidate_id) DO UPDATE SET status = 'pending', reason = excluded.reason
+                """,
+                (candidate["id"],),
+            )
+
+        result = DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient()),
+        ).verify_pending(limit=10)
+
+        self.assertEqual(result["summary"]["approved"], 1)
+        self.assertEqual(result["summary"]["dlq"], 0)
+        with self.db.session() as conn:
+            task = conn.execute(
+                "SELECT status, reason FROM manual_review_tasks WHERE candidate_id = ?",
+                (candidate["id"],),
+            ).fetchone()
+            latest_reason = conn.execute(
+                """
+                SELECT reason_codes_json
+                FROM decision_audit_logs
+                WHERE target_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (candidate["id"],),
+            ).fetchone()["reason_codes_json"]
+
+        self.assertEqual(task["status"], "auto_approved")
+        self.assertIn("EXISTING_SUCCESS_VERIFICATION", task["reason"])
+        self.assertIn("EXISTING_SUCCESS_VERIFICATION", latest_reason)
+
+    def test_existing_provider_evidence_does_not_override_not_active_permit_reason(self) -> None:
+        with self.db.session() as conn:
+            doc = conn.execute(
+                """
+                INSERT INTO raw_documents
+                  (institution_id, source_url, source_title, published_at, collected_at, content_hash)
+                VALUES (1, 'fixture://not-active-provider', '인허가 비활성 후보', '2026-06-05',
+                        CURRENT_TIMESTAMP, 'not-active-provider')
+                """
+            )
+            expense = conn.execute(
+                """
+                INSERT INTO expense_records
+                  (raw_document_id, institution_id, region_id, source_row_number, department_name,
+                   used_date, place_name, purpose, amount, participants, payment_method,
+                   original_row_json, normalized_place_name, normalized_purpose,
+                   is_food_candidate, candidate_reason, row_hash)
+                VALUES (?, 1, 1, 1, '총무과', '2026-06-05', '제주복국', '업무협의 간담회',
+                        100000, '4명', 'card', '{}', '제주복국', '업무협의 간담회', 1,
+                        'not_active_provider_test', 'not-active-provider-row')
+                """,
+                (doc.lastrowid,),
+            )
+            candidate = conn.execute(
+                """
+                INSERT INTO restaurant_candidates
+                  (expense_record_id, institution_id, region_id, original_place_name,
+                   normalized_place_name, original_address, normalized_address, used_date,
+                   amount, place_major_category, status, verification_status,
+                   manual_review_status, extraction_reason)
+                VALUES (?, 1, 1, '제주복국', '제주복국', '', '', '2026-06-05', 100000,
+                        'restaurant', 'needs_review', 'ambiguous', 'pending',
+                        'not_active_provider_test')
+                """,
+                (expense.lastrowid,),
+            )
+            conn.execute(
+                """
+                INSERT INTO manual_review_tasks (candidate_id, status, reason)
+                VALUES (?, 'pending', 'PERMIT_NOT_ACTIVE_ADDRESSLESS')
+                """,
+                (candidate.lastrowid,),
+            )
+            conn.execute(
+                """
+                INSERT INTO place_verifications
+                  (candidate_id, provider, provider_place_id, provider_place_name,
+                   provider_category, provider_address, provider_road_address,
+                   normalized_provider_name, normalized_provider_address,
+                   longitude, latitude, name_similarity, address_similarity,
+                   is_name_match, is_address_match, is_coordinate_valid,
+                   is_category_valid, verification_status, verification_reason,
+                   raw_response_json)
+                VALUES (?, 'naver', 'naver-jeju-001', '제주복국',
+                        'restaurant', '부산광역시 연제구 연산동 1',
+                        '부산광역시 연제구 중앙대로 1', '제주복국',
+                        '부산광역시 연제구 연산동 1', 129.075, 35.18,
+                        1.0, 0.0, 1, 0, 1, 1, 'ambiguous',
+                        'PERMIT_NOT_ACTIVE_ADDRESSLESS', '{}')
+                """,
+                (candidate.lastrowid,),
+            )
+            decision = existing_provider_evidence_decision(
+                conn,
+                int(candidate.lastrowid),
+                NormalizedExpenseRow(
+                    row_number=1,
+                    department_name="총무과",
+                    used_date="2026-06-05",
+                    place_name="제주복국",
+                    address="",
+                    purpose="업무협의 간담회",
+                    amount=100000,
+                    normalized_place_name="제주복국",
+                    normalized_address="",
+                ),
+            )
+
+        self.assertIsNone(decision)
+
     def test_branch_hint_match_can_auto_approve_permit_and_naver_food_candidate(self) -> None:
         verifier = VerifierAgent(BranchNaverClient(), BranchPermitClient())
 
@@ -490,6 +675,411 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("PERMIT_NOT_ACTIVE_DIFFERENT_ADDRESS_IGNORED", decision.reason_codes)
         self.assertEqual(decision.selected_candidate.name, "토곡정")
 
+    def test_cleaned_address_match_can_auto_approve_food_candidate(self) -> None:
+        verifier = VerifierAgent(FloorAddressNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="토곡정",
+                address="부산광역시 연제구 토곡로 7 201호",
+                purpose="업무협의 간담회",
+                amount=100000,
+                normalized_place_name="토곡정",
+                normalized_address="부산광역시 연제구 토곡로 7 201호",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_NORMALIZED_ADDRESS_MATCH", decision.reason_codes)
+        self.assertEqual(decision.evidence["address_similarity"], 1.0)
+
+    def test_cleaned_address_mismatch_stays_manual_review(self) -> None:
+        verifier = VerifierAgent(WrongAddressNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="토곡정",
+                address="부산광역시 연제구 토곡로 7 1층",
+                purpose="업무협의 간담회",
+                amount=100000,
+                normalized_place_name="토곡정",
+                normalized_address="부산광역시 연제구 토곡로 7 1층",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+
+    def test_cleaned_address_match_keeps_other_category_for_food_context_in_review(self) -> None:
+        verifier = VerifierAgent(OtherAddressNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="토곡정",
+                address="부산광역시 연제구 토곡로 7 1층",
+                purpose="업무협의 간담회",
+                amount=100000,
+                normalized_place_name="토곡정",
+                normalized_address="부산광역시 연제구 토곡로 7 1층",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+
+    def test_cleaned_address_match_does_not_override_closed_permit(self) -> None:
+        verifier = VerifierAgent(FloorAddressNaverClient(), ClosedDifferentAddressPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="토곡정",
+                address="부산광역시 연제구 토곡로 7 1층",
+                purpose="업무협의 간담회",
+                amount=100000,
+                normalized_place_name="토곡정",
+                normalized_address="부산광역시 연제구 토곡로 7 1층",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertIn("PERMIT_NOT_ACTIVE_FOOD", decision.reason_codes)
+
+    def test_other_category_without_food_context_is_auto_rejected(self) -> None:
+        verifier = VerifierAgent(OtherNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="동자상회",
+                address="",
+                purpose="보훈업무 추진협조를 위한 보훈복지회관 등 방문계획",
+                amount=1200000,
+                normalized_place_name="동자상회",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["NAVER_OTHER_CATEGORY"])
+
+    def test_brand_and_companion_suffix_can_auto_approve_addressless_candidate(self) -> None:
+        verifier = VerifierAgent(EdiyaNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="이디야 김해국제공항국제선점외 2",
+                address="",
+                purpose="공무국외출장 의전 관련 주요기관 관계자 간담회",
+                amount=125300,
+                normalized_place_name="이디야 김해국제공항국제선점외 2",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("PERMIT_MISSING_ALLOWED", decision.reason_codes)
+        self.assertGreaterEqual(decision.evidence["name_similarity"], 0.9)
+
+    def test_short_base_name_with_branch_suffix_can_auto_approve_addressless_candidate(self) -> None:
+        verifier = VerifierAgent(BaseSuffixNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="취원",
+                address="",
+                purpose="국내외 주요인사 의전 관련 논의를 위한 간담회",
+                amount=480000,
+                normalized_place_name="취원",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_BASE_NAME_ADDRESSLESS", decision.reason_codes)
+
+    def test_addressless_fuzzy_food_name_can_auto_approve_without_permit(self) -> None:
+        verifier = VerifierAgent(YeyijeNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="예이제",
+                address="",
+                purpose="국제 컨퍼런스 개최에 따른 간담회 개최",
+                amount=798000,
+                normalized_place_name="예이제",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_FUZZY_ADDRESSLESS", decision.reason_codes)
+        self.assertGreaterEqual(decision.evidence["name_similarity"], 0.7)
+
+    def test_addressless_fuzzy_70_percent_food_name_can_auto_approve_without_permit(self) -> None:
+        verifier = VerifierAgent(DongjingaNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="동진가셀프식당",
+                address="",
+                purpose="업무협의 간담회",
+                amount=95000,
+                normalized_place_name="동진가셀프식당",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_FUZZY_ADDRESSLESS", decision.reason_codes)
+        self.assertGreaterEqual(decision.evidence["name_similarity"], 0.7)
+
+    def test_addressless_fuzzy_name_does_not_auto_approve_branch_conflict(self) -> None:
+        verifier = VerifierAgent(BranchConflictNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="대박통(명륜점)",
+                address="",
+                purpose="업무협의 간담회",
+                amount=110000,
+                normalized_place_name="대박통",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertLess(decision.evidence["name_similarity"], 0.7)
+
+    def test_addressless_fuzzy_name_does_not_auto_approve_non_busan_candidate(self) -> None:
+        verifier = VerifierAgent(NonBusanFuzzyNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="강남면옥 정동점",
+                address="",
+                purpose="업무협의 간담회",
+                amount=120000,
+                normalized_place_name="강남면옥 정동점",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+
+    def test_addressless_fuzzy_name_does_not_override_closed_same_address_permit(self) -> None:
+        verifier = VerifierAgent(YeyijeNaverClient(), ClosedYeyijePermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="예이제",
+                address="",
+                purpose="국제 컨퍼런스 개최에 따른 간담회 개최",
+                amount=798000,
+                normalized_place_name="예이제",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["PERMIT_NOT_ACTIVE_ADDRESSLESS"])
+
+    def test_famous_franchise_addressless_without_branch_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="스타벅스 코리아 외 2",
+                address="",
+                purpose="업무협의 간담회",
+                amount=120000,
+                normalized_place_name="스타벅스 코리아 외 2",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
+        self.assertEqual(decision.category, "cafe")
+
+    def test_vips_addressless_without_branch_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="빕스",
+                address="",
+                purpose="업무협의 간담회",
+                amount=180000,
+                normalized_place_name="빕스",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
+        self.assertEqual(decision.category, "restaurant")
+
+    def test_famous_franchise_with_branch_continues_and_can_approve(self) -> None:
+        verifier = VerifierAgent(StarbucksNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="스타벅스 경성대점",
+                address="",
+                purpose="업무협의 간담회",
+                amount=90000,
+                normalized_place_name="스타벅스 경성대점",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("PERMIT_MISSING_ALLOWED", decision.reason_codes)
+        self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
+
+    def test_famous_franchise_without_branch_can_approve_by_address(self) -> None:
+        verifier = VerifierAgent(StarbucksNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="스타벅스 코리아",
+                address="부산광역시 남구 수영로 312",
+                purpose="업무협의 간담회",
+                amount=90000,
+                normalized_place_name="스타벅스 코리아",
+                normalized_address="부산광역시 남구 수영로 312",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_FRANCHISE_ADDRESS_MATCH", decision.reason_codes)
+        self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
+
+    def test_manual_feedback_legal_entity_without_store_info_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="(주)신화케이푸드",
+                address="",
+                purpose="중앙부처 관계자와의 간담회 개최",
+                amount=120000,
+                normalized_place_name="(주)신화케이푸드",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_LEGAL_ENTITY_INSUFFICIENT_INFO"])
+
+    def test_payment_processor_place_name_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="부산동백전_KICC_C외 3",
+                address="",
+                purpose="행사 관계자 간담회",
+                amount=45000,
+                normalized_place_name="부산동백전_KICC_C외 3",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["PAYMENT_PROCESSOR_OR_CARD_PLACE_NAME"])
+
+    def test_manual_feedback_closed_place_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="포도나무면가",
+                address="",
+                purpose="민관합동TF팀 간담회",
+                amount=100000,
+                normalized_place_name="포도나무면가",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_CLOSED_OR_NOT_OPERATING"])
+
+    def test_unknown_place_address_mismatch_auto_rejects(self) -> None:
+        verifier = VerifierAgent(UnknownMismatchNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="미상식당",
+                address="부산광역시 부산진구 중앙대로 730",
+                purpose="교통 현안 간담",
+                amount=51000,
+                normalized_place_name="미상식당",
+                normalized_address="부산광역시 부산진구 중앙대로 730",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["UNKNOWN_PLACE_ADDRESS_MISMATCH"])
+
     def test_non_food_purpose_rules_keep_snack_purchases_reviewable(self) -> None:
         self.assertEqual(non_food_purpose_reason("시정홍보 방문기념품 구입"), "NON_FOOD_PURPOSE_GIFT")
         self.assertEqual(non_food_purpose_reason("사무용품 구입"), "NON_FOOD_PURPOSE_OFFICE_SUPPLY")
@@ -510,6 +1100,85 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(_search_queries(row)[:2], ["19버거테이블 부산", "19버거테이블"])
+
+    def test_naver_search_queries_preserve_parenthetical_branch_hint(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="감사담당관",
+            used_date="2026-06-05",
+            place_name="대박통(명륜점)",
+            address="",
+            purpose="간담",
+            amount=70000,
+            normalized_place_name="대박통(명륜점)",
+            normalized_address="",
+        )
+
+        self.assertEqual(
+            _search_queries(row)[:3],
+            ["대박통 명륜점 부산", "대박통 명륜점", "대박통 동래명륜점 부산"],
+        )
+
+    def test_naver_search_queries_try_cleaned_address_before_raw_address(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="토곡정",
+            address="부산광역시 연제구 토곡로 7 1층",
+            purpose="간담",
+            amount=100000,
+            normalized_place_name="토곡정",
+            normalized_address="부산광역시 연제구 토곡로 7 1층",
+        )
+
+        self.assertEqual(_search_queries(row)[:3], [
+            "토곡정 부산광역시 연제구 토곡로 7",
+            "토곡정 부산광역시 연제구 토곡로 7 1층",
+            "토곡정 부산",
+        ])
+
+    def test_naver_search_queries_expand_manual_review_aliases(self) -> None:
+        cases = {
+            "세종 오이시외 1개소": "세종 오이시",
+            "주식회사 이흥용과자점 칠암사계": "칠암사계",
+            "벌교궁꼬막한정식외 1": "궁꼬막한정식",
+            "연제지역자활센터, 카페가온비": "카페가온비",
+        }
+        for place_name, expected in cases.items():
+            with self.subTest(place_name=place_name):
+                row = NormalizedExpenseRow(
+                    row_number=1,
+                    department_name="총무과",
+                    used_date="2026-06-05",
+                    place_name=place_name,
+                    address="",
+                    purpose="간담",
+                    amount=100000,
+                    normalized_place_name=place_name,
+                    normalized_address="",
+                )
+
+                self.assertIn(f"{expected} 부산", _search_queries(row))
+
+    def test_naver_search_queries_prioritize_food_part_from_mixed_org_name(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="연제지역자활센터, 카페가온비",
+            address="",
+            purpose="다과 구입",
+            amount=100000,
+            normalized_place_name="연제지역자활센터, 카페가온비",
+            normalized_address="",
+        )
+
+        self.assertEqual(_search_queries(row)[:2], ["카페가온비 부산", "카페가온비"])
+
+    def test_alias_keys_strip_generic_cafe_prefix(self) -> None:
+        self.assertIn("가온비", alias_keys_for_place("카페 가온비"))
+        self.assertIn("가온비", alias_keys_for_place("cafe가온비"))
 
     def test_cached_permit_client_stores_snapshot_and_api_log(self) -> None:
         row = NormalizedExpenseRow(
@@ -697,6 +1366,30 @@ class GenericNaverClient:
         ]
 
 
+class MultiCandidateNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-multi-001",
+                name="씨드",
+                category="cafe",
+                address="부산광역시 해운대구 우동 123",
+                road_address="부산광역시 해운대구 센텀중앙로 97",
+                longitude=129.129,
+                latitude=35.173,
+            ),
+            PlaceCandidate(
+                provider_place_id="naver-multi-002",
+                name="씨드커피",
+                category="cafe",
+                address="부산광역시 연제구 연산동 100",
+                road_address="부산광역시 연제구 중앙대로 1000",
+                longitude=129.075,
+                latitude=35.18,
+            ),
+        ]
+
+
 class BranchNaverClient:
     def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
         return [
@@ -738,6 +1431,186 @@ class TogokNaverClient:
                 road_address="부산광역시 연제구 토곡로 7 1층",
                 longitude=129.101,
                 latitude=35.186,
+            )
+        ]
+
+
+class FloorAddressNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-floor-address-001",
+                name="토곡정",
+                category="restaurant",
+                address="부산광역시 연제구 연산동 490-30 1층",
+                road_address="부산광역시 연제구 토곡로 7 1층",
+                longitude=129.101,
+                latitude=35.186,
+            )
+        ]
+
+
+class WrongAddressNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-wrong-address-001",
+                name="토곡정",
+                category="restaurant",
+                address="부산광역시 연제구 연산동 481-1",
+                road_address="부산광역시 연제구 과정로 207",
+                longitude=129.102,
+                latitude=35.187,
+            )
+        ]
+
+
+class OtherAddressNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-other-address-001",
+                name="토곡정",
+                category="other",
+                address="부산광역시 연제구 연산동 490-30 1층",
+                road_address="부산광역시 연제구 토곡로 7 1층",
+                longitude=129.101,
+                latitude=35.186,
+            )
+        ]
+
+
+class OtherNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-other-001",
+                name="동자상회",
+                category="other",
+                address="부산광역시 연제구 거제동 486-2",
+                road_address="부산광역시 연제구 거제천로 79",
+                longitude=129.074,
+                latitude=35.184,
+            )
+        ]
+
+
+class UnknownMismatchNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-unknown-mismatch-001",
+                name="미상",
+                category="restaurant",
+                address="부산광역시 동구 범일동 1422-6",
+                road_address="부산광역시 동구 범곡북로 14 1층",
+                longitude=129.052,
+                latitude=35.139,
+            )
+        ]
+
+
+class EdiyaNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-ediya-001",
+                name="이디야커피 김해국제공항 국제선점",
+                category="cafe",
+                address="부산광역시 강서구 대저2동 2350-1",
+                road_address="부산광역시 강서구 공항진입로 108",
+                longitude=128.948,
+                latitude=35.173,
+            )
+        ]
+
+
+class BaseSuffixNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-base-suffix-001",
+                name="취원 본점",
+                category="restaurant",
+                address="부산광역시 연제구 연산동 1499-26",
+                road_address="부산광역시 연제구 신촌로 38",
+                longitude=129.081,
+                latitude=35.185,
+            )
+        ]
+
+
+class YeyijeNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-yeyije-001",
+                name="예이제 해운대본점",
+                category="restaurant",
+                address="부산광역시 해운대구 중동 1123 푸르지오시티2층",
+                road_address="부산광역시 해운대구 해운대해변로298번길 29 푸르지오시티2층",
+                longitude=129.164,
+                latitude=35.161,
+            )
+        ]
+
+
+class DongjingaNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-dongjinga-001",
+                name="동진가식육식당",
+                category="restaurant",
+                address="부산광역시 연제구 거제동 453-3 상가1층 동진가식육식당",
+                road_address="부산광역시 연제구 거제시장로14번길 55 상가1층 동진가식육식당",
+                longitude=129.075,
+                latitude=35.186,
+            )
+        ]
+
+
+class BranchConflictNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-branch-conflict-001",
+                name="대박통 덕천점",
+                category="bar",
+                address="부산광역시 북구 덕천동 414-35 1층 대박통",
+                road_address="부산광역시 북구 덕천2길 79 1층 대박통",
+                longitude=129.008,
+                latitude=35.211,
+            )
+        ]
+
+
+class NonBusanFuzzyNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-non-busan-fuzzy-001",
+                name="강남면옥 정동점",
+                category="restaurant",
+                address="서울특별시 종로구 신문로2가 12-5",
+                road_address="서울특별시 종로구 새문안로 38",
+                longitude=126.972,
+                latitude=37.569,
+            )
+        ]
+
+
+class StarbucksNaverClient:
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [
+            PlaceCandidate(
+                provider_place_id="naver-starbucks-ks-001",
+                name="스타벅스 경성대점",
+                category="cafe",
+                address="부산광역시 남구 대연동 55-1",
+                road_address="부산광역시 남구 수영로 312",
+                longitude=129.101,
+                latitude=35.137,
             )
         ]
 
@@ -794,6 +1667,17 @@ class ClosedDifferentAddressPermitClient:
             business_status="closed",
             address="부산광역시 연제구 과정로 112-1",
             raw_response_json={"BPLC_NM": "토곡정"},
+        )
+
+
+class ClosedYeyijePermitClient:
+    def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
+        return PermitSnapshot(
+            permit_id="permit-closed-yeyije",
+            category="restaurant",
+            business_status="closed",
+            address="부산광역시 해운대구 해운대해변로298번길 29",
+            raw_response_json={"BPLC_NM": "예이제"},
         )
 
 

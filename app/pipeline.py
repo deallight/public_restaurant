@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .agents import (
+    FOOD_CATEGORIES,
     NaverClient,
     NormalizedExpenseRow,
     PermitClient,
@@ -216,6 +217,114 @@ class CachedPermitClient:
                 safe_json_dumps(snapshot.raw_response_json),
             ),
         )
+
+
+class StoredProviderNaverClient:
+    def __init__(self, candidate: PlaceCandidate):
+        self.candidate = candidate
+
+    def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+        return [self.candidate]
+
+
+class NoPermitClient:
+    def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
+        return None
+
+
+def existing_success_verification_decision(
+    conn: sqlite3.Connection,
+    candidate_id: int,
+    row: NormalizedExpenseRow,
+) -> VerificationDecision | None:
+    verification = conn.execute(
+        """
+        SELECT *
+        FROM place_verifications
+        WHERE candidate_id = ?
+          AND verification_status = 'success'
+          AND provider_category IN ('restaurant', 'cafe', 'bar')
+          AND is_coordinate_valid = 1
+        ORDER BY verified_at DESC, id DESC
+        LIMIT 1
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if verification is None:
+        return None
+    name_score = float(verification["name_similarity"] or 0.0)
+    address_score = float(verification["address_similarity"] or 0.0)
+    category = verification["provider_category"]
+    if category not in FOOD_CATEGORIES or name_score < 0.9:
+        return None
+    if row.normalized_address and address_score < 0.82:
+        return None
+    candidate = PlaceCandidate(
+        provider_place_id=verification["provider_place_id"],
+        name=verification["provider_place_name"],
+        category=category,
+        address=verification["provider_address"] or verification["provider_road_address"] or "",
+        road_address=verification["provider_road_address"] or verification["provider_address"] or "",
+        longitude=float(verification["longitude"]),
+        latitude=float(verification["latitude"]),
+    )
+    return VerificationDecision(
+        decision="approved",
+        confidence=0.98,
+        approved_by="rule",
+        selected_candidate=candidate,
+        category=category,
+        reason_codes=["EXISTING_SUCCESS_VERIFICATION"],
+        evidence={
+            "place_verification_id": int(verification["id"]),
+            "name_similarity": name_score,
+            "address_similarity": address_score,
+        },
+    )
+
+
+def existing_provider_evidence_decision(
+    conn: sqlite3.Connection,
+    candidate_id: int,
+    row: NormalizedExpenseRow,
+) -> VerificationDecision | None:
+    task = conn.execute(
+        """
+        SELECT reason
+        FROM manual_review_tasks
+        WHERE candidate_id = ? AND status = 'pending'
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if task is not None and "PERMIT_NOT_ACTIVE" in (task["reason"] or ""):
+        return None
+    verification = conn.execute(
+        """
+        SELECT *
+        FROM place_verifications
+        WHERE candidate_id = ?
+          AND provider_place_id IS NOT NULL
+          AND is_coordinate_valid = 1
+        ORDER BY verified_at DESC, id DESC
+        LIMIT 1
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if verification is None:
+        return None
+    candidate = PlaceCandidate(
+        provider_place_id=verification["provider_place_id"],
+        name=verification["provider_place_name"],
+        category=verification["provider_category"],
+        address=verification["provider_address"] or verification["provider_road_address"] or "",
+        road_address=verification["provider_road_address"] or verification["provider_address"] or "",
+        longitude=float(verification["longitude"]),
+        latitude=float(verification["latitude"]),
+    )
+    decision = VerifierAgent(StoredProviderNaverClient(candidate), NoPermitClient()).verify(row)
+    if decision.decision in {"approved", "rejected"}:
+        return decision
+    return None
 
 
 class BusanFixtureAdapter:
@@ -631,7 +740,9 @@ class DailyPipeline:
                         )
                         decision = (
                             non_food_purpose_decision(normalized)
+                            or existing_success_verification_decision(conn, int(row["candidate_id"]), normalized)
                             or alias_memory_decision(conn, normalized)
+                            or existing_provider_evidence_decision(conn, int(row["candidate_id"]), normalized)
                             or verifier.verify(normalized)
                         )
                         self._persist_decision(
@@ -913,6 +1024,7 @@ class DailyPipeline:
             )
             if decision.selected_candidate:
                 self._upsert_verification(conn, candidate_id, decision, "ambiguous")
+            self._upsert_candidate_evidence_list(conn, candidate_id, decision, "ambiguous")
         after = dict(
             conn.execute("SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)).fetchone()
         )
@@ -934,6 +1046,46 @@ class DailyPipeline:
                 safe_json_dumps(decision.reason_codes),
             ),
         )
+
+    def _upsert_candidate_evidence_list(
+        self,
+        conn: sqlite3.Connection,
+        candidate_id: int,
+        decision: VerificationDecision,
+        verification_status: str,
+    ) -> None:
+        for evidence in decision.evidence.get("candidate_evidence", []):
+            if not isinstance(evidence, dict):
+                continue
+            provider_place_id = str(evidence.get("provider_place_id") or "")
+            name = str(evidence.get("name") or "")
+            if not provider_place_id or not name:
+                continue
+            if decision.selected_candidate and provider_place_id == decision.selected_candidate.provider_place_id:
+                continue
+            candidate = PlaceCandidate(
+                provider_place_id=provider_place_id,
+                name=name,
+                category=str(evidence.get("category") or "other"),
+                address=str(evidence.get("address") or ""),
+                road_address=str(evidence.get("road_address") or evidence.get("address") or ""),
+                longitude=float(evidence.get("longitude") or 0.0),
+                latitude=float(evidence.get("latitude") or 0.0),
+            )
+            candidate_decision = VerificationDecision(
+                decision=decision.decision,
+                confidence=decision.confidence,
+                approved_by=decision.approved_by,
+                selected_candidate=candidate,
+                category=candidate.category,
+                reason_codes=decision.reason_codes,
+                evidence={
+                    "name_similarity": float(evidence.get("name_similarity") or 0.0),
+                    "address_similarity": float(evidence.get("address_similarity") or 0.0),
+                    "source_reason_codes": decision.reason_codes,
+                },
+            )
+            self._upsert_verification(conn, candidate_id, candidate_decision, verification_status)
 
     def _resolve_manual_task(
         self,

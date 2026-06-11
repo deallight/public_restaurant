@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable
 
+from .utils import normalize_text
 from .agents import (
     PlaceCandidate,
     VerificationDecision,
     alias_keys_for_place,
     candidate_address_similarity,
+    is_verifiable_place_name,
     name_similarity_with_branch,
 )
 
@@ -37,6 +39,10 @@ def remember_aliases(
 
 def alias_memory_decision(conn: sqlite3.Connection, row) -> VerificationDecision | None:
     aliases = alias_keys_for_place(row.normalized_place_name) + alias_keys_for_place(row.place_name)
+    for value in [row.normalized_place_name, row.place_name]:
+        normalized = normalize_text(value)
+        if is_verifiable_place_name(normalized):
+            aliases.append(normalized)
     normalized_aliases = list(dict.fromkeys(aliases))
     if not normalized_aliases:
         return None

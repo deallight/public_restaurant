@@ -196,15 +196,36 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._json(report, status=201)
                 elif path.startswith("/review/") and path.endswith("/approve-new"):
                     review_id = int(path.split("/")[2])
-                    self._json(app.service.approve_new(review_id, context))
+                    self._json(
+                        app.service.approve_new(
+                            review_id,
+                            context,
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                            verification_id=int(payload["verification_id"]) if payload.get("verification_id") else None,
+                        )
+                    )
                 elif path.startswith("/review/") and "/merge/" in path:
                     parts = path.split("/")
                     review_id = int(parts[2])
                     restaurant_id = int(parts[4])
-                    self._json(app.service.merge_candidate(review_id, restaurant_id, context))
+                    self._json(
+                        app.service.merge_candidate(
+                            review_id,
+                            restaurant_id,
+                            context,
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                        )
+                    )
                 elif path.startswith("/review/") and path.endswith("/reject"):
                     review_id = int(path.split("/")[2])
-                    self._json(app.service.reject_candidate(review_id, context))
+                    self._json(
+                        app.service.reject_candidate(
+                            review_id,
+                            context,
+                            reason=str(payload.get("reason", "manual_reject")),
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                        )
+                    )
                 elif path == "/auth/logout":
                     self._json({"result": "logged_out"})
                 elif path.startswith("/admin/accounts/") and path.endswith("/merge"):

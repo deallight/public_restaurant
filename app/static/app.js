@@ -26,6 +26,29 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function naverSearchAddress(address) {
+  return String(address || "")
+    .replace(/\s*(?:지하|지상)?\s*\d+\s*층(?:\s*\d+\s*호)?/g, " ")
+    .replace(/\s+\d{2,4}\s*호(?=\s|$)/g, " ")
+    .replace(/\s+\bB\d+\s*F?\b/gi, " ")
+    .replace(/\s+\b\d+\s*F\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function naverSearchUrl(restaurant) {
+  let query = restaurant.naver_map_query || "";
+  if (!query) {
+    const address = naverSearchAddress(restaurant.road_address || restaurant.address || "");
+    const compactName = String(restaurant.name || "").replace(/\s+/g, "");
+    const compactAddress = String(address).replace(/\s+/g, "");
+    query = compactName && compactAddress.includes(compactName)
+      ? address
+      : [restaurant.name, address].filter(Boolean).join(" ");
+  }
+  return `nmap://search?query=${encodeURIComponent(query)}&appname=${encodeURIComponent(window.location.origin)}`;
+}
+
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -169,6 +192,9 @@ async function selectRestaurant(id) {
       <span>${restaurant.visit_count}회</span>
       <span>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}점</span>
     </div>
+    <a class="naver-map-link" href="${escapeHtml(naverSearchUrl(restaurant))}" target="_blank" rel="noopener">
+      네이버 지도에서 보기
+    </a>
     <form id="review-form" class="review-form">
       <select name="rating" aria-label="별점">
         <option value="5">5점</option>

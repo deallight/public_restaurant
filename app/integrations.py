@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .agents import NormalizedExpenseRow, PermitSnapshot, PlaceCandidate, category_from_text, similarity
-from .utils import normalize_address, normalize_text
+from .utils import normalize_address, normalize_text, strip_address_detail
 
 
 class IntegrationError(RuntimeError):
@@ -83,19 +83,88 @@ def _category_from_naver(value: str) -> str:
 def _clean_place_query(value: str) -> str:
     text = re.sub(r"\([^)]*\)", " ", value or "")
     text = re.sub(r"(주식회사|유한회사|㈜|\(주\))", " ", text)
-    text = re.sub(r"\s*외\s*\d+.*$", " ", text)
+    text = re.sub(r"\s*외\s*\d+\s*(?:개소|개|곳)?\s*.*$", " ", text)
     text = re.sub(r"\s*(일원|등)\s*$", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _split_place_query_parts(value: str) -> list[str]:
+    parts = re.split(r"[,/_·]+", value or "")
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _specific_place_aliases(value: str) -> list[str]:
+    compact = normalize_text(value).replace(" ", "")
+    aliases: list[str] = []
+    if "칠암사계" in compact:
+        aliases.append("칠암사계")
+    if "카페가온비" in compact or "cafe가온비" in compact:
+        aliases.append("카페가온비")
+        aliases.append("cafe가온비")
+    if "벌교궁꼬막한정식" in compact:
+        aliases.append("궁꼬막한정식")
+    if "푸짐한마을실비식당" in compact:
+        aliases.append("푸짐한실비식당")
+        aliases.append("조방푸짐한마을실비식당")
+    if "에이제신관" in compact:
+        aliases.append("예이제 신관")
+        aliases.append("예이제")
+    return aliases
+
+
+def _place_query_variants(value: str) -> list[str]:
+    raw = (value or "").strip()
+    cleaned = _clean_place_query(raw)
+    variants: list[str] = []
+    parenthetical_hints = [hint.strip() for hint in re.findall(r"\(([^)]*점)\)", raw) if hint.strip()]
+    if parenthetical_hints and cleaned:
+        for hint in parenthetical_hints:
+            variants.append(f"{cleaned} {hint}")
+            if hint == "명륜점":
+                variants.append(f"{cleaned} 동래명륜점")
+    variants.extend(_specific_place_aliases(raw))
+    variants.extend(_specific_place_aliases(cleaned))
+    split_parts: list[str] = []
+    for source in [raw, cleaned]:
+        for part in _split_place_query_parts(source):
+            cleaned_part = _clean_place_query(part)
+            if cleaned_part:
+                split_parts.append(cleaned_part)
+    split_parts.sort(
+        key=lambda part: (
+            0 if category_from_text(part) in {"restaurant", "cafe", "bar"} else 1,
+            len(part),
+        )
+    )
+    variants.extend(split_parts)
+    variants.extend(value for value in [cleaned, raw] if value)
+    if cleaned:
+        words = cleaned.split()
+        if len(words) >= 2:
+            variants.append(words[-1])
+            variants.append(" ".join(words[-2:]))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for variant in variants:
+        key = normalize_text(variant)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(variant)
+    return deduped
+
+
 def _search_queries(row: NormalizedExpenseRow) -> list[str]:
     raw_place = (row.place_name or "").strip()
-    cleaned_place = _clean_place_query(raw_place)
-    place_values = [value for value in [cleaned_place, raw_place] if value]
+    place_values = _place_query_variants(raw_place)
+    address_values: list[str] = []
+    if row.address:
+        cleaned_address = strip_address_detail(row.address)
+        address_values.extend(value for value in [cleaned_address, row.address] if value)
     queries: list[str] = []
     for place in place_values:
-        if row.address:
-            queries.extend([f"{place} {row.address}", f"{place} 부산"])
+        if address_values:
+            queries.extend(f"{place} {address}" for address in address_values)
+            queries.append(f"{place} 부산")
         else:
             queries.append(f"{place} 부산")
         queries.append(place)

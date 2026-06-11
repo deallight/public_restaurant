@@ -35,6 +35,34 @@ function compactText(...values) {
   return values.filter((value) => String(value || "").trim()).join(" · ");
 }
 
+function providerCandidateList(item) {
+  const candidates = item.provider_candidates || [];
+  if (!candidates.length) return "";
+  return `
+    <div class="provider-candidates">
+      <strong>네이버 후보</strong>
+      ${candidates.map((candidate, index) => `
+        <label class="${candidate.is_approvable ? "" : "disabled"}">
+          <input
+            type="radio"
+            name="provider-${item.review_id}"
+            value="${candidate.verification_id}"
+            ${index === 0 && candidate.is_approvable ? "checked" : ""}
+            ${candidate.is_approvable ? "" : "disabled"}
+          >
+          <span>
+            ${escapeHtml(candidate.provider_place_name)}
+            · ${escapeHtml(candidate.provider_category)}
+            · 이름 ${(Number(candidate.name_similarity || 0) * 100).toFixed(0)}%
+            · 주소 ${(Number(candidate.address_similarity || 0) * 100).toFixed(0)}%
+            <small>${escapeHtml(candidate.provider_road_address || candidate.provider_address || "")}</small>
+          </span>
+        </label>
+      `).join("")}
+    </div>
+  `;
+}
+
 function integrationLabel(key) {
   return {
     naver_map_js: "네이버 지도 JS",
@@ -122,7 +150,7 @@ async function loadVerificationStatus() {
     <article>
       <strong>최근 배치</strong>
       <p>${batchText}</p>
-      <small>승인 ${latestSummary.approved || 0} · 수동검토 ${latestSummary.needs_review || 0} · DLQ ${latestSummary.dlq || 0}</small>
+      <small>승인 ${latestSummary.approved || 0} · 수동검토 ${latestSummary.needs_review || 0} · 반려 ${latestSummary.rejected || 0} · DLQ ${latestSummary.dlq || 0}</small>
     </article>
   `;
 }
@@ -147,15 +175,31 @@ async function loadReviewQueue() {
       <p class="review-purpose">${escapeHtml(item.purpose || "목적 정보 없음")}</p>
       ${item.provider_place_name ? `
         <p class="candidate-evidence">
-          네이버 후보: ${escapeHtml(item.provider_place_name)}
+          최신 후보: ${escapeHtml(item.provider_place_name)}
           · ${escapeHtml(item.provider_category)}
           · 이름 ${(Number(item.name_similarity || 0) * 100).toFixed(0)}%
           · 주소 ${(Number(item.address_similarity || 0) * 100).toFixed(0)}%
           <br>${escapeHtml(item.provider_road_address || item.provider_address || "")}
         </p>
       ` : ""}
+      ${providerCandidateList(item)}
+      <div class="review-feedback">
+        <label>
+          <span>반려 사유</span>
+          <select data-field="reason">
+            <option value="manual_reject">수동 반려</option>
+            <option value="LEGAL_ENTITY_INSUFFICIENT_INFO">법인명/정보부족</option>
+            <option value="PAYMENT_PROCESSOR_OR_CARD_PLACE_NAME">결제대행/카드명</option>
+            <option value="CLOSED_OR_NOT_OPERATING">폐업/운영중단</option>
+            <option value="ADDRESS_MISMATCH">주소 불일치</option>
+            <option value="AMBIGUOUS_BRANCH">지점 불명확</option>
+            <option value="TOO_MANY_SIMILAR_NAMES">동일상호 과다</option>
+          </select>
+        </label>
+        <textarea data-field="reviewer_note" rows="2" placeholder="검토 의견"></textarea>
+      </div>
       <div>
-        <button data-action="approve" data-id="${item.review_id}">신규 승인</button>
+        <button data-action="approve" data-id="${item.review_id}">${item.provider_place_name ? "후보 승인" : "신규 승인"}</button>
         <button data-action="reject" data-id="${item.review_id}">반려</button>
       </div>
     </article>
@@ -164,7 +208,19 @@ async function loadReviewQueue() {
     button.addEventListener("click", async () => {
       const id = button.dataset.id;
       const url = button.dataset.action === "approve" ? `/review/${id}/approve-new` : `/review/${id}/reject`;
-      await fetchJson(url, { method: "POST", body: JSON.stringify({ actor_id: "local-admin" }) });
+      const item = button.closest(".admin-item");
+      const payload = {
+        actor_id: "local-admin",
+        reviewer_note: item.querySelector("[data-field='reviewer_note']")?.value || "",
+      };
+      if (button.dataset.action === "approve") {
+        const selected = item.querySelector("input[type='radio'][name^='provider-']:checked");
+        if (selected) payload.verification_id = selected.value;
+      }
+      if (button.dataset.action === "reject") {
+        payload.reason = item.querySelector("[data-field='reason']")?.value || "manual_reject";
+      }
+      await fetchJson(url, { method: "POST", body: JSON.stringify(payload) });
       await loadReviewQueue();
     });
   });

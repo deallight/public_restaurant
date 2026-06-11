@@ -266,6 +266,24 @@ button {
   font-weight: 800;
 }
 
+.naver-map-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  margin: 0 0 16px;
+  border-radius: 6px;
+  color: #fff;
+  background: #03c75a;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.naver-map-link:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
 .panel-close {
   position: absolute;
   top: 10px;
@@ -519,8 +537,22 @@ button:disabled {
 
 .admin-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
+}
+
+.manual-review-section {
+  min-width: 0;
+}
+
+.review-reports-section {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.review-reports-section h2 {
+  margin-bottom: 12px;
 }
 
 .admin-list {
@@ -567,6 +599,67 @@ button:disabled {
   background: var(--surface);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.provider-candidates {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.provider-candidates > strong {
+  font-size: 13px;
+}
+
+.provider-candidates label {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 6px;
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.provider-candidates label.disabled {
+  color: var(--muted);
+  opacity: 0.68;
+}
+
+.provider-candidates small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+.admin-item .review-feedback {
+  display: grid;
+  grid-template-columns: minmax(160px, 240px) minmax(0, 1fr);
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.review-feedback label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.review-feedback select,
+.review-feedback textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--ink);
+  background: #fff;
 }
 
 @media (max-width: 820px) {

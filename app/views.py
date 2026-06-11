@@ -86,13 +86,13 @@ def admin_index() -> str:
       <div id="source-groups" class="source-groups"></div>
     </section>
     <section class="admin-grid">
-      <div>
+      <div class="manual-review-section">
         <h2>수동 검토 <small id="review-queue-summary"></small></h2>
         <div id="review-queue" class="admin-list"></div>
-      </div>
-      <div>
-        <h2>리뷰 신고</h2>
-        <div id="review-reports" class="admin-list"></div>
+        <section class="review-reports-section">
+          <h2>리뷰 신고</h2>
+          <div id="review-reports" class="admin-list"></div>
+        </section>
       </div>
     </section>
   </main>

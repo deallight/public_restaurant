@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 from .alias_memory import remember_aliases
 from .database import Database
-from .utils import normalize_text, safe_json_dumps, safe_json_loads, stable_hash, utc_now
+from .utils import (
+    normalize_address,
+    normalize_text,
+    safe_json_dumps,
+    safe_json_loads,
+    stable_hash,
+    strip_address_detail,
+    utc_now,
+)
 
 
 class AppError(Exception):
@@ -26,6 +36,23 @@ class RequestContext:
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def naver_search_address(address: str) -> str:
+    return strip_address_detail(address)
+
+
+def naver_map_query(name: str, address: str) -> str:
+    cleaned_address = naver_search_address(address)
+    compact_name = str(name or "").replace(" ", "")
+    compact_address = cleaned_address.replace(" ", "")
+    if compact_name and compact_name in compact_address:
+        return cleaned_address
+    return " ".join(part for part in [name, cleaned_address] if part)
+
+
+def naver_map_url(query: str, appname: str = "public_restaurant") -> str:
+    return f"nmap://search?query={quote(query, safe='')}&appname={quote(appname, safe='')}"
 
 
 class RestaurantService:
@@ -266,7 +293,7 @@ class RestaurantService:
     def admin_review_queue(self, limit: int = 50) -> list[dict[str, Any]]:
         capped_limit = max(1, min(limit, 100))
         with self.database.session() as conn:
-            return [
+            rows = [
                 dict(row)
                 for row in conn.execute(
                     """
@@ -316,6 +343,9 @@ class RestaurantService:
                     (capped_limit,),
                 )
             ]
+            for row in rows:
+                row["provider_candidates"] = self._provider_candidates(conn, int(row["candidate_id"]))
+            return rows
 
     def admin_review_queue_count(self) -> int:
         with self.database.session() as conn:
@@ -329,7 +359,13 @@ class RestaurantService:
                 ).fetchone()["count"]
             )
 
-    def approve_new(self, review_id: int, context: RequestContext) -> dict[str, Any]:
+    def approve_new(
+        self,
+        review_id: int,
+        context: RequestContext,
+        reviewer_note: str = "",
+        verification_id: int | None = None,
+    ) -> dict[str, Any]:
         with self.database.session() as conn:
             task = self._load_review_task(conn, review_id)
             candidate = conn.execute(
@@ -337,40 +373,51 @@ class RestaurantService:
             ).fetchone()
             if candidate is None:
                 raise AppError(404, "candidate not found")
-            cur = conn.execute(
-                """
-                INSERT INTO restaurants
-                  (region_id, canonical_name, normalized_name, major_category, naver_place_id,
-                   address, road_address, normalized_address, longitude, latitude,
-                   verification_status, map_exposure_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', 'visible')
-                """,
-                (
-                    candidate["region_id"],
-                    candidate["original_place_name"],
-                    candidate["normalized_place_name"],
-                    candidate["place_major_category"],
-                    f"manual-{candidate['id']}",
-                    candidate["original_address"] or "주소 미확인",
-                    candidate["original_address"],
-                    candidate["normalized_address"] or "",
-                    129.0756416,
-                    35.1795543,
-                ),
-            )
-            restaurant_id = int(cur.lastrowid)
-            self._resolve_task(conn, task, "approved", context, {"restaurant_id": restaurant_id})
-            return {"result": "approved_new", "restaurant_id": restaurant_id}
+            if verification_id:
+                verification = self._food_verification_by_id(conn, int(candidate["id"]), verification_id)
+            else:
+                verification = self._latest_food_verification(conn, int(candidate["id"]))
+            if verification is not None:
+                restaurant_id = self._restaurant_from_provider_verification(conn, candidate, verification)
+                conn.execute(
+                    """
+                    UPDATE restaurant_candidates
+                    SET place_major_category = ?
+                    WHERE id = ?
+                    """,
+                    (verification["provider_category"], candidate["id"]),
+                )
+                result = "approved_provider"
+            else:
+                restaurant_id = self._create_manual_restaurant_without_provider(conn, candidate)
+                result = "approved_new"
+            self._resolve_task(conn, task, "approved", context, {"restaurant_id": restaurant_id}, reviewer_note)
+            return {"result": result, "restaurant_id": restaurant_id}
 
-    def merge_candidate(self, review_id: int, restaurant_id: int, context: RequestContext) -> dict[str, Any]:
+    def merge_candidate(
+        self,
+        review_id: int,
+        restaurant_id: int,
+        context: RequestContext,
+        reviewer_note: str = "",
+    ) -> dict[str, Any]:
         with self.database.session() as conn:
             task = self._load_review_task(conn, review_id)
             if conn.execute("SELECT id FROM restaurants WHERE id = ?", (restaurant_id,)).fetchone() is None:
                 raise AppError(404, "restaurant not found")
-            self._resolve_task(conn, task, "merged", context, {"restaurant_id": restaurant_id})
+            self._resolve_task(conn, task, "merged", context, {"restaurant_id": restaurant_id}, reviewer_note)
             return {"result": "merged", "restaurant_id": restaurant_id}
 
-    def reject_candidate(self, review_id: int, context: RequestContext) -> dict[str, Any]:
+    def reject_candidate(
+        self,
+        review_id: int,
+        context: RequestContext,
+        reason: str = "manual_reject",
+        reviewer_note: str = "",
+    ) -> dict[str, Any]:
+        rejection_reason = re.sub(r"[^A-Za-z0-9_,-]+", "_", reason or "manual_reject").strip("_")
+        rejection_reason = rejection_reason or "manual_reject"
+        note = str(reviewer_note or "").strip()
         with self.database.session() as conn:
             task = self._load_review_task(conn, review_id)
             conn.execute(
@@ -378,19 +425,24 @@ class RestaurantService:
                 UPDATE restaurant_candidates
                 SET status = 'rejected',
                     manual_review_status = 'rejected',
-                    rejection_reason = 'manual_reject',
+                    rejection_reason = ?,
+                    review_note = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (utc_now(), task["candidate_id"]),
+                (rejection_reason, note, utc_now(), task["candidate_id"]),
             )
             conn.execute(
                 """
                 UPDATE manual_review_tasks
-                SET status = 'rejected', reviewed_by = ?, reviewed_at = ?
+                SET status = 'rejected',
+                    reason = ?,
+                    reviewer_note = ?,
+                    reviewed_by = ?,
+                    reviewed_at = ?
                 WHERE id = ?
                 """,
-                (context.actor_id, utc_now(), review_id),
+                (rejection_reason, note, context.actor_id, utc_now(), review_id),
             )
             self._audit(
                 conn,
@@ -398,8 +450,8 @@ class RestaurantService:
                 "candidate_reject",
                 "manual_review_task",
                 review_id,
-                after={"candidate_id": task["candidate_id"]},
-                reason_codes=["MANUAL_REJECT"],
+                after={"candidate_id": task["candidate_id"], "reviewer_note": note},
+                reason_codes=[rejection_reason],
             )
             return {"result": "rejected"}
 
@@ -648,6 +700,161 @@ class RestaurantService:
                 raise AppError(404, "batch not found")
             return self._batch_payload(row)
 
+    def _latest_food_verification(self, conn: sqlite3.Connection, candidate_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT *
+            FROM place_verifications
+            WHERE candidate_id = ?
+              AND provider_place_id IS NOT NULL
+              AND provider_category IN ('restaurant', 'cafe', 'bar')
+              AND is_coordinate_valid = 1
+            ORDER BY
+              CASE verification_status WHEN 'success' THEN 0 ELSE 1 END,
+              name_similarity DESC,
+              address_similarity DESC,
+              verified_at DESC,
+              id DESC
+            LIMIT 1
+            """,
+            (candidate_id,),
+        ).fetchone()
+
+    def _food_verification_by_id(
+        self,
+        conn: sqlite3.Connection,
+        candidate_id: int,
+        verification_id: int,
+    ) -> sqlite3.Row | None:
+        verification = conn.execute(
+            """
+            SELECT *
+            FROM place_verifications
+            WHERE id = ?
+              AND candidate_id = ?
+              AND provider_place_id IS NOT NULL
+              AND provider_category IN ('restaurant', 'cafe', 'bar')
+              AND is_coordinate_valid = 1
+            """,
+            (verification_id, candidate_id),
+        ).fetchone()
+        if verification is None:
+            raise AppError(400, "selected provider candidate is not approvable")
+        return verification
+
+    def _provider_candidates(self, conn: sqlite3.Connection, candidate_id: int) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT
+                  id AS verification_id,
+                  provider_place_id,
+                  provider_place_name,
+                  provider_category,
+                  provider_address,
+                  provider_road_address,
+                  longitude,
+                  latitude,
+                  name_similarity,
+                  address_similarity,
+                  verification_status,
+                  verification_reason,
+                  CASE
+                    WHEN provider_category IN ('restaurant', 'cafe', 'bar')
+                     AND is_coordinate_valid = 1
+                    THEN 1 ELSE 0
+                  END AS is_approvable
+                FROM place_verifications
+                WHERE candidate_id = ?
+                  AND provider_place_id IS NOT NULL
+                  AND is_coordinate_valid = 1
+                ORDER BY
+                  is_approvable DESC,
+                  name_similarity DESC,
+                  address_similarity DESC,
+                  verified_at DESC,
+                  id DESC
+                LIMIT 5
+                """,
+                (candidate_id,),
+            )
+        ]
+
+    def _restaurant_from_provider_verification(
+        self,
+        conn: sqlite3.Connection,
+        candidate: sqlite3.Row,
+        verification: sqlite3.Row,
+    ) -> int:
+        existing = conn.execute(
+            "SELECT id FROM restaurants WHERE naver_place_id = ?",
+            (verification["provider_place_id"],),
+        ).fetchone()
+        if existing is not None:
+            restaurant_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE restaurants
+                SET place_verification_id = ?,
+                    verification_status = 'success',
+                    map_exposure_status = 'visible',
+                    last_verified_at = ?
+                WHERE id = ?
+                """,
+                (verification["id"], utc_now(), restaurant_id),
+            )
+            return restaurant_id
+        address = verification["provider_address"] or verification["provider_road_address"] or "주소 미확인"
+        road_address = verification["provider_road_address"] or verification["provider_address"] or ""
+        cur = conn.execute(
+            """
+            INSERT INTO restaurants
+              (region_id, place_verification_id, canonical_name, normalized_name,
+               major_category, naver_place_id, address, road_address, normalized_address,
+               longitude, latitude, verification_status, map_exposure_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', 'visible')
+            """,
+            (
+                candidate["region_id"],
+                verification["id"],
+                verification["provider_place_name"],
+                normalize_text(verification["provider_place_name"]),
+                verification["provider_category"],
+                verification["provider_place_id"],
+                address,
+                road_address,
+                normalize_address(address),
+                float(verification["longitude"]),
+                float(verification["latitude"]),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def _create_manual_restaurant_without_provider(self, conn: sqlite3.Connection, candidate: sqlite3.Row) -> int:
+        cur = conn.execute(
+            """
+            INSERT INTO restaurants
+              (region_id, canonical_name, normalized_name, major_category, naver_place_id,
+               address, road_address, normalized_address, longitude, latitude,
+               verification_status, map_exposure_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', 'visible')
+            """,
+            (
+                candidate["region_id"],
+                candidate["original_place_name"],
+                candidate["normalized_place_name"],
+                candidate["place_major_category"],
+                f"manual-{candidate['id']}",
+                candidate["original_address"] or "주소 미확인",
+                candidate["original_address"],
+                candidate["normalized_address"] or "",
+                129.0756416,
+                35.1795543,
+            ),
+        )
+        return int(cur.lastrowid)
+
     def _batch_payload(self, row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["summary"] = safe_json_loads(payload.pop("summary_json"), {})
@@ -677,9 +884,11 @@ class RestaurantService:
         }
 
     def _restaurant_payload(self, row: dict[str, Any]) -> dict[str, Any]:
+        name = row.get("name") or row.get("canonical_name")
+        query = naver_map_query(name, row.get("road_address") or row["address"])
         return {
             "id": row["id"],
-            "name": row.get("name") or row.get("canonical_name"),
+            "name": name,
             "category": row["major_category"],
             "category_label": {
                 "restaurant": "음식점",
@@ -699,6 +908,8 @@ class RestaurantService:
             "total_amount": int(row.get("total_amount") or 0),
             "average_rating": round(float(row.get("average_rating") or 0), 2),
             "review_count": int(row.get("review_count") or 0),
+            "naver_map_query": query,
+            "naver_map_url": naver_map_url(query),
         }
 
     def _load_review_task(self, conn: sqlite3.Connection, review_id: int) -> sqlite3.Row:
@@ -716,6 +927,7 @@ class RestaurantService:
         status: str,
         context: RequestContext,
         after: dict[str, Any],
+        reviewer_note: str = "",
     ) -> None:
         candidate = conn.execute(
             "SELECT * FROM restaurant_candidates WHERE id = ?", (task["candidate_id"],)
@@ -744,25 +956,31 @@ class RestaurantService:
         if restaurant is not None:
             alias_texts.append(restaurant["canonical_name"])
         remember_aliases(conn, restaurant_id, alias_texts, source=f"manual_{status}", confidence=1.0)
+        note = str(reviewer_note or "").strip()
         conn.execute(
             """
             UPDATE restaurant_candidates
             SET status = 'verified',
                 manual_review_status = 'approved',
                 verification_status = 'success',
+                review_note = ?,
                 updated_at = ?
             WHERE id = ?
             """,
-            (utc_now(), candidate["id"]),
+            (note, utc_now(), candidate["id"]),
         )
         conn.execute(
             """
             UPDATE manual_review_tasks
-            SET status = ?, reviewed_by = ?, reviewed_at = ?
+            SET status = ?,
+                reviewer_note = ?,
+                reviewed_by = ?,
+                reviewed_at = ?
             WHERE id = ?
             """,
-            (status, context.actor_id, utc_now(), task["id"]),
+            (status, note, context.actor_id, utc_now(), task["id"]),
         )
+        after = {**after, "reviewer_note": note}
         self._audit(
             conn,
             "admin",
