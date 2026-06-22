@@ -10,10 +10,22 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from .config import Settings
 from .database import Database
-from .integrations import GoogleOAuthClient, IntegrationError, NaverLoginClient
-from .pipeline import BusanCityLiveAdapter, DailyPipeline
+from .integrations import (
+    GeocodingNaverClient,
+    GoogleOAuthClient,
+    IntegrationError,
+    NaverLoginClient,
+    NaverMapsGeocodingClient,
+    NaverSearchLocalClient,
+)
+from .pipeline import (
+    COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
+    COLLECTION_SCAN_SAFETY_MAX_PAGES,
+    BusanCityLiveAdapter,
+    DailyPipeline,
+)
 from .services import AppError, RequestContext, RestaurantService
-from .views import admin_index, public_index
+from .views import admin_index, admin_review_index, map_issues_index, ops_logs_index, public_index
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -24,23 +36,119 @@ class PublicRestaurantApplication:
         self.settings = settings
         self.database = Database(settings.db_path)
         self.database.initialize()
+        geocoding_client = None
+        if settings.naver_maps_client_id and settings.naver_maps_client_secret:
+            geocoding_client = NaverMapsGeocodingClient(
+                settings.naver_maps_client_id,
+                settings.naver_maps_client_secret,
+            )
+        naver_client = None
+        if settings.naver_search_client_id and settings.naver_search_client_secret:
+            naver_client = GeocodingNaverClient(
+                NaverSearchLocalClient(
+                    settings.naver_search_client_id,
+                    settings.naver_search_client_secret,
+                ),
+                geocoding_client,
+            )
         self.service = RestaurantService(
             self.database,
             review_rate_limit_per_hour=settings.review_rate_limit_per_hour,
+            geocoding_client=geocoding_client,
+            naver_client=naver_client,
         )
 
     def run_daily(self) -> dict:
         return DailyPipeline(self.database, settings=self.settings).run()
 
-    def run_busan_live(self) -> dict:
+    def run_busan_live(
+        self,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> dict:
         return DailyPipeline(
             self.database,
-            adapter=BusanCityLiveAdapter(max_pages=1, max_documents=10),
+            adapter=BusanCityLiveAdapter(
+                max_pages=COLLECTION_SCAN_SAFETY_MAX_PAGES,
+                max_documents=COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
+                start_date=start_date,
+                end_date=end_date,
+            ),
             settings=self.settings,
+            verify_new_rows=False,
         ).run()
+
+    def create_collection_plan(
+        self,
+        start_date: str = "",
+        end_date: str = "",
+        batch_size: int = 20,
+    ) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(
+                max_pages=COLLECTION_SCAN_SAFETY_MAX_PAGES,
+                max_documents=COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).create_collection_plan(
+            start_date=start_date,
+            end_date=end_date,
+            max_pages=COLLECTION_SCAN_SAFETY_MAX_PAGES,
+            max_documents=COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
+            batch_size=batch_size,
+        )
+
+    def run_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).run_collection_plan_batch(plan_id=plan_id, batch_size=batch_size)
+
+    def run_collection_plan_batches(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).run_collection_plan_batches(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+
+    def retry_collection_plan_failures(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).retry_collection_plan_failures(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
 
     def verify_pending(self, limit: int = 100) -> dict:
         return DailyPipeline(self.database, settings=self.settings).verify_pending(limit=limit)
+
+    def verify_collected(self, limit: int = 100) -> dict:
+        return DailyPipeline(self.database, settings=self.settings).verify_collected(limit=limit)
 
     def verification_status(self) -> dict:
         missing_env = {
@@ -94,6 +202,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(public_index(app.settings.naver_map_key))
                 elif path == "/admin":
                     self._html(admin_index())
+                elif path == "/admin/review":
+                    self._html(admin_review_index())
+                elif path == "/admin/map-issues":
+                    self._html(map_issues_index())
+                elif path == "/admin/logs":
+                    self._html(ops_logs_index())
                 elif path.startswith("/static/"):
                     self._static(path.removeprefix("/static/"))
                 elif path == "/api/map/restaurants":
@@ -143,6 +257,24 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._json(app.service.source_registry())
                 elif path == "/ops/verification-status":
                     self._json(app.verification_status())
+                elif path == "/ops/logs":
+                    plan_id = int(query["plan_id"]) if query.get("plan_id") else None
+                    limit = int(query.get("limit", "100") or "100")
+                    self._json(app.service.ops_logs(plan_id=plan_id, limit=limit))
+                elif path == "/ops/collection-progress":
+                    self._json(
+                        app.service.collection_progress(
+                            start_date=str(query.get("start_date", "")),
+                            end_date=str(query.get("end_date", "")),
+                        )
+                    )
+                elif path == "/ops/dashboard":
+                    self._json(
+                        app.service.collection_dashboard(
+                            start_date=str(query.get("start_date", "")),
+                            end_date=str(query.get("end_date", "")),
+                        )
+                    )
                 elif path == "/review":
                     if "application/json" in self.headers.get("Accept", ""):
                         limit = max(1, min(int(query.get("limit", "50") or "50"), 100))
@@ -157,6 +289,22 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         self._html(admin_index())
                 elif path == "/admin/review-reports":
                     self._json({"reports": app.service.review_reports()})
+                elif path == "/admin/map-issues/data":
+                    self._json(app.service.map_issue_candidates(limit=int(query.get("limit", "100") or "100")))
+                elif path == "/admin/candidates":
+                    limit = int(query.get("limit", "50") or "50")
+                    self._json(
+                        app.service.admin_candidates(
+                            limit=limit,
+                            offsets={
+                                "needs_review": int(query.get("needs_review_offset", "0") or "0"),
+                                "verified": int(query.get("verified_offset", "0") or "0"),
+                                "rejected": int(query.get("rejected_offset", "0") or "0"),
+                            },
+                            q=str(query.get("q", "")),
+                            sort=str(query.get("sort", "id_desc")),
+                        )
+                    )
                 else:
                     raise AppError(404, "not found")
             except AppError as exc:
@@ -173,9 +321,56 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 if path == "/ops/run-daily":
                     self._json(app.run_daily(), status=201)
                 elif path == "/ops/run-busan-live":
-                    self._json(app.run_busan_live(), status=201)
+                    self._json(
+                        app.run_busan_live(
+                            start_date=str(payload.get("start_date", "")),
+                            end_date=str(payload.get("end_date", "")),
+                        ),
+                        status=201,
+                    )
+                elif path == "/ops/collection-plans":
+                    self._json(
+                        app.create_collection_plan(
+                            start_date=str(payload.get("start_date", "")),
+                            end_date=str(payload.get("end_date", "")),
+                            batch_size=int(payload.get("batch_size", 20) or 20),
+                        ),
+                        status=201,
+                    )
+                elif path.startswith("/ops/collection-plans/") and path.endswith("/run"):
+                    plan_id = int(path.split("/")[3])
+                    repeat = bool(payload.get("repeat", True))
+                    if repeat:
+                        self._json(
+                            app.run_collection_plan_batches(
+                                plan_id,
+                                batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                                max_batches=int(payload.get("max_batches", 100) or 100),
+                            ),
+                            status=201,
+                        )
+                        return
+                    self._json(
+                        app.run_collection_plan_batch(
+                            plan_id,
+                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                        ),
+                        status=201,
+                    )
+                elif path.startswith("/ops/collection-plans/") and path.endswith("/retry-failed"):
+                    plan_id = int(path.split("/")[3])
+                    self._json(
+                        app.retry_collection_plan_failures(
+                            plan_id,
+                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                            max_batches=int(payload.get("max_batches", 100) or 100),
+                        ),
+                        status=201,
+                    )
                 elif path == "/ops/verify-pending":
                     self._json(app.verify_pending(limit=int(payload.get("limit", 100))), status=201)
+                elif path == "/ops/verify-collected":
+                    self._json(app.verify_collected(limit=int(payload.get("limit", 100))), status=201)
                 elif path.startswith("/api/restaurants/") and path.endswith("/reviews"):
                     restaurant_id = int(path.split("/")[3])
                     review = app.service.add_review(
@@ -194,6 +389,17 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         context=context,
                     )
                     self._json(report, status=201)
+                elif path.startswith("/review/") and path.endswith("/candidate"):
+                    review_id = int(path.split("/")[2])
+                    self._json(
+                        app.service.update_review_candidate(
+                            review_id,
+                            context,
+                            original_place_name=str(payload.get("review_place_name", payload.get("original_place_name", ""))),
+                            original_address=str(payload.get("review_address", payload.get("original_address", ""))),
+                            place_major_category=str(payload.get("review_major_category", payload.get("place_major_category", "restaurant"))),
+                        )
+                    )
                 elif path.startswith("/review/") and path.endswith("/approve-new"):
                     review_id = int(path.split("/")[2])
                     self._json(
@@ -224,6 +430,35 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             context,
                             reason=str(payload.get("reason", "manual_reject")),
                             reviewer_note=str(payload.get("reviewer_note", "")),
+                        )
+                    )
+                elif path.startswith("/admin/candidates/") and path.endswith("/geocode"):
+                    candidate_id = int(path.split("/")[3])
+                    self._json(
+                        app.service.geocode_admin_candidate(
+                            candidate_id,
+                            context,
+                            review_place_name=str(payload.get("review_place_name", payload.get("original_place_name", ""))),
+                            review_address=str(payload.get("review_address", payload.get("original_address", ""))),
+                            review_major_category=str(payload.get("review_major_category", payload.get("place_major_category", "restaurant"))),
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                        )
+                    )
+                elif path.startswith("/admin/candidates/"):
+                    candidate_id = int(path.split("/")[3])
+                    self._json(
+                        app.service.update_admin_candidate(
+                            candidate_id,
+                            context,
+                            review_place_name=str(payload.get("review_place_name", payload.get("original_place_name", ""))),
+                            review_address=str(payload.get("review_address", payload.get("original_address", ""))),
+                            review_major_category=str(payload.get("review_major_category", payload.get("place_major_category", "restaurant"))),
+                            target_status=str(payload.get("target_status", "needs_review")),
+                            rejection_reason=str(payload.get("rejection_reason", "manual_reject")),
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                            verification_id=int(payload["selected_verification_id"])
+                            if payload.get("selected_verification_id")
+                            else None,
                         )
                     )
                 elif path == "/auth/logout":

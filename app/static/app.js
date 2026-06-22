@@ -27,13 +27,18 @@ function escapeHtml(value) {
 }
 
 function naverSearchAddress(address) {
-  return String(address || "")
+  const cleaned = String(address || "")
     .replace(/\s*(?:지하|지상)?\s*\d+\s*층(?:\s*\d+\s*호)?/g, " ")
     .replace(/\s+\d{2,4}\s*호(?=\s|$)/g, " ")
     .replace(/\s+\bB\d+\s*F?\b/gi, " ")
     .replace(/\s+\b\d+\s*F\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+  const withoutPostalCode = cleaned.replace(/^\s*\(?\d{5}\)?\s*/, "");
+  const road = withoutPostalCode.match(/^(.*?(?:[0-9A-Za-z가-힣]+(?:대로|로|길))\s+\d+(?:-\d+)?)\b/);
+  if (road) return road[1].replace(/\s+/g, " ").trim();
+  const lot = withoutPostalCode.match(/^(.*?(?:[0-9A-Za-z가-힣]+(?:동|읍|면|리))\s+(?:산\s*)?\d+(?:-\d+)?)\b/);
+  return (lot ? lot[1] : withoutPostalCode).replace(/\s+/g, " ").trim();
 }
 
 function naverSearchUrl(restaurant) {
@@ -46,7 +51,7 @@ function naverSearchUrl(restaurant) {
       ? address
       : [restaurant.name, address].filter(Boolean).join(" ");
   }
-  return `nmap://search?query=${encodeURIComponent(query)}&appname=${encodeURIComponent(window.location.origin)}`;
+  return `https://map.naver.com/p/search/${encodeURIComponent(query)}`;
 }
 
 async function fetchJson(url, options = {}) {

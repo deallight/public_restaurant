@@ -45,6 +45,49 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
   error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS collection_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_key TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ready',
+  scan_max_pages INTEGER NOT NULL DEFAULT 1,
+  scan_max_documents INTEGER NOT NULL DEFAULT 500,
+  batch_size INTEGER NOT NULL DEFAULT 20,
+  discovered_count INTEGER NOT NULL DEFAULT 0,
+  pending_count INTEGER NOT NULL DEFAULT 0,
+  collected_count INTEGER NOT NULL DEFAULT 0,
+  duplicate_count INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  rows_seen INTEGER NOT NULL DEFAULT 0,
+  rows_inserted INTEGER NOT NULL DEFAULT 0,
+  created_batch_job_id INTEGER REFERENCES batch_jobs(id),
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS collection_plan_documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL REFERENCES collection_plans(id) ON DELETE CASCADE,
+  source_url TEXT NOT NULL,
+  source_title TEXT,
+  department_name TEXT,
+  published_at TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  raw_document_id INTEGER REFERENCES raw_documents(id),
+  batch_job_id INTEGER REFERENCES batch_jobs(id),
+  rows_seen INTEGER NOT NULL DEFAULT 0,
+  rows_inserted INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (plan_id, source_url)
+);
+
 CREATE TABLE IF NOT EXISTS raw_documents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   institution_id INTEGER NOT NULL REFERENCES institutions(id),
@@ -96,6 +139,11 @@ CREATE TABLE IF NOT EXISTS restaurant_candidates (
   normalized_place_name TEXT NOT NULL,
   original_address TEXT,
   normalized_address TEXT,
+  review_place_name TEXT,
+  review_normalized_place_name TEXT,
+  review_address TEXT,
+  review_normalized_address TEXT,
+  review_major_category TEXT,
   used_date TEXT,
   amount INTEGER,
   place_major_category TEXT NOT NULL DEFAULT 'other',
@@ -328,5 +376,6 @@ CREATE INDEX IF NOT EXISTS idx_reviews_restaurant ON restaurant_reviews (restaur
 CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports (status);
 CREATE INDEX IF NOT EXISTS idx_expense_records_date ON expense_records (used_date);
 CREATE INDEX IF NOT EXISTS idx_candidates_status ON restaurant_candidates (status);
+CREATE INDEX IF NOT EXISTS idx_collection_plan_documents_status
+  ON collection_plan_documents (plan_id, status, published_at);
 """
-

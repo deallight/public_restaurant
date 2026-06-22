@@ -168,6 +168,7 @@ def _search_queries(row: NormalizedExpenseRow) -> list[str]:
         else:
             queries.append(f"{place} 부산")
         queries.append(place)
+    queries.extend(address_values)
     seen: set[str] = set()
     deduped: list[str] = []
     for query in queries:
@@ -176,6 +177,15 @@ def _search_queries(row: NormalizedExpenseRow) -> list[str]:
             seen.add(key)
             deduped.append(query)
     return deduped
+
+
+def _place_rank(row: NormalizedExpenseRow, place: PlaceCandidate) -> tuple[float, int, float]:
+    row_address = normalize_address(strip_address_detail(row.address or ""))
+    place_address = normalize_address(place.road_address or place.address)
+    address_score = similarity(row_address, place_address) if row_address else 0.0
+    busan_bonus = 1 if "부산" in (place.road_address or place.address) else 0
+    name_score = similarity(normalize_text(row.place_name), normalize_text(place.name))
+    return (address_score, busan_bonus, name_score)
 
 
 @dataclass(frozen=True)
@@ -222,9 +232,8 @@ class NaverSearchLocalClient:
                         latitude=latitude,
                     )
                 )
-            if places:
-                break
-        return places[:5]
+        places.sort(key=lambda place: _place_rank(row, place), reverse=True)
+        return places[:10]
 
 
 @dataclass(frozen=True)

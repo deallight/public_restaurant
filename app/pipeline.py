@@ -4,6 +4,7 @@ import sqlite3
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 from html import unescape
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +20,7 @@ from .agents import (
     PlaceCandidate,
     VerificationDecision,
     VerifierAgent,
+    expense_scope_reject_decision,
     non_food_purpose_decision,
 )
 from .alias_memory import alias_memory_decision, remember_aliases
@@ -32,6 +34,10 @@ from .integrations import (
 )
 from .utils import normalize_address, normalize_text, safe_json_dumps, safe_json_loads, stable_hash, utc_now
 from .xlsx_parser import parse_expense_xlsx
+
+
+COLLECTION_SCAN_SAFETY_MAX_PAGES = 500
+COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS = 10000
 
 
 @dataclass(frozen=True)
@@ -54,8 +60,26 @@ class SourceDocument:
     attachments: tuple[SourceAttachment, ...] = ()
 
 
+@dataclass(frozen=True)
+class CollectionTarget:
+    source_url: str
+    source_title: str
+    published_at: str
+    department_name: str = ""
+
+
 class UnsupportedDocumentError(RuntimeError):
     pass
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -408,39 +432,100 @@ class BusanCityLiveAdapter:
         self,
         max_pages: int = 1,
         max_documents: int = 10,
+        start_date: str = "",
+        end_date: str = "",
         raw_dir: Path | None = None,
     ) -> None:
         self.max_pages = max_pages
         self.max_documents = max_documents
+        self.start_date = _parse_iso_date(start_date)
+        self.end_date = _parse_iso_date(end_date)
         self.raw_dir = raw_dir or BASE_DIR / "var" / "raw" / "busan_city"
 
     def discover(self) -> list[SourceDocument]:
         documents: list[SourceDocument] = []
+        for target in self.discover_targets():
+            try:
+                documents.append(self.fetch_document(target))
+            except Exception:
+                continue
+        return documents
+
+    def discover_targets(self) -> list[CollectionTarget]:
+        targets: list[CollectionTarget] = []
         seen: set[str] = set()
         for page in range(1, self.max_pages + 1):
             list_url = f"{self.base_url}{self.list_path}?curPage={page}"
-            list_html = self._get_text(list_url)
-            for item in self._parse_list(list_html, list_url):
+            try:
+                list_html = self._get_text(list_url)
+            except Exception:
+                continue
+            items = self._parse_list(list_html, list_url)
+            if not items:
+                break
+            dated_items = 0
+            items_before_start = 0
+            new_items = 0
+            for item in items:
                 if item["url"] in seen:
                     continue
                 seen.add(item["url"])
-                detail_html = self._get_text(item["url"])
-                documents.append(self._parse_detail(item, detail_html))
-                if len(documents) >= self.max_documents:
-                    return documents
-        return documents
+                new_items += 1
+                published = _parse_iso_date(item.get("published_at"))
+                if published:
+                    dated_items += 1
+                    if self.start_date and published < self.start_date:
+                        items_before_start += 1
+                        continue
+                if self.end_date and published and published > self.end_date:
+                    continue
+                targets.append(
+                    CollectionTarget(
+                        source_url=item["url"],
+                        source_title=item.get("title", ""),
+                        published_at=item.get("published_at", ""),
+                        department_name=item.get("department", ""),
+                    )
+                )
+                if len(targets) >= self.max_documents:
+                    return targets
+            if new_items == 0:
+                break
+            if self.start_date and dated_items and items_before_start == dated_items:
+                break
+        return targets
+
+    def fetch_document(self, target: CollectionTarget) -> SourceDocument:
+        item = {
+            "url": target.source_url,
+            "title": target.source_title,
+            "department": target.department_name,
+            "published_at": target.published_at,
+        }
+        detail_html = self._get_text(target.source_url)
+        return self._parse_detail(item, detail_html)
 
     def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
         supported = [
             attachment
             for attachment in document.attachments
-            if attachment.filename.lower().endswith(".xlsx")
+            if attachment.filename.lower().endswith((".xlsx", ".xls", ".html", ".htm"))
         ]
         if not supported:
             raise UnsupportedDocumentError("no supported XLSX attachment found")
         rows: list[RawExpenseRow] = []
+        parse_errors: list[str] = []
+        parsed_any = False
         for attachment in supported:
-            for parsed in parse_expense_xlsx(Path(attachment.content_path).read_bytes()):
+            try:
+                parsed_rows = parse_expense_xlsx(Path(attachment.content_path).read_bytes())
+                parsed_any = True
+            except Exception as exc:
+                parse_errors.append(f"{attachment.filename}: {exc}")
+                continue
+            for parsed in parsed_rows:
+                if not self._is_within_date_range(parsed.used_date):
+                    continue
                 rows.append(
                     RawExpenseRow(
                         row_number=parsed.row_number,
@@ -456,7 +541,19 @@ class BusanCityLiveAdapter:
                         payment_method=parsed.payment_method or "card",
                     )
                 )
+        if not parsed_any:
+            raise UnsupportedDocumentError("all attachments failed: " + " | ".join(parse_errors))
         return rows
+
+    def _is_within_date_range(self, used_date: str) -> bool:
+        parsed_date = _parse_iso_date(used_date)
+        if parsed_date is None:
+            return True
+        if self.start_date and parsed_date < self.start_date:
+            return False
+        if self.end_date and parsed_date > self.end_date:
+            return False
+        return True
 
     def _parse_list(self, html: str, list_url: str) -> list[dict[str, str]]:
         items: list[dict[str, str]] = []
@@ -540,7 +637,10 @@ class BusanCityLiveAdapter:
                 filename = filename.rsplit("(", 1)[0].strip()
             url = urljoin(self.base_url, clean_href)
             media_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else "unknown"
-            payload = self._get_bytes(url, referer=referer)
+            try:
+                payload = self._get_bytes(url, referer=referer)
+            except Exception:
+                continue
             content_hash = stable_hash(url, payload)
             safe_name = re.sub(r"[^0-9A-Za-z가-힣_.-]+", "_", filename)[:120] or f"{upper_no}.{media_type}"
             path = self._write_raw(f"{upper_no}_{len(attachments) + 1}_{safe_name}", payload)
@@ -568,8 +668,16 @@ class BusanCityLiveAdapter:
         headers = {"User-Agent": "Mozilla/5.0"}
         if referer:
             headers["Referer"] = referer
-        with urlopen(Request(url, headers=headers), timeout=20) as response:
-            return response.read()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                with urlopen(Request(url, headers=headers), timeout=12) as response:
+                    return response.read()
+            except Exception as exc:
+                last_error = exc
+                if attempt < 1:
+                    time.sleep(0.4 * (attempt + 1))
+        raise last_error or TimeoutError("request failed")
 
 
 class DailyPipeline:
@@ -579,11 +687,13 @@ class DailyPipeline:
         adapter: ExpenseAdapter | None = None,
         verifier: VerifierAgent | None = None,
         settings: Settings | None = None,
+        verify_new_rows: bool = True,
     ) -> None:
         self.database = database
         self.adapter = adapter or BusanFixtureAdapter()
         self.verifier = verifier
         self.settings = settings
+        self.verify_new_rows = verify_new_rows
 
     def _active_verifier(self, conn: sqlite3.Connection) -> VerifierAgent:
         return self.verifier or self._build_verifier(self.settings, conn)
@@ -592,7 +702,6 @@ class DailyPipeline:
         if not settings:
             return VerifierAgent()
         naver_client = None
-        permit_client = None
         if settings.naver_search_client_id and settings.naver_search_client_secret:
             geocoder = None
             if settings.naver_maps_client_id and settings.naver_maps_client_secret:
@@ -609,11 +718,95 @@ class DailyPipeline:
             )
             if conn is not None:
                 naver_client = LoggedNaverClient(conn, naver_client)
+        return VerifierAgent(naver_client=naver_client, permit_client=NoPermitClient())
+
+    def _build_advisory_permit_client(
+        self,
+        settings: Settings | None,
+        conn: sqlite3.Connection | None = None,
+    ) -> PermitClient | None:
+        if not settings or not settings.data_go_kr_service_key:
+            return None
+        permit_client: PermitClient = DataGoKrPermitClient(settings.data_go_kr_service_key)
         if settings.data_go_kr_service_key:
-            permit_client = DataGoKrPermitClient(settings.data_go_kr_service_key)
             if conn is not None:
                 permit_client = CachedPermitClient(conn, permit_client)
-        return VerifierAgent(naver_client=naver_client, permit_client=permit_client)
+        return permit_client
+
+    def _annotate_advisory_permit(
+        self,
+        conn: sqlite3.Connection,
+        row: NormalizedExpenseRow,
+        decision: VerificationDecision,
+    ) -> str:
+        if self._should_skip_advisory_permit(decision):
+            return "skipped"
+        permit_client = self._build_advisory_permit_client(self.settings, conn)
+        if permit_client is None:
+            return "skipped"
+        try:
+            permit = permit_client.lookup(row)
+        except Exception as exc:
+            decision.reason_codes.append("PERMIT_ADVISORY_UNAVAILABLE")
+            decision.evidence["permit_advisory"] = {
+                "status": "unavailable",
+                "error": str(exc)[:300],
+            }
+            return "unavailable"
+        if permit is None:
+            decision.reason_codes.append("PERMIT_ADVISORY_MISSING")
+            decision.evidence["permit_advisory"] = {"status": "missing"}
+            return "missing"
+        advisory_payload = {
+            "status": "found",
+            "permit_id": permit.permit_id,
+            "business_status": permit.business_status,
+            "category": permit.category,
+            "address": permit.address,
+        }
+        if permit.business_status == "active" and permit.category in FOOD_CATEGORIES:
+            reason = "PERMIT_ADVISORY_ACTIVE_FOOD"
+            result = "active_food"
+        elif permit.business_status in {"closed", "moved", "non_food"}:
+            reason = "PERMIT_ADVISORY_NOT_ACTIVE"
+            result = "not_active"
+        elif permit.category not in FOOD_CATEGORIES:
+            reason = "PERMIT_ADVISORY_NON_FOOD_CATEGORY"
+            result = "non_food_category"
+        else:
+            reason = "PERMIT_ADVISORY_FOUND"
+            result = "found"
+        decision.reason_codes.append(reason)
+        decision.evidence["permit_advisory"] = advisory_payload
+        return result
+
+    def _should_skip_advisory_permit(self, decision: VerificationDecision) -> bool:
+        if decision.selected_candidate is not None:
+            return False
+        pre_api_prefixes = (
+            "NON_FOOD_PURPOSE_",
+            "FRANCHISE_ADDRESSLESS_NO_BRANCH",
+            "MANUAL_FEEDBACK_",
+            "PAYMENT_PROCESSOR_OR_CARD_PLACE_NAME",
+            "UNKNOWN_PLACE_ADDRESS_MISMATCH",
+        )
+        return any(
+            reason == prefix or reason.startswith(prefix)
+            for reason in decision.reason_codes
+            for prefix in pre_api_prefixes
+        )
+
+    def _track_advisory_permit_summary(
+        self,
+        summary: dict[str, Any],
+        result: str,
+    ) -> None:
+        if result == "skipped":
+            return
+        if result == "unavailable":
+            summary["permit_advisory_unavailable"] = summary.get("permit_advisory_unavailable", 0) + 1
+            return
+        summary["permit_advisory_checked"] = summary.get("permit_advisory_checked", 0) + 1
 
     def run(self) -> dict[str, Any]:
         self.database.initialize()
@@ -628,6 +821,8 @@ class DailyPipeline:
                 "rejected": 0,
                 "needs_review": 0,
                 "dlq": 0,
+                "permit_advisory_checked": 0,
+                "permit_advisory_unavailable": 0,
             }
             try:
                 source = self._load_source(conn)
@@ -667,10 +862,19 @@ class DailyPipeline:
                             )
                             if self._candidate_is_resolved(conn, candidate_id):
                                 continue
+                            if not self.verify_new_rows:
+                                self._defer_candidate_verification(conn, candidate_id)
+                                summary["needs_review"] += 1
+                                continue
                             decision = (
-                                non_food_purpose_decision(normalized)
+                                expense_scope_reject_decision(normalized)
+                                or non_food_purpose_decision(normalized)
                                 or alias_memory_decision(conn, normalized)
                                 or verifier.verify(normalized)
+                            )
+                            self._track_advisory_permit_summary(
+                                summary,
+                                self._annotate_advisory_permit(conn, normalized, decision),
                             )
                             self._persist_decision(conn, source, expense_id, candidate_id, decision)
                             summary[decision.decision] += 1
@@ -684,10 +888,410 @@ class DailyPipeline:
                 raise
 
     def verify_pending(self, limit: int = 100) -> dict[str, Any]:
+        return self._verify_pending(limit=limit, job_name="verify_pending", initial_only=False)
+
+    def verify_collected(self, limit: int = 100) -> dict[str, Any]:
+        return self._verify_pending(limit=limit, job_name="verify_collected", initial_only=True)
+
+    def create_collection_plan(
+        self,
+        start_date: str,
+        end_date: str,
+        max_pages: int = COLLECTION_SCAN_SAFETY_MAX_PAGES,
+        max_documents: int = COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
+        batch_size: int = 20,
+    ) -> dict[str, Any]:
+        self.database.initialize()
+        if not hasattr(self.adapter, "discover_targets"):
+            raise RuntimeError("adapter does not support collection planning")
+        self.adapter.max_pages = max(1, min(int(max_pages or COLLECTION_SCAN_SAFETY_MAX_PAGES), COLLECTION_SCAN_SAFETY_MAX_PAGES))  # type: ignore[attr-defined]
+        self.adapter.max_documents = max(1, min(int(max_documents or COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS), COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS))  # type: ignore[attr-defined]
+        self.adapter.start_date = _parse_iso_date(start_date)  # type: ignore[attr-defined]
+        self.adapter.end_date = _parse_iso_date(end_date)  # type: ignore[attr-defined]
+        capped_batch_size = max(1, min(int(batch_size or 20), 200))
+        with self.database.session() as conn:
+            batch_id = self._create_batch(conn, "collection_plan_discover")
+            summary = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "scan_max_pages": self.adapter.max_pages,  # type: ignore[attr-defined]
+                "scan_max_documents": self.adapter.max_documents,  # type: ignore[attr-defined]
+                "batch_size": capped_batch_size,
+                "documents_seen": 0,
+                "documents_inserted": 0,
+                "dlq": 0,
+            }
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO collection_plans
+                      (source_key, start_date, end_date, status, scan_max_pages,
+                       scan_max_documents, batch_size, created_batch_job_id, summary_json,
+                       updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.adapter.source_key,
+                        start_date,
+                        end_date,
+                        "discovering",
+                        self.adapter.max_pages,  # type: ignore[attr-defined]
+                        self.adapter.max_documents,  # type: ignore[attr-defined]
+                        capped_batch_size,
+                        batch_id,
+                        safe_json_dumps(summary),
+                        utc_now(),
+                    ),
+                )
+                plan_id = int(cur.lastrowid)
+                targets = self.adapter.discover_targets()  # type: ignore[attr-defined]
+                for target in targets:
+                    summary["documents_seen"] += 1
+                    inserted = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO collection_plan_documents
+                          (plan_id, source_url, source_title, department_name, published_at, status)
+                        VALUES (?, ?, ?, ?, ?, 'pending')
+                        """,
+                        (
+                            plan_id,
+                            target.source_url,
+                            target.source_title,
+                            target.department_name,
+                            target.published_at,
+                        ),
+                    ).rowcount
+                    if inserted:
+                        summary["documents_inserted"] += 1
+                self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
+                self._finish_batch(conn, batch_id, "success", summary)
+                return {
+                    "batch_id": batch_id,
+                    "plan_id": plan_id,
+                    "status": "success",
+                    "summary": summary,
+                }
+            except Exception as exc:
+                summary["dlq"] += 1
+                self._finish_batch(conn, batch_id, "failed", summary, str(exc))
+                raise
+
+    def run_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict[str, Any]:
+        self.database.initialize()
+        with self.database.session() as conn:
+            plan = conn.execute("SELECT * FROM collection_plans WHERE id = ?", (plan_id,)).fetchone()
+            if plan is None:
+                raise RuntimeError(f"collection plan not found: {plan_id}")
+            if hasattr(self.adapter, "start_date"):
+                self.adapter.start_date = _parse_iso_date(plan["start_date"])  # type: ignore[attr-defined]
+            if hasattr(self.adapter, "end_date"):
+                self.adapter.end_date = _parse_iso_date(plan["end_date"])  # type: ignore[attr-defined]
+            source = self._load_source(conn)
+            capped_batch_size = max(1, min(int(batch_size or plan["batch_size"] or 20), 200))
+            batch_id = self._create_batch(conn, "collection_plan_batch")
+            summary = {
+                "plan_id": plan_id,
+                "batch_size": capped_batch_size,
+                "documents_seen": 0,
+                "documents_inserted": 0,
+                "documents_duplicate": 0,
+                "rows_seen": 0,
+                "rows_inserted": 0,
+                "approved": 0,
+                "rejected": 0,
+                "needs_review": 0,
+                "dlq": 0,
+                "permit_advisory_checked": 0,
+                "permit_advisory_unavailable": 0,
+            }
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM collection_plan_documents
+                    WHERE plan_id = ? AND status = 'pending'
+                    ORDER BY published_at DESC, id ASC
+                    LIMIT ?
+                    """,
+                    (plan_id, capped_batch_size),
+                ).fetchall()
+                now = utc_now()
+                conn.execute(
+                    """
+                    UPDATE collection_plans
+                    SET status = 'collecting', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, plan_id),
+                )
+                for target_row in rows:
+                    summary["documents_seen"] += 1
+                    conn.execute(
+                        """
+                        UPDATE collection_plan_documents
+                        SET status = 'processing',
+                            batch_job_id = ?,
+                            attempts = attempts + 1,
+                            error_message = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (batch_id, utc_now(), target_row["id"]),
+                    )
+                    doc_rows_seen = 0
+                    doc_rows_inserted = 0
+                    document: SourceDocument | None = None
+                    try:
+                        document = self.adapter.fetch_document(
+                            CollectionTarget(
+                                source_url=target_row["source_url"],
+                                source_title=target_row["source_title"] or "",
+                                published_at=target_row["published_at"] or "",
+                                department_name=target_row["department_name"] or "",
+                            )
+                        )
+                        raw_document_id, inserted_doc = self._upsert_document(conn, source, document)
+                        if inserted_doc:
+                            summary["documents_inserted"] += 1
+                        else:
+                            summary["documents_duplicate"] += 1
+                        extracted_rows = self.adapter.extract(document)
+                        for raw_row in extracted_rows:
+                            doc_rows_seen += 1
+                            summary["rows_seen"] += 1
+                            normalized = self._normalize(raw_row)
+                            expense_id, inserted_row = self._upsert_expense(
+                                conn, source, raw_document_id, raw_row, normalized
+                            )
+                            candidate_id = self._upsert_candidate(
+                                conn, source, expense_id, raw_row, normalized
+                            )
+                            if inserted_row:
+                                doc_rows_inserted += 1
+                                summary["rows_inserted"] += 1
+                                if not self._candidate_is_resolved(conn, candidate_id):
+                                    self._defer_candidate_verification(conn, candidate_id)
+                                    summary["needs_review"] += 1
+                        document_status = (
+                            "collected"
+                            if inserted_doc or doc_rows_inserted > 0
+                            else "duplicate"
+                        )
+                        conn.execute(
+                            """
+                            UPDATE collection_plan_documents
+                            SET status = ?,
+                                raw_document_id = ?,
+                                rows_seen = ?,
+                                rows_inserted = ?,
+                                error_message = NULL,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                document_status,
+                                raw_document_id,
+                                doc_rows_seen,
+                                doc_rows_inserted,
+                                utc_now(),
+                                target_row["id"],
+                            ),
+                        )
+                    except Exception as exc:
+                        summary["dlq"] += 1
+                        self._insert_dlq(
+                            conn,
+                            batch_id,
+                            "collection_plan_document",
+                            {
+                                "plan_id": plan_id,
+                                "source_url": target_row["source_url"],
+                                "source_title": target_row["source_title"],
+                                "attachment_diagnostics": _attachment_diagnostics(document.attachments)
+                                if document is not None
+                                else [],
+                            },
+                            str(exc),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE collection_plan_documents
+                            SET status = 'failed',
+                                rows_seen = ?,
+                                rows_inserted = ?,
+                                error_message = ?,
+                                metadata_json = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                doc_rows_seen,
+                                doc_rows_inserted,
+                                str(exc),
+                                safe_json_dumps(
+                                    {
+                                        "attachment_diagnostics": _attachment_diagnostics(document.attachments)
+                                        if document is not None
+                                        else []
+                                    }
+                                ),
+                                utc_now(),
+                                target_row["id"],
+                            ),
+                        )
+                self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
+                self._finish_batch(conn, batch_id, "success", summary)
+                return {
+                    "batch_id": batch_id,
+                    "plan_id": plan_id,
+                    "status": "success",
+                    "summary": summary,
+                }
+            except Exception as exc:
+                self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
+                self._finish_batch(conn, batch_id, "failed", summary, str(exc))
+                raise
+
+    def run_collection_plan_batches(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict[str, Any]:
+        self.database.initialize()
+        capped_max_batches = max(1, min(int(max_batches or 100), 500))
+        pending_before = self._collection_plan_pending_count(plan_id)
+        summary: dict[str, Any] = {
+            "plan_id": plan_id,
+            "batches_run": 0,
+            "batch_ids": [],
+            "pending_before": pending_before,
+            "pending_after": pending_before,
+            "documents_seen": 0,
+            "documents_inserted": 0,
+            "documents_duplicate": 0,
+            "rows_seen": 0,
+            "rows_inserted": 0,
+            "approved": 0,
+            "rejected": 0,
+            "needs_review": 0,
+            "dlq": 0,
+        }
+        last_batch_id: int | None = None
+        for _ in range(capped_max_batches):
+            if self._collection_plan_pending_count(plan_id) <= 0:
+                break
+            result = self.run_collection_plan_batch(plan_id=plan_id, batch_size=batch_size)
+            batch_summary = result.get("summary", {})
+            if int(batch_summary.get("documents_seen") or 0) <= 0:
+                break
+            last_batch_id = int(result["batch_id"])
+            summary["batches_run"] += 1
+            summary["batch_ids"].append(last_batch_id)
+            for key in [
+                "documents_seen",
+                "documents_inserted",
+                "documents_duplicate",
+                "rows_seen",
+                "rows_inserted",
+                "approved",
+                "rejected",
+                "needs_review",
+                "dlq",
+            ]:
+                summary[key] += int(batch_summary.get(key) or 0)
+            summary["pending_after"] = self._collection_plan_pending_count(plan_id)
+            if summary["pending_after"] <= 0:
+                break
+        return {
+            "batch_id": last_batch_id,
+            "plan_id": plan_id,
+            "status": "success",
+            "summary": summary,
+        }
+
+    def retry_collection_plan_failures(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict[str, Any]:
+        self.database.initialize()
+        with self.database.session() as conn:
+            failed_before = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM collection_plan_documents
+                    WHERE plan_id = ? AND status = 'failed'
+                    """,
+                    (plan_id,),
+                ).fetchone()["count"]
+                or 0
+            )
+            if failed_before <= 0:
+                return {
+                    "batch_id": None,
+                    "plan_id": plan_id,
+                    "status": "success",
+                    "summary": {
+                        "plan_id": plan_id,
+                        "retried_failed": 0,
+                        "batches_run": 0,
+                        "pending_before": self._collection_plan_pending_count(plan_id),
+                        "pending_after": self._collection_plan_pending_count(plan_id),
+                        "documents_seen": 0,
+                        "documents_inserted": 0,
+                        "documents_duplicate": 0,
+                        "rows_seen": 0,
+                        "rows_inserted": 0,
+                        "approved": 0,
+                        "rejected": 0,
+                        "needs_review": 0,
+                        "dlq": 0,
+                    },
+                }
+            conn.execute(
+                """
+                UPDATE collection_plan_documents
+                SET status = 'pending',
+                    error_message = NULL,
+                    metadata_json = '{}',
+                    updated_at = ?
+                WHERE plan_id = ? AND status = 'failed'
+                """,
+                (utc_now(), plan_id),
+            )
+            self._refresh_collection_plan_counts(
+                conn,
+                plan_id,
+                extra_summary={"retry_failed_documents": failed_before},
+            )
+        result = self.run_collection_plan_batches(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+        result["summary"]["retried_failed"] = failed_before
+        return result
+
+    def _collection_plan_pending_count(self, plan_id: int) -> int:
+        with self.database.session() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM collection_plan_documents
+                WHERE plan_id = ? AND status = 'pending'
+                """,
+                (plan_id,),
+            ).fetchone()
+            return int(row["count"] or 0)
+
+    def _verify_pending(self, limit: int, job_name: str, initial_only: bool) -> dict[str, Any]:
         self.database.initialize()
         capped_limit = max(1, min(limit, 500))
         with self.database.session() as conn:
-            batch_id = self._create_batch(conn, "verify_pending")
+            batch_id = self._create_batch(conn, job_name)
             summary = {
                 "documents_seen": 0,
                 "documents_inserted": 0,
@@ -699,9 +1303,26 @@ class DailyPipeline:
                 "dlq": 0,
             }
             try:
+                summary["pending_before"] = self._verification_pending_count(conn, initial_only)
                 verifier = self._active_verifier(conn)
-                rows = conn.execute(
+                pending_filter = (
                     """
+                    c.verification_status = 'not_requested'
+                    AND c.review_note = 'PENDING_VERIFICATION'
+                    AND c.status = 'needs_review'
+                    AND c.manual_review_status = 'pending'
+                    AND (mrt.id IS NULL OR mrt.status = 'pending')
+                    """
+                    if initial_only
+                    else "mrt.status = 'pending'"
+                )
+                order_sql = (
+                    "COALESCE(mrt.created_at, c.updated_at) ASC, c.id ASC"
+                    if initial_only
+                    else "mrt.created_at ASC, c.id ASC"
+                )
+                rows = conn.execute(
+                    f"""
                     SELECT
                       c.id AS candidate_id,
                       c.expense_record_id,
@@ -715,11 +1336,11 @@ class DailyPipeline:
                       er.source_row_number,
                       er.department_name,
                       er.purpose
-                    FROM manual_review_tasks mrt
-                    JOIN restaurant_candidates c ON c.id = mrt.candidate_id
+                    FROM restaurant_candidates c
+                    LEFT JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
                     JOIN expense_records er ON er.id = c.expense_record_id
-                    WHERE mrt.status = 'pending'
-                    ORDER BY mrt.created_at ASC
+                    WHERE {pending_filter}
+                    ORDER BY {order_sql}
                     LIMIT ?
                     """,
                     (capped_limit,),
@@ -739,11 +1360,16 @@ class DailyPipeline:
                             normalized_address=row["normalized_address"] or normalize_address(row["original_address"]),
                         )
                         decision = (
-                            non_food_purpose_decision(normalized)
+                            expense_scope_reject_decision(normalized)
+                            or non_food_purpose_decision(normalized)
                             or existing_success_verification_decision(conn, int(row["candidate_id"]), normalized)
                             or alias_memory_decision(conn, normalized)
                             or existing_provider_evidence_decision(conn, int(row["candidate_id"]), normalized)
                             or verifier.verify(normalized)
+                        )
+                        self._track_advisory_permit_summary(
+                            summary,
+                            self._annotate_advisory_permit(conn, normalized, decision),
                         )
                         self._persist_decision(
                             conn,
@@ -763,11 +1389,112 @@ class DailyPipeline:
                             str(exc),
                         )
                 summary["rows_processed"] = summary["rows_seen"]
+                summary["pending_after"] = self._verification_pending_count(conn, initial_only)
                 self._finish_batch(conn, batch_id, "success", summary)
                 return {"batch_id": batch_id, "status": "success", "summary": summary}
             except Exception as exc:
+                summary["pending_after"] = self._verification_pending_count(conn, initial_only)
                 self._finish_batch(conn, batch_id, "failed", summary, str(exc))
                 raise
+
+    def _verification_pending_count(self, conn: sqlite3.Connection, initial_only: bool) -> int:
+        if initial_only:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM restaurant_candidates c
+                    LEFT JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
+                    WHERE c.verification_status = 'not_requested'
+                      AND c.review_note = 'PENDING_VERIFICATION'
+                      AND c.status = 'needs_review'
+                      AND c.manual_review_status = 'pending'
+                      AND (mrt.id IS NULL OR mrt.status = 'pending')
+                    """
+                ).fetchone()["count"]
+            )
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM manual_review_tasks
+                WHERE status = 'pending'
+                """
+            ).fetchone()["count"]
+        )
+
+    def _refresh_collection_plan_counts(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: int,
+        extra_summary: dict[str, Any] | None = None,
+    ) -> None:
+        counts = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS discovered_count,
+              SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+              SUM(CASE WHEN status = 'collected' THEN 1 ELSE 0 END) AS collected_count,
+              SUM(CASE WHEN status = 'duplicate' THEN 1 ELSE 0 END) AS duplicate_count,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+              SUM(rows_seen) AS rows_seen,
+              SUM(rows_inserted) AS rows_inserted
+            FROM collection_plan_documents
+            WHERE plan_id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+        pending_count = int(counts["pending_count"] or 0)
+        failed_count = int(counts["failed_count"] or 0)
+        discovered_count = int(counts["discovered_count"] or 0)
+        processed_count = (
+            int(counts["collected_count"] or 0)
+            + int(counts["duplicate_count"] or 0)
+            + failed_count
+        )
+        if discovered_count == 0:
+            status = "empty"
+        elif pending_count > 0 and processed_count > 0:
+            status = "collecting"
+        elif pending_count > 0:
+            status = "ready"
+        elif failed_count > 0:
+            status = "completed_with_errors"
+        else:
+            status = "completed"
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE collection_plans
+            SET status = ?,
+                discovered_count = ?,
+                pending_count = ?,
+                collected_count = ?,
+                duplicate_count = ?,
+                failed_count = ?,
+                rows_seen = ?,
+                rows_inserted = ?,
+                summary_json = ?,
+                updated_at = ?,
+                completed_at = CASE WHEN ? IN ('completed', 'completed_with_errors', 'empty') THEN ? ELSE completed_at END
+            WHERE id = ?
+            """,
+            (
+                status,
+                discovered_count,
+                pending_count,
+                int(counts["collected_count"] or 0),
+                int(counts["duplicate_count"] or 0),
+                failed_count,
+                int(counts["rows_seen"] or 0),
+                int(counts["rows_inserted"] or 0),
+                safe_json_dumps(extra_summary or {}),
+                now,
+                status,
+                now,
+                plan_id,
+            ),
+        )
 
     def _create_batch(self, conn: sqlite3.Connection, job_name: str | None = None) -> int:
         cur = conn.execute(
@@ -941,6 +1668,33 @@ class DailyPipeline:
             and row["status"] in {"verified", "rejected"}
             or row
             and row["manual_review_status"] == "pending"
+        )
+
+    def _defer_candidate_verification(self, conn: sqlite3.Connection, candidate_id: int) -> None:
+        conn.execute(
+            """
+            UPDATE restaurant_candidates
+            SET status = 'needs_review',
+                verification_status = 'not_requested',
+                manual_review_status = 'pending',
+                review_note = 'PENDING_VERIFICATION',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), candidate_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO manual_review_tasks (candidate_id, status, reason)
+            VALUES (?, 'pending', 'PENDING_VERIFICATION')
+            ON CONFLICT(candidate_id) DO UPDATE SET
+              status = 'pending',
+              reason = 'PENDING_VERIFICATION',
+              reviewer_note = NULL,
+              reviewed_by = NULL,
+              reviewed_at = NULL
+            """,
+            (candidate_id,),
         )
 
     def _persist_decision(
@@ -1339,6 +2093,41 @@ def _first_match(value: str, pattern: str, default: str = "") -> str:
 def _department_from_title(title: str) -> str:
     match = re.search(r"\(([^)]+)\)", title or "")
     return match.group(1).strip() if match else ""
+
+
+def _attachment_diagnostics(attachments: tuple[SourceAttachment, ...]) -> list[dict[str, Any]]:
+    return [_attachment_diagnostic(attachment) for attachment in attachments]
+
+
+def _attachment_diagnostic(attachment: SourceAttachment) -> dict[str, Any]:
+    path = Path(attachment.content_path)
+    payload = path.read_bytes() if path.exists() else b""
+    head = payload[:64]
+    return {
+        "filename": attachment.filename,
+        "media_type": attachment.media_type,
+        "url": attachment.url,
+        "content_path": attachment.content_path,
+        "content_hash": attachment.content_hash,
+        "size_bytes": len(payload),
+        "head_hex": head[:16].hex(),
+        "detected_type": _detect_attachment_type(payload),
+    }
+
+
+def _detect_attachment_type(payload: bytes) -> str:
+    head = payload[:512].lstrip().lower()
+    if not payload:
+        return "empty"
+    if payload.startswith(b"PK\x03\x04"):
+        return "xlsx_zip"
+    if payload.startswith(b"\x9b DRMONE") or b"DRMONE" in payload[:64]:
+        return "encrypted_drm"
+    if payload.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "legacy_xls_binary"
+    if head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<table" in head:
+        return "html_table"
+    return "unknown"
 
 
 def _elapsed_ms(started: float) -> int:

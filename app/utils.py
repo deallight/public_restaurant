@@ -37,6 +37,24 @@ def strip_address_detail(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def map_search_address(value: str | None) -> str:
+    text = strip_address_detail(value)
+    text = re.sub(r"^\s*\(?\d{5}\)?\s*", "", text)
+    road_match = re.match(
+        r"^(.*?(?:[0-9A-Za-z가-힣]+(?:대로|로|길))\s+\d+(?:-\d+)?)\b",
+        text,
+    )
+    if road_match:
+        return re.sub(r"\s+", " ", road_match.group(1)).strip()
+    lot_match = re.match(
+        r"^(.*?(?:[0-9A-Za-z가-힣]+(?:동|읍|면|리))\s+(?:산\s*)?\d+(?:-\d+)?)\b",
+        text,
+    )
+    if lot_match:
+        return re.sub(r"\s+", " ", lot_match.group(1)).strip()
+    return text
+
+
 def address_match_keys(value: str | None) -> set[str]:
     cleaned = strip_address_detail(value)
     normalized = normalize_address(cleaned)

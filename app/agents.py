@@ -87,6 +87,13 @@ NON_FOOD_PURPOSE_RULES = (
     ("필요물품", "NON_FOOD_PURPOSE_SUPPLY"),
     ("특산품", "NON_FOOD_PURPOSE_PRODUCT_PURCHASE"),
 )
+HARD_REJECT_PLACE_RULES = (
+    ("구입", "PURCHASE_WORD_IN_PLACE_NAME"),
+    ("쿠팡", "COUPANG_PLACE_NAME"),
+)
+HARD_REJECT_PURPOSE_RULES = (
+    ("경조사", "CEREMONIAL_EVENT_EXPENSE"),
+)
 FOOD_PURCHASE_PURPOSE_TOKENS = (
     "간담",
     "오찬",
@@ -331,6 +338,34 @@ def non_food_purpose_decision(row: NormalizedExpenseRow) -> VerificationDecision
         reason_codes=[reason],
         evidence={"purpose": row.purpose},
     )
+
+
+def expense_scope_reject_decision(row: NormalizedExpenseRow) -> VerificationDecision | None:
+    compact_name = normalize_text(row.place_name or row.normalized_place_name).replace(" ", "")
+    compact_purpose = normalize_text(row.purpose).replace(" ", "")
+    for token, reason in HARD_REJECT_PLACE_RULES:
+        if token in compact_name:
+            return VerificationDecision(
+                decision="rejected",
+                confidence=0.99,
+                approved_by="rule",
+                selected_candidate=None,
+                category="other",
+                reason_codes=[reason],
+                evidence={"place_name": row.place_name},
+            )
+    for token, reason in HARD_REJECT_PURPOSE_RULES:
+        if token in compact_purpose:
+            return VerificationDecision(
+                decision="rejected",
+                confidence=0.99,
+                approved_by="rule",
+                selected_candidate=None,
+                category="other",
+                reason_codes=[reason],
+                evidence={"purpose": row.purpose},
+            )
+    return None
 
 
 def manual_feedback_reject_decision(row: NormalizedExpenseRow) -> VerificationDecision | None:
@@ -842,6 +877,9 @@ class VerifierAgent:
         self.ai_reviewer = ai_reviewer or RuleBasedAiReviewer()
 
     def verify(self, row: NormalizedExpenseRow) -> VerificationDecision:
+        scope_reject_decision = expense_scope_reject_decision(row)
+        if scope_reject_decision is not None:
+            return scope_reject_decision
         purpose_decision = non_food_purpose_decision(row)
         if purpose_decision is not None:
             return purpose_decision

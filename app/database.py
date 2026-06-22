@@ -29,7 +29,9 @@ SQLITE_TABLES = [
     "place_verifications",
     "restaurant_candidates",
     "expense_records",
+    "collection_plan_documents",
     "raw_documents",
+    "collection_plans",
     "batch_jobs",
     "source_registry",
     "institutions",
@@ -63,7 +65,42 @@ class Database:
     def initialize(self) -> None:
         with self.session() as conn:
             conn.executescript(SQLITE_SCHEMA)
+            self._migrate_schema(conn)
             self.seed_core(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_columns(
+            conn,
+            "restaurant_candidates",
+            {
+                "review_place_name": "TEXT",
+                "review_normalized_place_name": "TEXT",
+                "review_address": "TEXT",
+                "review_normalized_address": "TEXT",
+                "review_major_category": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            conn,
+            "collection_plans",
+            {
+                "created_batch_job_id": "INTEGER REFERENCES batch_jobs(id)",
+            },
+        )
+
+    def _ensure_columns(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        columns: dict[str, str],
+    ) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        for column_name, column_sql in columns.items():
+            if column_name not in existing:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
     def rollback_schema(self) -> None:
         """Drop the development SQLite schema in dependency order.

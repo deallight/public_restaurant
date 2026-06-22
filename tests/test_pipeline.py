@@ -13,11 +13,21 @@ from app.agents import (
     PlaceCandidate,
     VerifierAgent,
     alias_keys_for_place,
+    expense_scope_reject_decision,
     non_food_purpose_reason,
 )
+from app.config import Settings
 from app.database import Database
 from app.integrations import DataGoKrPermitClient, _search_queries
-from app.pipeline import CachedPermitClient, DailyPipeline, RawExpenseRow, SourceDocument, existing_provider_evidence_decision
+from app.pipeline import (
+    CachedPermitClient,
+    CollectionTarget,
+    DailyPipeline,
+    RawExpenseRow,
+    SourceDocument,
+    existing_provider_evidence_decision,
+)
+from app.services import RestaurantService
 from app.source_catalog import iter_source_catalog
 from app.utils import normalized_address_similarity, strip_address_detail, structured_address_match
 
@@ -58,6 +68,201 @@ class PipelineTests(unittest.TestCase):
                 "manual_review_tasks": 1,
             },
         )
+
+    def test_live_collection_can_defer_verification_for_new_rows(self) -> None:
+        result = DailyPipeline(self.db, verify_new_rows=False).run()
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["summary"]["rows_inserted"], 5)
+        self.assertEqual(result["summary"]["needs_review"], 5)
+        with self.db.session() as conn:
+            pending = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM manual_review_tasks
+                WHERE status = 'pending' AND reason = 'PENDING_VERIFICATION'
+                """
+            ).fetchone()["c"]
+            candidates = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM restaurant_candidates
+                WHERE status = 'needs_review'
+                  AND verification_status = 'not_requested'
+                  AND manual_review_status = 'pending'
+                """
+            ).fetchone()["c"]
+
+        self.assertEqual(pending, 5)
+        self.assertEqual(candidates, 5)
+
+    def test_verify_collected_only_processes_initial_unverified_rows(self) -> None:
+        DailyPipeline(self.db, verify_new_rows=False).run()
+        with self.db.session() as conn:
+            manual = conn.execute("SELECT candidate_id FROM manual_review_tasks LIMIT 1").fetchone()
+            conn.execute(
+                """
+                UPDATE restaurant_candidates
+                SET verification_status = 'ambiguous',
+                    review_note = 'AI_BOUNDARY_SCORE'
+                WHERE id = ?
+                """,
+                (manual["candidate_id"],),
+            )
+            conn.execute(
+                "UPDATE manual_review_tasks SET reason = 'AI_BOUNDARY_SCORE' WHERE candidate_id = ?",
+                (manual["candidate_id"],),
+            )
+
+        result = DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(ExactNaverClient(), ExactPermitClient()),
+        ).verify_collected(limit=10)
+
+        self.assertEqual(result["summary"]["rows_seen"], 4)
+        with self.db.session() as conn:
+            untouched = conn.execute(
+                """
+                SELECT c.status, c.verification_status, mrt.status AS task_status
+                FROM restaurant_candidates c
+                JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
+                WHERE c.id = ?
+                """,
+                (manual["candidate_id"],),
+            ).fetchone()
+
+        self.assertEqual(untouched["status"], "needs_review")
+        self.assertEqual(untouched["verification_status"], "ambiguous")
+
+    def test_verify_collected_processes_initial_candidate_without_review_task(self) -> None:
+        DailyPipeline(self.db, verify_new_rows=False).run()
+        with self.db.session() as conn:
+            candidate_id = conn.execute(
+                """
+                SELECT candidate_id
+                FROM manual_review_tasks
+                WHERE status = 'pending'
+                LIMIT 1
+                """
+            ).fetchone()["candidate_id"]
+            conn.execute("DELETE FROM manual_review_tasks WHERE candidate_id = ?", (candidate_id,))
+
+        result = DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(ExactNaverClient(), ExactPermitClient()),
+        ).verify_collected(limit=10)
+
+        self.assertEqual(result["summary"]["pending_before"], 5)
+        self.assertEqual(result["summary"]["rows_processed"], 5)
+        with self.db.session() as conn:
+            candidate = conn.execute(
+                "SELECT status, verification_status FROM restaurant_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+
+        self.assertNotEqual(candidate["verification_status"], "not_requested")
+
+    def test_collection_plan_discovers_targets_and_batches_collection(self) -> None:
+        adapter = PlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=2,
+            max_documents=10,
+            batch_size=1,
+        )
+        first = pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        second = pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+
+        self.assertEqual(plan["summary"]["documents_seen"], 2)
+        self.assertEqual(first["summary"]["documents_seen"], 1)
+        self.assertEqual(first["summary"]["rows_inserted"], 1)
+        self.assertEqual(second["summary"]["documents_seen"], 1)
+        with self.db.session() as conn:
+            plan_row = conn.execute(
+                "SELECT * FROM collection_plans WHERE id = ?",
+                (plan["plan_id"],),
+            ).fetchone()
+            documents = conn.execute(
+                """
+                SELECT status, rows_inserted
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                ORDER BY id ASC
+                """,
+                (plan["plan_id"],),
+            ).fetchall()
+            pending = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM restaurant_candidates
+                WHERE verification_status = 'not_requested'
+                  AND review_note = 'PENDING_VERIFICATION'
+                """
+            ).fetchone()["c"]
+
+        self.assertEqual(plan_row["status"], "completed")
+        self.assertEqual([row["status"] for row in documents], ["collected", "collected"])
+        self.assertEqual([row["rows_inserted"] for row in documents], [1, 1])
+        self.assertEqual(pending, 2)
+        progress = RestaurantService(self.db).ops_logs(plan_id=plan["plan_id"], limit=10)["progress"]
+        self.assertEqual(len(progress["by_institution"]), 2)
+        self.assertTrue(all(item["percent"] == 100.0 for item in progress["by_institution"]))
+        self.assertEqual(progress["by_priority"][0]["percent"], 100.0)
+        period_progress = RestaurantService(self.db).collection_progress(
+            "2026-01-01",
+            "2026-12-31",
+        )
+        self.assertEqual(period_progress["document_count"], 2)
+        self.assertEqual(period_progress["plan_count"], 1)
+        self.assertEqual(len(period_progress["by_institution"]), 2)
+        self.assertEqual(
+            RestaurantService(self.db).collection_progress(
+                "2025-01-01",
+                "2025-12-31",
+            )["document_count"],
+            0,
+        )
+        dashboard = RestaurantService(self.db).collection_dashboard(
+            "2026-01-01",
+            "2026-12-31",
+        )
+        self.assertEqual(dashboard["city"]["name"], "부산광역시")
+        self.assertEqual(dashboard["city"]["document_count"], 2)
+        self.assertEqual(len(dashboard["priorities"]), 8)
+        self.assertEqual(dashboard["priorities"][0]["priority"], 1)
+        self.assertEqual(len(dashboard["priorities"][0]["institutions"]), 2)
+
+    def test_collection_plan_batches_repeat_until_no_pending_documents(self) -> None:
+        adapter = PlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=2,
+            max_documents=10,
+            batch_size=1,
+        )
+        result = pipeline.run_collection_plan_batches(plan["plan_id"], batch_size=1)
+
+        self.assertEqual(result["summary"]["batches_run"], 2)
+        self.assertEqual(result["summary"]["pending_before"], 2)
+        self.assertEqual(result["summary"]["pending_after"], 0)
+        self.assertEqual(result["summary"]["rows_inserted"], 2)
+        with self.db.session() as conn:
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM collection_plan_documents
+                WHERE plan_id = ? AND status = 'pending'
+                """,
+                (plan["plan_id"],),
+            ).fetchone()["c"]
+
+        self.assertEqual(remaining, 0)
 
     def test_sqlite_schema_apply_and_development_rollback(self) -> None:
         self.assertGreater(self.db.count("regions"), 0)
@@ -297,6 +502,75 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pending_count, 0)
         self.assertEqual(restaurant_count, 1)
         self.assertEqual(visible_map_count, 1)
+
+    def test_settings_permit_timeout_is_advisory_and_does_not_dlq(self) -> None:
+        settings = Settings(
+            db_path=Path(self.tmp.name) / "test.db",
+            data_go_kr_service_key="test-key",
+        )
+
+        with patch("app.pipeline.DataGoKrPermitClient", return_value=TimeoutPermitClient()):
+            result = DailyPipeline(
+                self.db,
+                adapter=AddresslessAdapter(),
+                verifier=VerifierAgent(ExactNaverClient(), EmptyPermitClient()),
+                settings=settings,
+            ).run()
+
+        self.assertEqual(result["summary"]["approved"], 1)
+        self.assertEqual(result["summary"]["dlq"], 0)
+        self.assertEqual(result["summary"]["permit_advisory_unavailable"], 1)
+        with self.db.session() as conn:
+            audit = conn.execute(
+                """
+                SELECT reason_codes_json
+                FROM decision_audit_logs
+                WHERE action = 'approved'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()["reason_codes_json"]
+            api_error = conn.execute(
+                """
+                SELECT error_message
+                FROM api_call_logs
+                WHERE provider = 'data_go_kr'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()["error_message"]
+
+        self.assertIn("PERMIT_ADVISORY_UNAVAILABLE", audit)
+        self.assertIn("read operation timed out", api_error)
+
+    def test_settings_permit_not_active_is_advisory_and_does_not_override_naver_approval(self) -> None:
+        settings = Settings(
+            db_path=Path(self.tmp.name) / "test.db",
+            data_go_kr_service_key="test-key",
+        )
+
+        with patch("app.pipeline.DataGoKrPermitClient", return_value=ClosedPermitClient()):
+            result = DailyPipeline(
+                self.db,
+                adapter=AddresslessAdapter(),
+                verifier=VerifierAgent(ExactNaverClient(), EmptyPermitClient()),
+                settings=settings,
+            ).run()
+
+        self.assertEqual(result["summary"]["approved"], 1)
+        self.assertEqual(result["summary"]["needs_review"], 0)
+        self.assertEqual(result["summary"]["dlq"], 0)
+        self.assertEqual(result["summary"]["permit_advisory_checked"], 1)
+        with self.db.session() as conn:
+            verification = conn.execute(
+                """
+                SELECT verification_status, verification_reason
+                FROM place_verifications
+                """
+            ).fetchone()
+
+        self.assertEqual(verification["verification_status"], "success")
+        self.assertIn("PERMIT_ADVISORY_NOT_ACTIVE", verification["verification_reason"])
 
     def test_generic_addressless_naver_candidate_stays_manual_review(self) -> None:
         result = DailyPipeline(
@@ -1086,6 +1360,33 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(non_food_purpose_reason("회의 다과 구입"))
         self.assertIsNone(non_food_purpose_reason("직원 격려 간식 구입"))
 
+    def test_scope_reject_rules_run_before_external_verification(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+        cases = [
+            ("사무용품 구입", "업무협의", "PURCHASE_WORD_IN_PLACE_NAME"),
+            ("쿠팡", "업무협의", "COUPANG_PLACE_NAME"),
+            ("부산식당", "직원 경조사 지원", "CEREMONIAL_EVENT_EXPENSE"),
+        ]
+
+        for place_name, purpose, expected_reason in cases:
+            with self.subTest(place_name=place_name, purpose=purpose):
+                row = NormalizedExpenseRow(
+                    row_number=1,
+                    department_name="총무과",
+                    used_date="2026-06-20",
+                    place_name=place_name,
+                    address="",
+                    purpose=purpose,
+                    amount=10000,
+                    normalized_place_name=place_name,
+                    normalized_address="",
+                )
+                decision = verifier.verify(row)
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(decision.reason_codes, [expected_reason])
+                self.assertEqual(expense_scope_reject_decision(row), decision)
+
     def test_naver_search_queries_strip_companion_suffix(self) -> None:
         row = NormalizedExpenseRow(
             row_number=1,
@@ -1235,6 +1536,58 @@ class AddresslessAdapter:
         ]
 
 
+class PlanningAdapter:
+    source_key = "busan_city_expense_v1"
+
+    def __init__(self) -> None:
+        self.max_pages = 1
+        self.max_documents = 10
+        self.start_date = None
+        self.end_date = None
+
+    def discover(self) -> list[SourceDocument]:
+        return [self.fetch_document(target) for target in self.discover_targets()]
+
+    def discover_targets(self) -> list[CollectionTarget]:
+        return [
+            CollectionTarget(
+                source_url="fixture://busan/planning/1",
+                source_title="1분기 업무추진비",
+                published_at="2026-03-31",
+                department_name="기획담당관",
+            ),
+            CollectionTarget(
+                source_url="fixture://busan/planning/2",
+                source_title="2분기 업무추진비",
+                published_at="2026-06-30",
+                department_name="청년정책과",
+            ),
+        ][: self.max_documents]
+
+    def fetch_document(self, target: CollectionTarget) -> SourceDocument:
+        return SourceDocument(
+            source_url=target.source_url,
+            source_title=target.source_title,
+            published_at=target.published_at,
+            content=f"planning-{target.source_url}",
+            department_name=target.department_name,
+        )
+
+    def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
+        suffix = document.source_url.rsplit("/", 1)[-1]
+        return [
+            RawExpenseRow(
+                row_number=1,
+                department_name=document.department_name,
+                used_date="2026-02-01",
+                place_name=f"계획식당{suffix}",
+                address="",
+                purpose="간담회",
+                amount=10000 + int(suffix),
+            )
+        ]
+
+
 class GenericAddresslessAdapter:
     source_key = "busan_city_expense_v1"
 
@@ -1334,6 +1687,11 @@ class ExplodingNaverClient:
 class ExplodingPermitClient:
     def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
         raise AssertionError("Permit client should not be called for non-food purpose rows")
+
+
+class TimeoutPermitClient:
+    def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
+        raise TimeoutError("The read operation timed out")
 
 
 class ExactNaverClient:

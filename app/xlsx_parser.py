@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from io import BytesIO
 from xml.etree import ElementTree as ET
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -24,7 +25,7 @@ class ParsedExpenseRow:
 
 
 def parse_expense_xlsx(payload: bytes) -> list[ParsedExpenseRow]:
-    rows = _read_first_sheet(payload)
+    rows = _read_rows(payload)
     header_index, header = _find_header(rows)
     mapping = _header_mapping(header)
     parsed: list[ParsedExpenseRow] = []
@@ -51,6 +52,19 @@ def parse_expense_xlsx(payload: bytes) -> list[ParsedExpenseRow]:
     return parsed
 
 
+def _read_rows(payload: bytes) -> list[list[str]]:
+    if _looks_like_html(payload):
+        return _read_html_tables(payload)
+    if payload.startswith(b"\x9b DRMONE") or b"DRMONE" in payload[:64]:
+        raise ValueError("unsupported encrypted DRM file")
+    if payload.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise ValueError("unsupported legacy xls binary file")
+    try:
+        return _read_first_sheet(payload)
+    except BadZipFile as exc:
+        raise ValueError("unsupported spreadsheet file: not xlsx/html") from exc
+
+
 def _read_first_sheet(payload: bytes) -> list[list[str]]:
     with ZipFile(BytesIO(payload)) as archive:
         shared = _shared_strings(archive)
@@ -67,6 +81,59 @@ def _read_first_sheet(payload: bytes) -> list[list[str]]:
             max_index = max(max_index, index)
         rows.append([values.get(index, "") for index in range(max_index + 1)])
     return rows
+
+
+class _TableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._in_cell = False
+        self._current_row: list[str] | None = None
+        self._current_cell: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "tr":
+            self._current_row = []
+        elif tag.lower() in {"td", "th"} and self._current_row is not None:
+            self._in_cell = True
+            self._current_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"td", "th"} and self._in_cell and self._current_row is not None:
+            self._current_row.append(re.sub(r"\s+", " ", "".join(self._current_cell)).strip())
+            self._current_cell = []
+            self._in_cell = False
+        elif tag.lower() == "tr" and self._current_row is not None:
+            if any(cell.strip() for cell in self._current_row):
+                self.rows.append(self._current_row)
+            self._current_row = None
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._current_cell.append(data)
+
+
+def _looks_like_html(payload: bytes) -> bool:
+    head = payload[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<table" in head
+
+
+def _read_html_tables(payload: bytes) -> list[list[str]]:
+    text = _decode_text(payload)
+    parser = _TableParser()
+    parser.feed(text)
+    if not parser.rows:
+        raise ValueError("html table not found")
+    return parser.rows
+
+
+def _decode_text(payload: bytes) -> str:
+    for encoding in ["utf-8-sig", "cp949", "euc-kr", "utf-16"]:
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8", errors="replace")
 
 
 def _shared_strings(archive: ZipFile) -> list[str]:
@@ -109,11 +176,9 @@ def _text(element: ET.Element) -> str:
 
 
 def _find_header(rows: list[list[str]]) -> tuple[int, list[str]]:
-    for index, row in enumerate(rows[:20]):
+    for index, row in enumerate(rows[:50]):
         normalized = [_normalize(cell) for cell in row]
-        if any(cell in {"장소", "사용장소", "집행장소"} for cell in normalized) and any(
-            "금액" in cell for cell in normalized
-        ):
+        if any(_is_place_header(cell) for cell in normalized) and any(_is_amount_header(cell) for cell in normalized):
             return index, row
     raise ValueError("expense header row not found")
 
@@ -121,22 +186,55 @@ def _find_header(rows: list[list[str]]) -> tuple[int, list[str]]:
 def _header_mapping(header: list[str]) -> dict[str, int]:
     normalized = [_normalize(cell) for cell in header]
     mapping = {
-        "date": _find_any(normalized, ["일시", "사용일자", "집행일자", "사용일", "일자"]),
-        "place": _find_any(normalized, ["장소", "사용장소", "집행장소", "업소명", "상호"]),
-        "amount": _find_contains(normalized, "금액"),
+        "date": _find_label(
+            normalized,
+            ["일시", "날짜", "사용일자", "집행일자", "사용일", "일자", "집행일", "지출일자", "사용일시"],
+        ),
+        "place": _find_label(
+            normalized,
+            ["장소", "사용장소", "집행장소", "업소명", "상호", "상호명", "사용처", "지급처", "업체명"],
+        ),
+        "amount": _find_amount(normalized),
     }
     optional = {
         "department": ["사용자", "부서", "담당부서", "집행자"],
-        "purpose": ["집행목적", "사용목적", "사용내역", "내용", "목적"],
+        "purpose": ["집행목적", "사용목적", "사용내역", "집행내용", "내용", "목적", "내역"],
         "participants": ["대상인원수", "대상인원", "참석인원", "인원"],
         "payment_method": ["결제방법", "사용방법", "지급방법"],
     }
     for key, labels in optional.items():
         try:
-            mapping[key] = _find_any(normalized, labels)
+            mapping[key] = _find_label(normalized, labels)
         except ValueError:
             mapping[key] = -1
     return mapping
+
+
+def _is_place_header(value: str) -> bool:
+    return value in {"장소", "사용장소", "집행장소", "업소명", "상호", "상호명", "사용처", "지급처", "업체명"} or (
+        "장소" in value and "목적" not in value
+    )
+
+
+def _is_amount_header(value: str) -> bool:
+    return any(token in value for token in ["금액", "집행액", "지출액", "사용액"])
+
+
+def _find_label(values: list[str], candidates: list[str]) -> int:
+    for candidate in candidates:
+        if candidate in values:
+            return values.index(candidate)
+    for index, value in enumerate(values):
+        if any(candidate in value for candidate in candidates):
+            return index
+    raise ValueError(f"required column not found: {candidates}")
+
+
+def _find_amount(values: list[str]) -> int:
+    for index, value in enumerate(values):
+        if _is_amount_header(value):
+            return index
+    raise ValueError("required column not found: amount")
 
 
 def _find_any(values: list[str], candidates: list[str]) -> int:

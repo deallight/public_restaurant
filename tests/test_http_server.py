@@ -47,6 +47,28 @@ class HttpServerTests(unittest.TestCase):
     def test_public_admin_and_ops_api(self) -> None:
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
         self.assertIn("공공 맛집 지도", index)
+        admin = urlopen(f"{self.base_url}/admin", timeout=5).read().decode("utf-8")
+        self.assertNotIn("live-max-pages", admin)
+        self.assertNotIn("live-max-documents", admin)
+        self.assertIn("관리자 대시보드", admin)
+        self.assertIn("dashboard-start-date", admin)
+        self.assertIn("dashboard-end-date", admin)
+        self.assertIn("priority-chart", admin)
+        self.assertNotIn("review-queue", admin)
+        review_admin = urlopen(f"{self.base_url}/admin/review", timeout=5).read().decode("utf-8")
+        self.assertIn("후보 데이터", review_admin)
+        self.assertIn("review-queue", review_admin)
+        progress = self.get_json(
+            "/ops/collection-progress?start_date=2026-01-01&end_date=2026-12-31"
+        )
+        self.assertEqual(progress["start_date"], "2026-01-01")
+        self.assertEqual(progress["end_date"], "2026-12-31")
+        self.assertEqual(progress["document_count"], 0)
+        dashboard = self.get_json(
+            "/ops/dashboard?start_date=2026-01-01&end_date=2026-12-31"
+        )
+        self.assertEqual(dashboard["city"]["name"], "부산광역시")
+        self.assertEqual(len(dashboard["priorities"]), 8)
 
         batch = self.post_json("/ops/run-daily")
         self.assertEqual(batch["status"], "success")
