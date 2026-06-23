@@ -40,6 +40,13 @@ const verificationSegments = [
   { key: "rejected", label: "반려", color: "#d95d4f" },
 ];
 
+const collectionSegments = [
+  { key: "stored", label: "수집 완료", className: "collected" },
+  { key: "failed", label: "실패", className: "failed" },
+  { key: "processing", label: "처리 중", className: "processing" },
+  { key: "pending", label: "대기", className: "pending" },
+];
+
 function liveCollectionPayload() {
   return {
     start_date: document.querySelector("#live-start-date")?.value || "",
@@ -87,7 +94,56 @@ function renderOverview(payload) {
 
 function progressWidth(value, maximum) {
   if (!maximum) return 0;
-  return Math.max(2, Math.min(100, Number(value || 0) / maximum * 100));
+  return Math.max(0, Math.min(100, Number(value || 0) / maximum * 100));
+}
+
+function collectionStatusTrack(item, maximum) {
+  const description = collectionSegments
+    .map((segment) => `${segment.label} ${Number(item[segment.key] || 0)}건`)
+    .join(", ");
+  return `
+    <span class="dashboard-bar-track" aria-label="${escapeHtml(description)}">
+      ${collectionSegments.map((segment) => {
+        const count = Number(item[segment.key] || 0);
+        return count > 0
+          ? `<i class="${segment.className}" style="width:${progressWidth(count, maximum)}%" title="${segment.label} ${count}건"></i>`
+          : "";
+      }).join("")}
+    </span>
+  `;
+}
+
+function verificationStatusTrack(verification) {
+  const total = Number(verification?.total || 0);
+  const description = verificationSegments
+    .map((segment) => `${segment.label} ${Number(verification?.[segment.key] || 0)}건`)
+    .join(", ");
+  return `
+    <span class="dashboard-bar-track verification" aria-label="${escapeHtml(description)}">
+      ${verificationSegments.map((segment) => {
+        const count = Number(verification?.[segment.key] || 0);
+        return count > 0
+          ? `<i style="width:${progressWidth(count, total)}%;background:${segment.color}" title="${segment.label} ${count}건"></i>`
+          : "";
+      }).join("")}
+    </span>
+  `;
+}
+
+function metricTracks(item, collectionMaximum) {
+  const verification = item.verification || {};
+  return `
+    <span class="dashboard-metric-tracks">
+      <span class="dashboard-track-line">
+        <small>수집</small>
+        ${collectionStatusTrack(item, collectionMaximum)}
+      </span>
+      <span class="dashboard-track-line">
+        <small>검증</small>
+        ${verificationStatusTrack(verification)}
+      </span>
+    </span>
+  `;
 }
 
 function renderPriorityChart() {
@@ -102,14 +158,12 @@ function renderPriorityChart() {
     >
       <span class="dashboard-bar-label">
         <strong>${item.priority}순위</strong>
-        <small>${escapeHtml(item.label)}</small>
+        <small>${escapeHtml(item.label)} · ${item.ready_count}/${item.source_count} 준비</small>
       </span>
-      <span class="dashboard-bar-track">
-        <i style="width:${progressWidth(item.total, maximum)}%"></i>
-      </span>
+      ${metricTracks(item, maximum)}
       <span class="dashboard-bar-value">
         <strong>${Number(item.total || 0).toLocaleString("ko-KR")}건</strong>
-        <small>${item.ready_count}/${item.source_count} 준비</small>
+        <small>수집 ${item.stored || 0}/${item.total || 0} · 검증완료 ${item.verification?.completed || 0}/${item.verification?.total || 0}</small>
       </span>
     </button>
   `).join("") || '<p class="empty">수집 우선순위가 없습니다.</p>';
@@ -131,31 +185,37 @@ function renderPriorityDetail() {
   if (!selected) return;
   dashboardState.selectedPriority = Number(selected.priority);
   document.querySelector("#priority-detail-title").textContent = `${selected.priority}순위 · ${selected.label}`;
+  const detailLinkParams = new URLSearchParams({
+    start_date: dashboardState.payload?.start_date || "",
+    end_date: dashboardState.payload?.end_date || "",
+  });
+  document.querySelector("#priority-detail-link").href = `/admin/documents?${detailLinkParams.toString()}`;
   const institutions = selected.institutions || [];
   const maximum = Math.max(1, ...institutions.map((item) => Number(item.total || 0)));
   const node = document.querySelector("#priority-detail");
   node.innerHTML = institutions.map((item) => {
-    const params = new URLSearchParams({ institution: item.label });
+    const params = new URLSearchParams({
+      institution: item.label,
+      start_date: dashboardState.payload?.start_date || "",
+      end_date: dashboardState.payload?.end_date || "",
+    });
+    const verification = item.verification || {};
     const status = item.total
-      ? `처리 ${item.processed}/${item.total} · 실패 ${item.failed}`
+      ? `수집 ${item.stored}/${item.total} · 실패 ${item.failed} · 검증완료 ${verification.completed || 0}/${verification.total || 0}`
       : statusLabel(item.status);
     return `
       <a
         class="dashboard-bar-row detail"
-        href="/admin/logs?${params.toString()}"
-        target="_blank"
-        rel="noreferrer"
+        href="/admin/documents?${params.toString()}"
       >
         <span class="dashboard-bar-label">
           <strong>${escapeHtml(item.label)}</strong>
           <small>${escapeHtml(status)}</small>
         </span>
-        <span class="dashboard-bar-track">
-          <i style="width:${progressWidth(item.total, maximum)}%"></i>
-        </span>
+        ${metricTracks(item, maximum)}
         <span class="dashboard-bar-value">
           <strong>${Number(item.total || 0).toLocaleString("ko-KR")}건</strong>
-          <small>${Number(item.percent || 0).toFixed(1)}%</small>
+          <small>수집 ${Number(item.percent || 0).toFixed(1)}% · 검증 ${Number(verification.percent || 0).toFixed(1)}%</small>
         </span>
       </a>
     `;

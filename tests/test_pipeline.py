@@ -234,6 +234,38 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(dashboard["priorities"]), 8)
         self.assertEqual(dashboard["priorities"][0]["priority"], 1)
         self.assertEqual(len(dashboard["priorities"][0]["institutions"]), 2)
+        self.assertEqual(dashboard["priorities"][0]["verification"]["total"], 2)
+        self.assertEqual(dashboard["priorities"][0]["verification"]["pending"], 2)
+        self.assertEqual(dashboard["priorities"][0]["verification"]["completed"], 0)
+        self.assertTrue(
+            all(
+                item["verification"]["total"] == 1
+                for item in dashboard["priorities"][0]["institutions"]
+            )
+        )
+        document_board = RestaurantService(self.db).admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            limit=10,
+        )
+        self.assertEqual(document_board["total"], 2)
+        self.assertEqual(document_board["summary"]["candidates"], 2)
+        self.assertEqual(len(document_board["items"]), 2)
+        selected_document = document_board["items"][0]
+        institution_board = RestaurantService(self.db).admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            institution=selected_document["institution_label"],
+            limit=10,
+        )
+        self.assertEqual(institution_board["total"], 1)
+        document_detail = RestaurantService(self.db).admin_document_detail(
+            int(selected_document["id"]),
+        )
+        self.assertEqual(document_detail["document"]["id"], selected_document["id"])
+        self.assertEqual(document_detail["total"], 1)
+        self.assertEqual(len(document_detail["items"]), 1)
+        self.assertIn("effective_place_name", document_detail["items"][0])
 
     def test_collection_plan_batches_repeat_until_no_pending_documents(self) -> None:
         adapter = PlanningAdapter()

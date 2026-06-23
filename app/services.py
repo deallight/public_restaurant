@@ -1974,8 +1974,10 @@ class RestaurantService:
                         "source_count": 0,
                         "ready_count": 0,
                         "documents": self._empty_progress_counts(),
+                        "verification": self._empty_verification_counts(),
                         "configured_institutions": [],
                         "document_institutions": {},
+                        "institution_verifications": {},
                     },
                 )
                 group["source_count"] += 1
@@ -2022,8 +2024,10 @@ class RestaurantService:
                         "source_count": 0,
                         "ready_count": 0,
                         "documents": self._empty_progress_counts(),
+                        "verification": self._empty_verification_counts(),
                         "configured_institutions": [],
                         "document_institutions": {},
+                        "institution_verifications": {},
                     },
                 )
                 self._increment_progress_counts(group["documents"], str(row["status"]))
@@ -2036,6 +2040,77 @@ class RestaurantService:
                     self._empty_progress_counts(),
                 )
                 self._increment_progress_counts(institution_counts, str(row["status"]))
+
+            verification_rows = conn.execute(
+                """
+                SELECT
+                  c.status,
+                  c.verification_status,
+                  er.department_name,
+                  COALESCE(cpd.source_title, rd.source_title) AS source_title,
+                  cpd.department_name AS collection_department_name,
+                  rd.metadata_json,
+                  COALESCE(cp.source_key, sr.source_key) AS source_key
+                FROM restaurant_candidates c
+                JOIN expense_records er ON er.id = c.expense_record_id
+                JOIN raw_documents rd ON rd.id = er.raw_document_id
+                LEFT JOIN collection_plan_documents cpd
+                  ON cpd.id = (
+                    SELECT MAX(latest_cpd.id)
+                    FROM collection_plan_documents latest_cpd
+                    WHERE latest_cpd.raw_document_id = rd.id
+                  )
+                LEFT JOIN collection_plans cp ON cp.id = cpd.plan_id
+                LEFT JOIN source_registry sr ON sr.id = rd.source_registry_id
+                WHERE er.used_date >= ?
+                  AND er.used_date <= ?
+                """,
+                (start_date, end_date),
+            ).fetchall()
+            for row in verification_rows:
+                source_key = str(row["source_key"] or "")
+                config = source_configs.get(source_key, {})
+                priority = int(config.get("priority") or 99)
+                group = groups.setdefault(
+                    priority,
+                    {
+                        "priority": priority,
+                        "group_key": str(config.get("group_key") or "unknown"),
+                        "label": str(config.get("group_label") or source_key or "미분류"),
+                        "source_count": 0,
+                        "ready_count": 0,
+                        "documents": self._empty_progress_counts(),
+                        "verification": self._empty_verification_counts(),
+                        "configured_institutions": [],
+                        "document_institutions": {},
+                        "institution_verifications": {},
+                    },
+                )
+                self._increment_verification_counts(
+                    group["verification"],
+                    str(row["status"]),
+                    str(row["verification_status"]),
+                )
+                metadata = safe_json_loads(row["metadata_json"], {})
+                department_name = str(
+                    row["collection_department_name"]
+                    or metadata.get("department_name")
+                    or row["department_name"]
+                    or ""
+                )
+                institution_label = self._collection_progress_label(
+                    str(row["source_title"] or ""),
+                    department_name,
+                )
+                institution_verification = group["institution_verifications"].setdefault(
+                    institution_label,
+                    self._empty_verification_counts(),
+                )
+                self._increment_verification_counts(
+                    institution_verification,
+                    str(row["status"]),
+                    str(row["verification_status"]),
+                )
 
             candidate_counts = conn.execute(
                 """
@@ -2074,17 +2149,35 @@ class RestaurantService:
         priorities: list[dict[str, Any]] = []
         for priority, group in sorted(groups.items()):
             document_counts = group.pop("documents")
+            verification_counts = group.pop("verification")
             configured = group.pop("configured_institutions")
             collected_institutions = group.pop("document_institutions")
-            if collected_institutions:
+            institution_verifications = group.pop("institution_verifications")
+            institution_labels = set(collected_institutions) | set(institution_verifications)
+            if institution_labels:
                 institutions = [
                     {
-                        **self._collection_progress_item(label, counts),
+                        **self._collection_progress_item(
+                            label,
+                            collected_institutions.get(label, self._empty_progress_counts()),
+                        ),
+                        "verification": self._verification_progress_item(
+                            institution_verifications.get(
+                                label,
+                                self._empty_verification_counts(),
+                            )
+                        ),
                         "status": "collected",
                     }
-                    for label, counts in sorted(
-                        collected_institutions.items(),
-                        key=lambda item: (-item[1]["total_count"], item[0]),
+                    for label in sorted(
+                        institution_labels,
+                        key=lambda item: (
+                            -collected_institutions.get(
+                                item,
+                                self._empty_progress_counts(),
+                            )["total_count"],
+                            item,
+                        ),
                     )
                 ]
             else:
@@ -2093,12 +2186,17 @@ class RestaurantService:
                         "label": item["label"],
                         "total": 0,
                         "processed": 0,
+                        "successful": 0,
+                        "stored": 0,
                         "pending": 0,
                         "processing": 0,
                         "collected": 0,
                         "duplicate": 0,
                         "failed": 0,
                         "percent": 0.0,
+                        "verification": self._verification_progress_item(
+                            self._empty_verification_counts()
+                        ),
                         "status": item["status"],
                     }
                     for item in configured
@@ -2107,6 +2205,7 @@ class RestaurantService:
                 {
                     **group,
                     **self._collection_progress_item(group["label"], document_counts),
+                    "verification": self._verification_progress_item(verification_counts),
                     "institutions": institutions,
                 }
             )
@@ -2132,6 +2231,382 @@ class RestaurantService:
             "priorities": priorities,
         }
 
+    def admin_documents(
+        self,
+        start_date: str,
+        end_date: str,
+        institution: str = "",
+        status: str = "",
+        q: str = "",
+        sort: str = "published_desc",
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise AppError(400, "start_date and end_date must use YYYY-MM-DD") from exc
+        if start > end:
+            raise AppError(400, "start_date must not be after end_date")
+        capped_limit = max(1, min(int(limit or 10), 100))
+        safe_offset = max(0, int(offset or 0))
+        status_filter = str(status or "").strip()
+        if status_filter and status_filter not in {
+            "pending",
+            "processing",
+            "collected",
+            "duplicate",
+            "failed",
+        }:
+            raise AppError(400, "unsupported document status")
+
+        with self.database.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  cpd.id,
+                  cpd.plan_id,
+                  cpd.source_url,
+                  cpd.source_title,
+                  cpd.department_name,
+                  cpd.published_at,
+                  cpd.status,
+                  cpd.raw_document_id,
+                  cpd.rows_seen,
+                  cpd.rows_inserted,
+                  cpd.attempts,
+                  cpd.error_message,
+                  cpd.created_at,
+                  cpd.updated_at,
+                  rd.collected_at,
+                  rd.raw_content_path,
+                  COUNT(c.id) AS candidate_count,
+                  SUM(CASE WHEN c.verification_status = 'not_requested' THEN 1 ELSE 0 END)
+                    AS verification_pending,
+                  SUM(CASE WHEN c.status = 'verified' THEN 1 ELSE 0 END) AS approved_count,
+                  SUM(
+                    CASE
+                      WHEN c.status = 'needs_review'
+                       AND c.verification_status <> 'not_requested'
+                      THEN 1 ELSE 0
+                    END
+                  ) AS review_count,
+                  SUM(CASE WHEN c.status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+                FROM collection_plan_documents cpd
+                LEFT JOIN raw_documents rd ON rd.id = cpd.raw_document_id
+                LEFT JOIN expense_records er ON er.raw_document_id = rd.id
+                LEFT JOIN restaurant_candidates c ON c.expense_record_id = er.id
+                WHERE cpd.published_at >= ?
+                  AND cpd.published_at <= ?
+                GROUP BY cpd.id
+                ORDER BY cpd.plan_id DESC, cpd.id DESC
+                """,
+                (start_date, end_date),
+            ).fetchall()
+
+        latest_by_url: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest_by_url.setdefault(str(row["source_url"]), row)
+        documents = []
+        for row in latest_by_url.values():
+            payload = dict(row)
+            payload["institution_label"] = self._collection_progress_label(
+                str(row["source_title"] or ""),
+                str(row["department_name"] or ""),
+            )
+            payload["display_title"] = self._admin_document_title(
+                str(row["source_title"] or ""),
+                str(row["department_name"] or ""),
+            )
+            payload["candidate_count"] = int(row["candidate_count"] or 0)
+            payload["verification_pending"] = int(row["verification_pending"] or 0)
+            payload["approved_count"] = int(row["approved_count"] or 0)
+            payload["review_count"] = int(row["review_count"] or 0)
+            payload["rejected_count"] = int(row["rejected_count"] or 0)
+            payload["verification_completed"] = (
+                payload["approved_count"] + payload["rejected_count"]
+            )
+            payload["verification_percent"] = (
+                round(payload["verification_completed"] * 100 / payload["candidate_count"], 1)
+                if payload["candidate_count"]
+                else 0.0
+            )
+            documents.append(payload)
+
+        institutions = sorted(
+            {str(item["institution_label"]) for item in documents if item["institution_label"]}
+        )
+        institution_filter = str(institution or "").strip()
+        search_text = normalize_text(q)
+        filtered = [
+            item
+            for item in documents
+            if (not institution_filter or item["institution_label"] == institution_filter)
+            and (not status_filter or item["status"] == status_filter)
+            and (
+                not search_text
+                or search_text
+                in normalize_text(
+                    " ".join(
+                        [
+                            str(item["source_title"] or ""),
+                            str(item["department_name"] or ""),
+                            str(item["institution_label"] or ""),
+                            str(item["source_url"] or ""),
+                        ]
+                    )
+                )
+            )
+        ]
+        sort_key = str(sort or "published_desc")
+        if sort_key == "published_asc":
+            filtered.sort(key=lambda item: (str(item["published_at"] or ""), int(item["id"])))
+        elif sort_key == "collected_desc":
+            filtered.sort(
+                key=lambda item: (str(item["collected_at"] or ""), int(item["id"])),
+                reverse=True,
+            )
+        elif sort_key == "rows_desc":
+            filtered.sort(
+                key=lambda item: (int(item["rows_seen"] or 0), int(item["id"])),
+                reverse=True,
+            )
+        elif sort_key == "verification_asc":
+            filtered.sort(
+                key=lambda item: (float(item["verification_percent"]), -int(item["id"]))
+            )
+        else:
+            filtered.sort(
+                key=lambda item: (str(item["published_at"] or ""), int(item["id"])),
+                reverse=True,
+            )
+        page = filtered[safe_offset : safe_offset + capped_limit]
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "city": "부산광역시",
+            "institution": institution_filter,
+            "institutions": institutions,
+            "status": status_filter,
+            "sort": sort_key,
+            "q": str(q or ""),
+            "items": page,
+            "total": len(filtered),
+            "limit": capped_limit,
+            "offset": safe_offset,
+            "has_prev": safe_offset > 0,
+            "has_next": safe_offset + len(page) < len(filtered),
+            "summary": {
+                "documents": len(filtered),
+                "collected": sum(
+                    1 for item in filtered if item["status"] in {"collected", "duplicate"}
+                ),
+                "failed": sum(1 for item in filtered if item["status"] == "failed"),
+                "candidates": sum(int(item["candidate_count"]) for item in filtered),
+                "verification_completed": sum(
+                    int(item["verification_completed"]) for item in filtered
+                ),
+            },
+        }
+
+    def admin_document_detail(
+        self,
+        document_id: int,
+        q: str = "",
+        status: str = "",
+        sort: str = "row_asc",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        capped_limit = max(1, min(int(limit or 25), 100))
+        safe_offset = max(0, int(offset or 0))
+        status_filter = str(status or "").strip()
+        if status_filter and status_filter not in {
+            "needs_review",
+            "verified",
+            "rejected",
+        }:
+            raise AppError(400, "unsupported candidate status")
+        sort_sql = {
+            "row_asc": "COALESCE(er.source_row_number, 0) ASC, c.id ASC",
+            "row_desc": "COALESCE(er.source_row_number, 0) DESC, c.id DESC",
+            "used_date_desc": "COALESCE(c.used_date, '') DESC, c.id DESC",
+            "amount_desc": "COALESCE(c.amount, 0) DESC, c.id DESC",
+            "status_asc": "c.status ASC, COALESCE(er.source_row_number, 0) ASC",
+        }.get(str(sort or "row_asc"), "COALESCE(er.source_row_number, 0) ASC, c.id ASC")
+        search_text = normalize_text(q)
+        search_clause = ""
+        search_params: list[Any] = []
+        if search_text:
+            pattern = f"%{search_text}%"
+            search_clause = """
+              AND (
+                c.normalized_place_name LIKE ?
+                OR COALESCE(c.review_normalized_place_name, '') LIKE ?
+                OR COALESCE(c.normalized_address, '') LIKE ?
+                OR COALESCE(c.review_normalized_address, '') LIKE ?
+                OR COALESCE(er.purpose, '') LIKE ?
+                OR CAST(c.id AS TEXT) LIKE ?
+              )
+            """
+            search_params = [pattern, pattern, pattern, pattern, pattern, pattern]
+        status_clause = "AND c.status = ?" if status_filter else ""
+        status_params: list[Any] = [status_filter] if status_filter else []
+
+        with self.database.session() as conn:
+            document_row = conn.execute(
+                """
+                SELECT
+                  cpd.*,
+                  rd.collected_at,
+                  rd.raw_content_path,
+                  rd.status AS raw_status,
+                  rd.error_message AS raw_error_message,
+                  rd.metadata_json AS raw_metadata_json
+                FROM collection_plan_documents cpd
+                LEFT JOIN raw_documents rd ON rd.id = cpd.raw_document_id
+                WHERE cpd.id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+            if document_row is None:
+                raise AppError(404, "document not found")
+            total = 0
+            rows: list[dict[str, Any]] = []
+            counts = self._empty_verification_counts()
+            if document_row["raw_document_id"]:
+                total = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*) AS count
+                        FROM restaurant_candidates c
+                        JOIN expense_records er ON er.id = c.expense_record_id
+                        WHERE er.raw_document_id = ?
+                        {status_clause}
+                        {search_clause}
+                        """,
+                        [document_row["raw_document_id"], *status_params, *search_params],
+                    ).fetchone()["count"]
+                )
+                count_rows = conn.execute(
+                    """
+                    SELECT c.status, c.verification_status
+                    FROM restaurant_candidates c
+                    JOIN expense_records er ON er.id = c.expense_record_id
+                    WHERE er.raw_document_id = ?
+                    """,
+                    (document_row["raw_document_id"],),
+                ).fetchall()
+                for count_row in count_rows:
+                    self._increment_verification_counts(
+                        counts,
+                        str(count_row["status"]),
+                        str(count_row["verification_status"]),
+                    )
+                rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"""
+                        SELECT
+                          c.id AS candidate_id,
+                          c.original_place_name,
+                          c.review_place_name,
+                          c.review_normalized_place_name,
+                          c.original_address,
+                          c.review_address,
+                          c.review_normalized_address,
+                          c.place_major_category,
+                          c.review_major_category,
+                          c.status AS candidate_status,
+                          c.verification_status,
+                          c.manual_review_status,
+                          c.rejection_reason,
+                          c.review_note,
+                          c.used_date,
+                          c.amount,
+                          er.source_row_number,
+                          er.department_name,
+                          er.purpose,
+                          er.participants,
+                          er.payment_method,
+                          pv.id AS latest_verification_id,
+                          pv.provider_place_name,
+                          pv.provider_category,
+                          pv.provider_address,
+                          pv.provider_road_address,
+                          pv.name_similarity,
+                          pv.address_similarity
+                        FROM restaurant_candidates c
+                        JOIN expense_records er ON er.id = c.expense_record_id
+                        LEFT JOIN place_verifications pv ON pv.id = (
+                          SELECT id
+                          FROM place_verifications
+                          WHERE candidate_id = c.id
+                          ORDER BY verified_at DESC, id DESC
+                          LIMIT 1
+                        )
+                        WHERE er.raw_document_id = ?
+                        {status_clause}
+                        {search_clause}
+                        ORDER BY {sort_sql}
+                        LIMIT ? OFFSET ?
+                        """,
+                        [
+                            document_row["raw_document_id"],
+                            *status_params,
+                            *search_params,
+                            capped_limit,
+                            safe_offset,
+                        ],
+                    )
+                ]
+                for row in rows:
+                    self._add_effective_candidate_values(row)
+            document = dict(document_row)
+            document["metadata"] = safe_json_loads(document.pop("metadata_json"), {})
+            document["raw_metadata"] = safe_json_loads(
+                document.pop("raw_metadata_json") or "{}",
+                {},
+            )
+            document["institution_label"] = self._collection_progress_label(
+                str(document["source_title"] or ""),
+                str(document["department_name"] or ""),
+            )
+            document["display_title"] = self._admin_document_title(
+                str(document["source_title"] or ""),
+                str(document["department_name"] or ""),
+            )
+            document["verification"] = self._verification_progress_item(counts)
+            return {
+                "document": document,
+                "items": rows,
+                "total": total,
+                "limit": capped_limit,
+                "offset": safe_offset,
+                "has_prev": safe_offset > 0,
+                "has_next": safe_offset + len(rows) < total,
+                "q": str(q or ""),
+                "status": status_filter,
+                "sort": str(sort or "row_asc"),
+            }
+
+    def _admin_document_title(self, source_title: str, department_name: str) -> str:
+        title = re.sub(r"\s+", " ", str(source_title or "")).strip()
+        department = re.sub(r"\s+", " ", str(department_name or "")).strip()
+        generic_year_title = len(title) <= 24 and bool(
+            re.fullmatch(r"(?:\([^)]*\))?\s*\d{4}년(?:도)?", title)
+        )
+        if department and (not title or generic_year_title):
+            matched = re.search(
+                r"((?:제?\s*\d+\s*분기\s*)?업무추진비"
+                r"(?:\s+사용)?\s*(?:집행)?\s*내역(?:\s*\([^)]*\))?)",
+                department,
+            )
+            if matched:
+                return matched.group(1).strip()
+        return title or department or "제목 없음"
+
     def _empty_progress_counts(self) -> dict[str, int]:
         return {
             "total_count": 0,
@@ -2140,6 +2615,44 @@ class RestaurantService:
             "collected_count": 0,
             "duplicate_count": 0,
             "failed_count": 0,
+        }
+
+    def _empty_verification_counts(self) -> dict[str, int]:
+        return {
+            "total": 0,
+            "pending": 0,
+            "approved": 0,
+            "needs_review": 0,
+            "rejected": 0,
+        }
+
+    def _increment_verification_counts(
+        self,
+        counts: dict[str, int],
+        status: str,
+        verification_status: str,
+    ) -> None:
+        counts["total"] += 1
+        if verification_status == "not_requested":
+            counts["pending"] += 1
+        elif status == "verified":
+            counts["approved"] += 1
+        elif status == "rejected":
+            counts["rejected"] += 1
+        elif status == "needs_review":
+            counts["needs_review"] += 1
+        else:
+            counts["pending"] += 1
+
+    def _verification_progress_item(self, counts: dict[str, int]) -> dict[str, Any]:
+        total = int(counts["total"] or 0)
+        approved = int(counts["approved"] or 0)
+        rejected = int(counts["rejected"] or 0)
+        completed = approved + rejected
+        return {
+            **counts,
+            "completed": completed,
+            "percent": round(completed * 100 / total, 1) if total else 0.0,
         }
 
     def _increment_progress_counts(self, counts: dict[str, int], status: str) -> None:
@@ -2253,16 +2766,19 @@ class RestaurantService:
         duplicate = int(row["duplicate_count"] or 0)
         failed = int(row["failed_count"] or 0)
         processed = max(0, total - pending - processing)
+        stored = collected + duplicate
         return {
             "label": label,
             "total": total,
             "processed": processed,
+            "successful": stored,
+            "stored": stored,
             "pending": pending,
             "processing": processing,
             "collected": collected,
             "duplicate": duplicate,
             "failed": failed,
-            "percent": round(processed * 100 / total, 1) if total else 0.0,
+            "percent": round(stored * 100 / total, 1) if total else 0.0,
         }
 
     def _collection_progress_label(self, source_title: str, department_name: str) -> str:

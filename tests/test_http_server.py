@@ -54,7 +54,19 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("dashboard-start-date", admin)
         self.assertIn("dashboard-end-date", admin)
         self.assertIn("priority-chart", admin)
+        self.assertIn("수집 완료", admin)
+        self.assertIn("검증 전", admin)
         self.assertNotIn("review-queue", admin)
+        documents_admin = urlopen(
+            f"{self.base_url}/admin/documents",
+            timeout=5,
+        ).read().decode("utf-8")
+        self.assertIn("기관별 수집 문서", documents_admin)
+        self.assertIn("document-board-list", documents_admin)
+        documents = self.get_json(
+            "/admin/documents/data?start_date=2026-01-01&end_date=2026-12-31"
+        )
+        self.assertEqual(documents["total"], 0)
         review_admin = urlopen(f"{self.base_url}/admin/review", timeout=5).read().decode("utf-8")
         self.assertIn("후보 데이터", review_admin)
         self.assertIn("review-queue", review_admin)

@@ -25,7 +25,15 @@ from .pipeline import (
     DailyPipeline,
 )
 from .services import AppError, RequestContext, RestaurantService
-from .views import admin_index, admin_review_index, map_issues_index, ops_logs_index, public_index
+from .views import (
+    admin_document_detail_index,
+    admin_documents_index,
+    admin_index,
+    admin_review_index,
+    map_issues_index,
+    ops_logs_index,
+    public_index,
+)
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -208,6 +216,36 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(map_issues_index())
                 elif path == "/admin/logs":
                     self._html(ops_logs_index())
+                elif path == "/admin/documents":
+                    self._html(admin_documents_index())
+                elif path == "/admin/documents/data":
+                    self._json(
+                        app.service.admin_documents(
+                            start_date=str(query.get("start_date", "")),
+                            end_date=str(query.get("end_date", "")),
+                            institution=str(query.get("institution", "")),
+                            status=str(query.get("status", "")),
+                            q=str(query.get("q", "")),
+                            sort=str(query.get("sort", "published_desc")),
+                            limit=int(query.get("limit", "10") or "10"),
+                            offset=int(query.get("offset", "0") or "0"),
+                        )
+                    )
+                elif path.startswith("/admin/documents/") and path.endswith("/data"):
+                    document_id = int(path.split("/")[3])
+                    self._json(
+                        app.service.admin_document_detail(
+                            document_id,
+                            q=str(query.get("q", "")),
+                            status=str(query.get("status", "")),
+                            sort=str(query.get("sort", "row_asc")),
+                            limit=int(query.get("limit", "25") or "25"),
+                            offset=int(query.get("offset", "0") or "0"),
+                        )
+                    )
+                elif path.startswith("/admin/documents/"):
+                    self._path_int(path, "/admin/documents/")
+                    self._html(admin_document_detail_index())
                 elif path.startswith("/static/"):
                     self._static(path.removeprefix("/static/"))
                 elif path == "/api/map/restaurants":

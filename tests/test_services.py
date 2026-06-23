@@ -750,6 +750,34 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(candidate["rejection_reason"], "AMBIGUOUS_BRANCH")
         self.assertEqual(link_count, 0)
 
+    def test_collection_progress_percent_excludes_failed_documents(self) -> None:
+        item = self.service._collection_progress_item(
+            "디지털경제실",
+            {
+                "total_count": 5,
+                "pending_count": 0,
+                "processing_count": 0,
+                "collected_count": 1,
+                "duplicate_count": 2,
+                "failed_count": 2,
+            },
+        )
+
+        self.assertEqual(item["processed"], 5)
+        self.assertEqual(item["successful"], 3)
+        self.assertEqual(item["stored"], 3)
+        self.assertEqual(item["failed"], 2)
+        self.assertEqual(item["percent"], 60.0)
+
+    def test_admin_document_title_uses_expense_title_in_department_path(self) -> None:
+        self.assertEqual(
+            self.service._admin_document_title(
+                "(방호조사과)2026년",
+                "1분기 업무추진비 집행내역(방호조사과) 소방재난본부 > 방호조사과",
+            ),
+            "1분기 업무추진비 집행내역(방호조사과)",
+        )
+
     def test_source_registry_groups_priority_and_collection_counts(self) -> None:
         payload = self.service.source_registry()
 
