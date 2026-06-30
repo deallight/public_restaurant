@@ -433,14 +433,24 @@ class RestaurantService:
         offsets: dict[str, int] | None = None,
         q: str = "",
         sort: str = "id_desc",
+        start_date: str = "",
+        end_date: str = "",
+        institution: str = "",
+        status: str = "",
+        offset: int = 0,
     ) -> dict[str, Any]:
         capped_limit = max(1, min(limit, 200))
         offsets = offsets or {}
+        safe_offset = max(0, int(offset or 0))
         sort_sql = {
             "id_desc": "c.id DESC",
             "id_asc": "c.id ASC",
             "updated_desc": "c.updated_at DESC, c.id DESC",
+            "verification_oldest": "COALESCE(mrt.created_at, c.updated_at) ASC, c.id ASC",
             "used_date_desc": "COALESCE(c.used_date, '') DESC, c.id DESC",
+            "used_date_asc": "COALESCE(c.used_date, '') ASC, c.id ASC",
+            "source_published_desc": "COALESCE(rd.published_at, '') DESC, c.id DESC",
+            "source_published_asc": "COALESCE(rd.published_at, '') ASC, c.id ASC",
             "amount_desc": "COALESCE(c.amount, 0) DESC, c.id DESC",
             "name_asc": "COALESCE(c.review_normalized_place_name, c.normalized_place_name) ASC, c.id DESC",
         }.get(str(sort or "id_desc"), "c.id DESC")
@@ -462,6 +472,47 @@ class RestaurantService:
             """
             pattern = f"%{search_text}%"
             search_params = [pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern]
+        institution_filter = str(institution or "").strip()
+        institution_clause = ""
+        institution_params: list[Any] = []
+        if institution_filter:
+            institution_clause = """
+              AND (
+                COALESCE(i.name, '') LIKE ?
+                OR COALESCE(er.department_name, '') LIKE ?
+                OR COALESCE(rd.source_title, '') LIKE ?
+              )
+            """
+            institution_pattern = f"%{institution_filter}%"
+            institution_params = [institution_pattern, institution_pattern, institution_pattern]
+        date_clause = ""
+        date_params: list[Any] = []
+        if start_date or end_date:
+            try:
+                start = datetime.strptime(start_date, "%Y-%m-%d").date()
+                end = datetime.strptime(end_date, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise AppError(400, "start_date and end_date must use YYYY-MM-DD") from exc
+            if start > end:
+                raise AppError(400, "start_date must not be after end_date")
+            date_clause = "AND rd.published_at >= ? AND rd.published_at <= ?"
+            date_params = [start_date, end_date]
+        selected_status = str(status or "").strip()
+        if selected_status == "manual":
+            selected_status = "needs_review"
+        if selected_status and selected_status not in {
+            "pending",
+            "needs_review",
+            "verified",
+            "rejected",
+        }:
+            raise AppError(400, "unsupported candidate status")
+        selected_status_clause = {
+            "pending": "AND c.status = 'needs_review' AND c.verification_status = 'not_requested'",
+            "needs_review": "AND c.status = 'needs_review' AND c.verification_status <> 'not_requested'",
+            "verified": "AND c.status = 'verified'",
+            "rejected": "AND c.status = 'rejected'",
+        }.get(selected_status, "")
         groups = {
             "needs_review": {"label": "수동검토", "items": [], "total": 0},
             "verified": {"label": "승인", "items": [], "total": 0},
@@ -470,20 +521,25 @@ class RestaurantService:
         with self.database.session() as conn:
             for status in groups:
                 offset = max(0, int(offsets.get(status, 0) or 0))
-                groups[status]["total"] = int(
-                    conn.execute(
-                        f"""
+                count_row = conn.execute(
+                    f"""
                         SELECT COUNT(*) AS count
+                        {", SUM(CASE WHEN c.verification_status = 'not_requested' THEN 1 ELSE 0 END) AS pending_count, SUM(CASE WHEN c.verification_status <> 'not_requested' THEN 1 ELSE 0 END) AS manual_count" if status == "needs_review" else ""}
                         FROM restaurant_candidates c
                         JOIN expense_records er ON er.id = c.expense_record_id
                         JOIN institutions i ON i.id = c.institution_id
                         JOIN raw_documents rd ON rd.id = er.raw_document_id
                         WHERE c.status = ?
+                        {date_clause}
                         {search_clause}
+                        {institution_clause}
                         """,
-                        [status, *search_params],
-                    ).fetchone()["count"]
-                )
+                    [status, *date_params, *search_params, *institution_params],
+                ).fetchone()
+                groups[status]["total"] = int(count_row["count"] or 0)
+                if status == "needs_review":
+                    groups[status]["pending_total"] = int(count_row["pending_count"] or 0)
+                    groups[status]["manual_total"] = int(count_row["manual_count"] or 0)
                 rows = [
                     dict(row)
                     for row in conn.execute(
@@ -537,11 +593,20 @@ class RestaurantService:
                           LIMIT 1
                         )
                         WHERE c.status = ?
+                        {date_clause}
                         {search_clause}
+                        {institution_clause}
                         ORDER BY {sort_sql}
                         LIMIT ? OFFSET ?
                         """,
-                        [status, *search_params, capped_limit, offset],
+                        [
+                            status,
+                            *date_params,
+                            *search_params,
+                            *institution_params,
+                            capped_limit,
+                            offset,
+                        ],
                     )
                 ]
                 for row in rows:
@@ -552,7 +617,120 @@ class RestaurantService:
                 groups[status]["limit"] = capped_limit
                 groups[status]["has_prev"] = offset > 0
                 groups[status]["has_next"] = offset + len(rows) < int(groups[status]["total"])
-        return {"groups": groups, "limit": capped_limit, "sort": sort}
+            selected_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM restaurant_candidates c
+                    JOIN expense_records er ON er.id = c.expense_record_id
+                    JOIN institutions i ON i.id = c.institution_id
+                    JOIN raw_documents rd ON rd.id = er.raw_document_id
+                    WHERE 1 = 1
+                    {selected_status_clause}
+                    {date_clause}
+                    {search_clause}
+                    {institution_clause}
+                    """,
+                    [*date_params, *search_params, *institution_params],
+                ).fetchone()["count"]
+                or 0
+            )
+            selected_rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT
+                      c.id AS candidate_id,
+                      c.original_place_name,
+                      c.review_place_name,
+                      c.review_normalized_place_name,
+                      c.original_address,
+                      c.review_address,
+                      c.review_normalized_address,
+                      c.place_major_category,
+                      c.review_major_category,
+                      c.status AS candidate_status,
+                      c.verification_status,
+                      c.manual_review_status,
+                      c.rejection_reason,
+                      c.review_note,
+                      c.used_date,
+                      c.amount,
+                      er.department_name,
+                      er.purpose,
+                      er.participants,
+                      er.payment_method,
+                      i.name AS institution_name,
+                      rd.source_title,
+                      rd.source_url,
+                      rd.published_at AS source_published_at,
+                      mrt.id AS review_id,
+                      mrt.status AS review_status,
+                      mrt.reason AS review_reason,
+                      pv.provider_place_name,
+                      pv.provider_category,
+                      pv.provider_address,
+                      pv.provider_road_address,
+                      pv.name_similarity,
+                      pv.address_similarity,
+                      pv.verification_status AS provider_verification_status,
+                      pv.verification_reason
+                    FROM restaurant_candidates c
+                    JOIN expense_records er ON er.id = c.expense_record_id
+                    JOIN institutions i ON i.id = c.institution_id
+                    JOIN raw_documents rd ON rd.id = er.raw_document_id
+                    LEFT JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
+                    LEFT JOIN place_verifications pv ON pv.id = (
+                      SELECT id
+                      FROM place_verifications
+                      WHERE candidate_id = c.id
+                      ORDER BY verified_at DESC, id DESC
+                      LIMIT 1
+                    )
+                    WHERE 1 = 1
+                    {selected_status_clause}
+                    {date_clause}
+                    {search_clause}
+                    {institution_clause}
+                    ORDER BY {sort_sql}
+                    LIMIT ? OFFSET ?
+                    """,
+                    [
+                        *date_params,
+                        *search_params,
+                        *institution_params,
+                        capped_limit,
+                        safe_offset,
+                    ],
+                )
+            ]
+            for row in selected_rows:
+                self._add_effective_candidate_values(row)
+                row["provider_candidates"] = self._provider_candidates(conn, int(row["candidate_id"]))
+        selected_labels = {
+            "": "전체 상태",
+            "pending": "검증 대기",
+            "needs_review": "수동검토",
+            "verified": "승인",
+            "rejected": "반려",
+        }
+        return {
+            "groups": groups,
+            "selected": {
+                "label": selected_labels.get(selected_status, "전체 상태"),
+                "items": selected_rows,
+                "total": selected_count,
+                "offset": safe_offset,
+                "limit": capped_limit,
+                "status": selected_status,
+                "has_prev": safe_offset > 0,
+                "has_next": safe_offset + len(selected_rows) < selected_count,
+            },
+            "limit": capped_limit,
+            "offset": safe_offset,
+            "sort": sort,
+            "institution": institution_filter,
+        }
 
     def map_issue_candidates(self, limit: int = 100) -> dict[str, Any]:
         capped_limit = max(1, min(limit, 300))

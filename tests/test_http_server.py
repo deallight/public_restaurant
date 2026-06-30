@@ -56,7 +56,25 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("priority-chart", admin)
         self.assertIn("수집 완료", admin)
         self.assertIn("검증 전", admin)
+        self.assertLess(
+            admin.index('class="source-section"'),
+            admin.index('class="collection-operations"'),
+        )
         self.assertNotIn("review-queue", admin)
+        workflow = urlopen(f"{self.base_url}/admin/workflow", timeout=5).read().decode("utf-8")
+        self.assertIn("수집·검증 작업판", workflow)
+        self.assertIn("workflow-steps", workflow)
+        self.assertIn("workflow-priority", workflow)
+        self.assertIn("workflow-institution", workflow)
+        self.assertIn("workflow-document-rows", workflow)
+        self.assertIn("workflow-document-pagination", workflow)
+        self.assertIn("workflow-candidate-rows", workflow)
+        self.assertIn("workflow-candidate-status", workflow)
+        self.assertIn("workflow-candidate-sort", workflow)
+        self.assertIn("검증 대기 오래된순", workflow)
+        self.assertIn("workflow-candidate-pagination", workflow)
+        self.assertIn("검증 항목", workflow)
+        self.assertIn("workflow-status-tabs", workflow)
         documents_admin = urlopen(
             f"{self.base_url}/admin/documents",
             timeout=5,
@@ -110,6 +128,13 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("overview", verification)
         self.assertIn("NAVER_SEARCH_CLIENT_ID", verification["missing_env"]["naver_search"])
         self.assertIn("pending_reviews", verification["overview"]["counts"])
+        progress = self.get_json("/ops/verification-progress")
+        self.assertIn("active", progress)
+        self.assertIn("items", progress)
+        candidates = self.get_json(
+            "/admin/candidates?start_date=2026-01-01&end_date=2026-12-31&limit=5"
+        )
+        self.assertIn("needs_review", candidates["groups"])
 
     def test_review_api_rate_limit_status_code(self) -> None:
         self.post_json("/ops/run-daily")

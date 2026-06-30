@@ -162,6 +162,68 @@ class PipelineTests(unittest.TestCase):
 
         self.assertNotEqual(candidate["verification_status"], "not_requested")
 
+    def test_verify_collected_emits_candidate_progress_events(self) -> None:
+        DailyPipeline(self.db, verify_new_rows=False).run()
+        events: list[dict] = []
+
+        result = DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(ExactNaverClient(), ExactPermitClient()),
+            verification_progress_callback=events.append,
+        ).verify_collected(limit=1)
+
+        event_names = [event["event"] for event in events]
+        step_stages = [event.get("stage") for event in events if event["event"] == "candidate_step"]
+        done = [event for event in events if event["event"] == "candidate_done"]
+        finished = [event for event in events if event["event"] == "batch_finished"]
+
+        self.assertEqual(result["summary"]["rows_processed"], 1)
+        self.assertIn("batch_started", event_names)
+        self.assertIn("candidate_queued", event_names)
+        self.assertIn("normalize", step_stages)
+        self.assertIn("expense_scope_rule", step_stages)
+        self.assertIn("persist_decision", step_stages)
+        self.assertEqual(done[-1]["percent"], 100)
+        self.assertEqual(done[-1]["status"], "completed")
+        self.assertEqual(finished[-1]["processed"], 1)
+
+    def test_verify_collected_sort_can_prioritize_latest_used_date(self) -> None:
+        DailyPipeline(self.db, verify_new_rows=False).run()
+        with self.db.session() as conn:
+            latest_candidate_id = conn.execute(
+                """
+                SELECT c.id
+                FROM restaurant_candidates c
+                JOIN expense_records er ON er.id = c.expense_record_id
+                WHERE c.verification_status = 'not_requested'
+                ORDER BY COALESCE(c.used_date, '') DESC, c.id DESC
+                LIMIT 1
+                """
+            ).fetchone()["id"]
+
+        DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(ExactNaverClient(), ExactPermitClient()),
+        ).verify_collected(limit=1, sort="used_date_desc")
+
+        with self.db.session() as conn:
+            latest_status = conn.execute(
+                "SELECT verification_status FROM restaurant_candidates WHERE id = ?",
+                (latest_candidate_id,),
+            ).fetchone()["verification_status"]
+            remaining_pending = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM restaurant_candidates
+                    WHERE verification_status = 'not_requested'
+                    """
+                ).fetchone()["count"]
+            )
+
+        self.assertNotEqual(latest_status, "not_requested")
+        self.assertEqual(remaining_pending, 4)
+
     def test_collection_plan_discovers_targets_and_batches_collection(self) -> None:
         adapter = PlanningAdapter()
         pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
@@ -266,6 +328,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(document_detail["total"], 1)
         self.assertEqual(len(document_detail["items"]), 1)
         self.assertIn("effective_place_name", document_detail["items"][0])
+        candidate_board = RestaurantService(self.db).admin_candidates(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            limit=10,
+        )
+        self.assertEqual(candidate_board["groups"]["needs_review"]["total"], 2)
+        self.assertEqual(candidate_board["groups"]["needs_review"]["pending_total"], 2)
+        self.assertEqual(candidate_board["groups"]["needs_review"]["manual_total"], 0)
+        self.assertEqual(candidate_board["selected"]["total"], 2)
+        pending_candidate_page = RestaurantService(self.db).admin_candidates(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            status="pending",
+            limit=1,
+            offset=0,
+        )
+        self.assertEqual(pending_candidate_page["selected"]["label"], "검증 대기")
+        self.assertEqual(pending_candidate_page["selected"]["total"], 2)
+        self.assertEqual(len(pending_candidate_page["selected"]["items"]), 1)
+        self.assertTrue(pending_candidate_page["selected"]["has_next"])
+        empty_candidate_board = RestaurantService(self.db).admin_candidates(
+            start_date="2025-01-01",
+            end_date="2025-12-31",
+            limit=10,
+        )
+        self.assertEqual(empty_candidate_board["groups"]["needs_review"]["total"], 0)
 
     def test_collection_plan_batches_repeat_until_no_pending_documents(self) -> None:
         adapter = PlanningAdapter()
@@ -295,6 +383,58 @@ class PipelineTests(unittest.TestCase):
             ).fetchone()["c"]
 
         self.assertEqual(remaining, 0)
+
+    def test_collection_plan_skips_previously_collected_documents(self) -> None:
+        adapter = PlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        first_plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=2,
+            max_documents=10,
+            batch_size=1,
+        )
+        first_batch = pipeline.run_collection_plan_batch(first_plan["plan_id"], batch_size=1)
+        second_plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=2,
+            max_documents=10,
+            batch_size=10,
+        )
+        second_batch = pipeline.run_collection_plan_batch(second_plan["plan_id"], batch_size=10)
+
+        self.assertEqual(first_batch["summary"]["documents_seen"], 1)
+        self.assertEqual(second_plan["summary"]["documents_seen"], 2)
+        self.assertEqual(second_plan["summary"]["documents_skipped_collected"], 1)
+        self.assertEqual(second_batch["summary"]["documents_seen"], 1)
+        with self.db.session() as conn:
+            plan_row = conn.execute(
+                "SELECT pending_count, duplicate_count, collected_count FROM collection_plans WHERE id = ?",
+                (second_plan["plan_id"],),
+            ).fetchone()
+            documents = conn.execute(
+                """
+                SELECT source_url, status, raw_document_id
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                ORDER BY source_url ASC
+                """,
+                (second_plan["plan_id"],),
+            ).fetchall()
+
+        self.assertEqual(plan_row["pending_count"], 0)
+        self.assertEqual(plan_row["duplicate_count"], 1)
+        self.assertEqual(plan_row["collected_count"], 1)
+        self.assertEqual(
+            [(row["source_url"], row["status"]) for row in documents],
+            [
+                ("fixture://busan/planning/1", "collected"),
+                ("fixture://busan/planning/2", "duplicate"),
+            ],
+        )
+        self.assertIsNotNone(documents[1]["raw_document_id"])
 
     def test_sqlite_schema_apply_and_development_rollback(self) -> None:
         self.assertGreater(self.db.count("regions"), 0)

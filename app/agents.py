@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import re
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 from .utils import normalize_address, normalize_text, normalized_address_similarity, structured_address_match
 
@@ -876,7 +876,11 @@ class VerifierAgent:
         self.permit_client = permit_client or FakePermitClient()
         self.ai_reviewer = ai_reviewer or RuleBasedAiReviewer()
 
-    def verify(self, row: NormalizedExpenseRow) -> VerificationDecision:
+    def verify(
+        self,
+        row: NormalizedExpenseRow,
+        progress: Callable[[str, str, int], None] | None = None,
+    ) -> VerificationDecision:
         scope_reject_decision = expense_scope_reject_decision(row)
         if scope_reject_decision is not None:
             return scope_reject_decision
@@ -890,8 +894,14 @@ class VerifierAgent:
         if franchise_decision is not None:
             return franchise_decision
 
+        if progress:
+            progress("naver_search", "네이버 장소 검색 API", 82)
         candidates = self.naver_client.search_local(row)
+        if progress:
+            progress("permit_lookup", "인허가 조회 API", 88)
         permit = self.permit_client.lookup(row)
+        if progress:
+            progress("rule_decision", "검색 결과 조건 판단", 92)
         best = candidates[0] if candidates else None
         unknown_mismatch_decision = unknown_place_address_mismatch_decision(row, best)
         if unknown_mismatch_decision is not None:
@@ -1222,6 +1232,8 @@ class VerifierAgent:
                 reason_codes=["LOW_SCORE_NO_PERMIT"],
                 evidence={"rule_score": rule_score},
             )
+        if progress:
+            progress("ai_review", "경계값 최종 판단", 94)
         decision = self.ai_reviewer.decide(row, candidates, permit, rule_score)
         if candidates:
             decision.evidence["candidate_evidence"] = candidate_evidence_payload(row, candidates)

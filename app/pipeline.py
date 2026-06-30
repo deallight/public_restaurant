@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from html import unescape
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -38,6 +38,7 @@ from .xlsx_parser import parse_expense_xlsx
 
 COLLECTION_SCAN_SAFETY_MAX_PAGES = 500
 COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS = 10000
+VerificationProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -688,12 +689,14 @@ class DailyPipeline:
         verifier: VerifierAgent | None = None,
         settings: Settings | None = None,
         verify_new_rows: bool = True,
+        verification_progress_callback: VerificationProgressCallback | None = None,
     ) -> None:
         self.database = database
         self.adapter = adapter or BusanFixtureAdapter()
         self.verifier = verifier
         self.settings = settings
         self.verify_new_rows = verify_new_rows
+        self.verification_progress_callback = verification_progress_callback
 
     def _active_verifier(self, conn: sqlite3.Connection) -> VerifierAgent:
         return self.verifier or self._build_verifier(self.settings, conn)
@@ -887,11 +890,21 @@ class DailyPipeline:
                 self._finish_batch(conn, batch_id, "failed", summary, str(exc))
                 raise
 
-    def verify_pending(self, limit: int = 100) -> dict[str, Any]:
-        return self._verify_pending(limit=limit, job_name="verify_pending", initial_only=False)
+    def verify_pending(self, limit: int = 100, sort: str = "verification_oldest") -> dict[str, Any]:
+        return self._verify_pending(
+            limit=limit,
+            job_name="verify_pending",
+            initial_only=False,
+            sort=sort,
+        )
 
-    def verify_collected(self, limit: int = 100) -> dict[str, Any]:
-        return self._verify_pending(limit=limit, job_name="verify_collected", initial_only=True)
+    def verify_collected(self, limit: int = 100, sort: str = "verification_oldest") -> dict[str, Any]:
+        return self._verify_pending(
+            limit=limit,
+            job_name="verify_collected",
+            initial_only=True,
+            sort=sort,
+        )
 
     def create_collection_plan(
         self,
@@ -919,9 +932,11 @@ class DailyPipeline:
                 "batch_size": capped_batch_size,
                 "documents_seen": 0,
                 "documents_inserted": 0,
+                "documents_skipped_collected": 0,
                 "dlq": 0,
             }
             try:
+                source = self._load_source(conn)
                 cur = conn.execute(
                     """
                     INSERT INTO collection_plans
@@ -947,11 +962,18 @@ class DailyPipeline:
                 targets = self.adapter.discover_targets()  # type: ignore[attr-defined]
                 for target in targets:
                     summary["documents_seen"] += 1
+                    existing_raw_document_id = self._existing_collected_document_id(
+                        conn,
+                        source,
+                        target,
+                    )
+                    status = "duplicate" if existing_raw_document_id else "pending"
                     inserted = conn.execute(
                         """
                         INSERT OR IGNORE INTO collection_plan_documents
-                          (plan_id, source_url, source_title, department_name, published_at, status)
-                        VALUES (?, ?, ?, ?, ?, 'pending')
+                          (plan_id, source_url, source_title, department_name, published_at,
+                           status, raw_document_id, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             plan_id,
@@ -959,10 +981,19 @@ class DailyPipeline:
                             target.source_title,
                             target.department_name,
                             target.published_at,
+                            status,
+                            existing_raw_document_id,
+                            safe_json_dumps(
+                                {"skip_reason": "already_collected"}
+                                if existing_raw_document_id
+                                else {}
+                            ),
                         ),
                     ).rowcount
                     if inserted:
                         summary["documents_inserted"] += 1
+                        if existing_raw_document_id:
+                            summary["documents_skipped_collected"] += 1
                 self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
                 self._finish_batch(conn, batch_id, "success", summary)
                 return {
@@ -1287,7 +1318,33 @@ class DailyPipeline:
             ).fetchone()
             return int(row["count"] or 0)
 
-    def _verify_pending(self, limit: int, job_name: str, initial_only: bool) -> dict[str, Any]:
+    def _emit_verification_progress(self, event: dict[str, Any]) -> None:
+        if self.verification_progress_callback is None:
+            return
+        try:
+            self.verification_progress_callback({**event, "updated_at": utc_now()})
+        except Exception:
+            return
+
+    def _verification_order_sql(self, sort: str, initial_only: bool) -> str:
+        fallback = (
+            "COALESCE(mrt.created_at, c.updated_at) ASC, c.id ASC"
+            if initial_only
+            else "mrt.created_at ASC, c.id ASC"
+        )
+        return {
+            "verification_oldest": fallback,
+            "used_date_desc": "COALESCE(c.used_date, '') DESC, c.id DESC",
+            "used_date_asc": "COALESCE(c.used_date, '') ASC, c.id ASC",
+            "source_published_desc": "COALESCE(rd.published_at, '') DESC, c.id DESC",
+            "source_published_asc": "COALESCE(rd.published_at, '') ASC, c.id ASC",
+            "amount_desc": "COALESCE(c.amount, 0) DESC, c.id DESC",
+            "name_asc": "COALESCE(c.normalized_place_name, c.original_place_name) ASC, c.id ASC",
+            "id_desc": "c.id DESC",
+            "id_asc": "c.id ASC",
+        }.get(str(sort or "verification_oldest"), fallback)
+
+    def _verify_pending(self, limit: int, job_name: str, initial_only: bool, sort: str) -> dict[str, Any]:
         self.database.initialize()
         capped_limit = max(1, min(limit, 500))
         with self.database.session() as conn:
@@ -1316,11 +1373,7 @@ class DailyPipeline:
                     if initial_only
                     else "mrt.status = 'pending'"
                 )
-                order_sql = (
-                    "COALESCE(mrt.created_at, c.updated_at) ASC, c.id ASC"
-                    if initial_only
-                    else "mrt.created_at ASC, c.id ASC"
-                )
+                order_sql = self._verification_order_sql(sort, initial_only)
                 rows = conn.execute(
                     f"""
                     SELECT
@@ -1339,15 +1392,57 @@ class DailyPipeline:
                     FROM restaurant_candidates c
                     LEFT JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
                     JOIN expense_records er ON er.id = c.expense_record_id
+                    JOIN raw_documents rd ON rd.id = er.raw_document_id
                     WHERE {pending_filter}
                     ORDER BY {order_sql}
                     LIMIT ?
                     """,
                     (capped_limit,),
                 ).fetchall()
-                for row in rows:
+                self._emit_verification_progress(
+                    {
+                        "event": "batch_started",
+                        "batch_id": batch_id,
+                        "job_name": job_name,
+                        "total": len(rows),
+                        "limit": capped_limit,
+                    }
+                )
+                for order, row in enumerate(rows, start=1):
+                    self._emit_verification_progress(
+                        {
+                            "event": "candidate_queued",
+                            "batch_id": batch_id,
+                            "candidate_id": int(row["candidate_id"]),
+                            "order": order,
+                            "stage": "queued",
+                            "label": "검증 대기",
+                            "percent": 4,
+                            "status": "queued",
+                            "place_name": row["original_place_name"] or "",
+                        }
+                    )
+                for order, row in enumerate(rows, start=1):
                     summary["rows_seen"] += 1
+                    candidate_id = int(row["candidate_id"])
+
+                    def progress(stage: str, label: str, percent: int, status: str = "running") -> None:
+                        self._emit_verification_progress(
+                            {
+                                "event": "candidate_step",
+                                "batch_id": batch_id,
+                                "candidate_id": candidate_id,
+                                "order": order,
+                                "stage": stage,
+                                "label": label,
+                                "percent": percent,
+                                "status": status,
+                                "place_name": row["original_place_name"] or "",
+                            }
+                        )
+
                     try:
+                        progress("normalize", "원문 정규화", 8)
                         normalized = NormalizedExpenseRow(
                             row_number=int(row["source_row_number"] or 0),
                             department_name=row["department_name"] or "",
@@ -1359,14 +1454,27 @@ class DailyPipeline:
                             normalized_place_name=row["normalized_place_name"] or normalize_text(row["original_place_name"]),
                             normalized_address=row["normalized_address"] or normalize_address(row["original_address"]),
                         )
-                        decision = (
-                            expense_scope_reject_decision(normalized)
-                            or non_food_purpose_decision(normalized)
-                            or existing_success_verification_decision(conn, int(row["candidate_id"]), normalized)
-                            or alias_memory_decision(conn, normalized)
-                            or existing_provider_evidence_decision(conn, int(row["candidate_id"]), normalized)
-                            or verifier.verify(normalized)
-                        )
+                        progress("expense_scope_rule", "업무추진비 범위 조건", 18)
+                        decision = expense_scope_reject_decision(normalized)
+                        if decision is None:
+                            progress("purpose_rule", "음식점 목적 조건", 30)
+                            decision = non_food_purpose_decision(normalized)
+                        if decision is None:
+                            progress("existing_success", "기존 승인 근거 확인", 42)
+                            decision = existing_success_verification_decision(conn, candidate_id, normalized)
+                        if decision is None:
+                            progress("alias_memory", "별칭 기억 확인", 54)
+                            decision = alias_memory_decision(conn, normalized)
+                        if decision is None:
+                            progress("provider_evidence", "기존 검색 근거 확인", 66)
+                            decision = existing_provider_evidence_decision(conn, candidate_id, normalized)
+                        if decision is None:
+                            progress("external_verification", "외부 API 검증", 78)
+                            decision = verifier.verify(
+                                normalized,
+                                progress=lambda stage, label, percent: progress(stage, label, percent),
+                            )
+                        progress("persist_decision", "검증 결과 저장", 96)
                         self._track_advisory_permit_summary(
                             summary,
                             self._annotate_advisory_permit(conn, normalized, decision),
@@ -1375,12 +1483,43 @@ class DailyPipeline:
                             conn,
                             {"region_id": row["region_id"]},
                             int(row["expense_record_id"]),
-                            int(row["candidate_id"]),
+                            candidate_id,
                             decision,
                         )
                         summary[decision.decision] += 1
+                        self._emit_verification_progress(
+                            {
+                                "event": "candidate_done",
+                                "batch_id": batch_id,
+                                "candidate_id": candidate_id,
+                                "order": order,
+                                "stage": "done",
+                                "label": {
+                                    "approved": "승인 완료",
+                                    "needs_review": "수동검토 이동",
+                                    "rejected": "반려 완료",
+                                }.get(decision.decision, "검증 완료"),
+                                "percent": 100,
+                                "status": "completed",
+                                "decision": decision.decision,
+                                "place_name": row["original_place_name"] or "",
+                            }
+                        )
                     except Exception as exc:  # pragma: no cover - defensive DLQ guard
                         summary["dlq"] += 1
+                        self._emit_verification_progress(
+                            {
+                                "event": "candidate_done",
+                                "batch_id": batch_id,
+                                "candidate_id": candidate_id,
+                                "order": order,
+                                "stage": "failed",
+                                "label": "검증 실패",
+                                "percent": 100,
+                                "status": "failed",
+                                "place_name": row["original_place_name"] or "",
+                            }
+                        )
                         self._insert_dlq(
                             conn,
                             batch_id,
@@ -1391,10 +1530,28 @@ class DailyPipeline:
                 summary["rows_processed"] = summary["rows_seen"]
                 summary["pending_after"] = self._verification_pending_count(conn, initial_only)
                 self._finish_batch(conn, batch_id, "success", summary)
+                self._emit_verification_progress(
+                    {
+                        "event": "batch_finished",
+                        "batch_id": batch_id,
+                        "job_name": job_name,
+                        "processed": summary["rows_processed"],
+                        "summary": summary,
+                    }
+                )
                 return {"batch_id": batch_id, "status": "success", "summary": summary}
             except Exception as exc:
                 summary["pending_after"] = self._verification_pending_count(conn, initial_only)
                 self._finish_batch(conn, batch_id, "failed", summary, str(exc))
+                self._emit_verification_progress(
+                    {
+                        "event": "batch_finished",
+                        "batch_id": batch_id,
+                        "job_name": job_name,
+                        "processed": summary["rows_seen"],
+                        "summary": summary,
+                    }
+                )
                 raise
 
     def _verification_pending_count(self, conn: sqlite3.Connection, initial_only: bool) -> int:
@@ -1516,6 +1673,26 @@ class DailyPipeline:
         if source is None:
             raise RuntimeError(f"source registry not found: {self.adapter.source_key}")
         return source
+
+    def _existing_collected_document_id(
+        self,
+        conn: sqlite3.Connection,
+        source: sqlite3.Row,
+        target: CollectionTarget,
+    ) -> int | None:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM raw_documents
+            WHERE institution_id = ?
+              AND source_url = ?
+              AND status IN ('parsed', 'collected')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (source["institution_id"], target.source_url),
+        ).fetchone()
+        return int(row["id"]) if row else None
 
     def _upsert_document(
         self, conn: sqlite3.Connection, source: sqlite3.Row, document: SourceDocument

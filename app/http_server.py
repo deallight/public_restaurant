@@ -24,12 +24,14 @@ from .pipeline import (
     BusanCityLiveAdapter,
     DailyPipeline,
 )
+from .progress import VerificationProgressStore
 from .services import AppError, RequestContext, RestaurantService
 from .views import (
     admin_document_detail_index,
     admin_documents_index,
     admin_index,
     admin_review_index,
+    admin_workflow_index,
     map_issues_index,
     ops_logs_index,
     public_index,
@@ -65,6 +67,7 @@ class PublicRestaurantApplication:
             geocoding_client=geocoding_client,
             naver_client=naver_client,
         )
+        self.verification_progress = VerificationProgressStore()
 
     def run_daily(self) -> dict:
         return DailyPipeline(self.database, settings=self.settings).run()
@@ -152,11 +155,19 @@ class PublicRestaurantApplication:
             max_batches=max_batches,
         )
 
-    def verify_pending(self, limit: int = 100) -> dict:
-        return DailyPipeline(self.database, settings=self.settings).verify_pending(limit=limit)
+    def verify_pending(self, limit: int = 100, sort: str = "verification_oldest") -> dict:
+        return DailyPipeline(
+            self.database,
+            settings=self.settings,
+            verification_progress_callback=self.verification_progress.update,
+        ).verify_pending(limit=limit, sort=sort)
 
-    def verify_collected(self, limit: int = 100) -> dict:
-        return DailyPipeline(self.database, settings=self.settings).verify_collected(limit=limit)
+    def verify_collected(self, limit: int = 100, sort: str = "verification_oldest") -> dict:
+        return DailyPipeline(
+            self.database,
+            settings=self.settings,
+            verification_progress_callback=self.verification_progress.update,
+        ).verify_collected(limit=limit, sort=sort)
 
     def verification_status(self) -> dict:
         missing_env = {
@@ -210,6 +221,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(public_index(app.settings.naver_map_key))
                 elif path == "/admin":
                     self._html(admin_index())
+                elif path == "/admin/workflow":
+                    self._html(admin_workflow_index())
                 elif path == "/admin/review":
                     self._html(admin_review_index())
                 elif path == "/admin/map-issues":
@@ -295,6 +308,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._json(app.service.source_registry())
                 elif path == "/ops/verification-status":
                     self._json(app.verification_status())
+                elif path == "/ops/verification-progress":
+                    self._json(app.verification_progress.snapshot())
                 elif path == "/ops/logs":
                     plan_id = int(query["plan_id"]) if query.get("plan_id") else None
                     limit = int(query.get("limit", "100") or "100")
@@ -341,6 +356,11 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             },
                             q=str(query.get("q", "")),
                             sort=str(query.get("sort", "id_desc")),
+                            start_date=str(query.get("start_date", "")),
+                            end_date=str(query.get("end_date", "")),
+                            institution=str(query.get("institution", "")),
+                            status=str(query.get("status", "")),
+                            offset=int(query.get("offset", "0") or "0"),
                         )
                     )
                 else:
@@ -406,9 +426,21 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         status=201,
                     )
                 elif path == "/ops/verify-pending":
-                    self._json(app.verify_pending(limit=int(payload.get("limit", 100))), status=201)
+                    self._json(
+                        app.verify_pending(
+                            limit=int(payload.get("limit", 100)),
+                            sort=str(payload.get("sort", "verification_oldest")),
+                        ),
+                        status=201,
+                    )
                 elif path == "/ops/verify-collected":
-                    self._json(app.verify_collected(limit=int(payload.get("limit", 100))), status=201)
+                    self._json(
+                        app.verify_collected(
+                            limit=int(payload.get("limit", 100)),
+                            sort=str(payload.get("sort", "verification_oldest")),
+                        ),
+                        status=201,
+                    )
                 elif path.startswith("/api/restaurants/") and path.endswith("/reviews"):
                     restaurant_id = int(path.split("/")[3])
                     review = app.service.add_review(
