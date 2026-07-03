@@ -119,10 +119,13 @@ async function loadOpsLogs() {
     { key: "source_title", label: "제목", render: (row) => `<a href="${escapeHtml(row.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(short(row.source_title, 70))}</a>` },
     { key: "rows_seen", label: "확인 행" },
     { key: "rows_inserted", label: "신규 행" },
-    { key: "attempts", label: "시도" },
+    { key: "attempts", label: "수집 시도" },
+    { key: "parse_status", label: "파싱" },
+    { key: "parse_attempts", label: "파싱 시도" },
     { key: "batch_job_id", label: "배치" },
     { key: "failure_type", label: "실패 유형", render: (row) => escapeHtml(row.failure_type || "") },
-    { key: "error_message", label: "오류", render: (row) => escapeHtml(short(row.error_message, 80)) },
+    { key: "error_message", label: "수집 오류", render: (row) => escapeHtml(short(row.error_message, 80)) },
+    { key: "parse_error_message", label: "파싱 오류", render: (row) => escapeHtml(short(row.parse_error_message, 80)) },
     { key: "updated_at", label: "수정" },
   ], documents, institutionFilter ? "선택한 기관의 문서가 없습니다." : "선택된 계획의 문서가 없습니다.");
 

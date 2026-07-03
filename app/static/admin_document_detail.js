@@ -35,6 +35,17 @@ function statusLabel(status) {
   }[status] || status || "미확인";
 }
 
+function parseStatusLabel(status) {
+  return {
+    not_requested: "파싱 대기",
+    parsing: "파싱 중",
+    parsed: "파싱 완료",
+    empty: "파싱 결과 없음",
+    failed: "파싱 실패",
+    unsupported: "지원 불가",
+  }[status] || status || "파싱 대기";
+}
+
 const documentId = Number(window.location.pathname.split("/").filter(Boolean).pop());
 const state = {
   offset: 0,
@@ -77,7 +88,10 @@ function renderDocument(documentData) {
     <div><span>반려</span><strong>${Number(verification.rejected || 0).toLocaleString("ko-KR")}</strong></div>
     <div><span>검증 전</span><strong>${Number(verification.pending || 0).toLocaleString("ko-KR")}</strong></div>
     <div><span>수집 시도</span><strong>${Number(documentData.attempts || 0)}</strong></div>
+    <div><span>파싱 상태</span><strong>${escapeHtml(parseStatusLabel(documentData.parse_status))}</strong></div>
+    <div><span>파싱 시도</span><strong>${Number(documentData.parse_attempts || 0)}</strong></div>
     <div class="wide"><span>오류</span><strong>${escapeHtml(documentData.error_message || documentData.raw_error_message || "없음")}</strong></div>
+    <div class="wide"><span>파싱 오류</span><strong>${escapeHtml(documentData.parse_error_message || "없음")}</strong></div>
   `;
 }
 

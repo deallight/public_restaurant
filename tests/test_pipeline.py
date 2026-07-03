@@ -236,12 +236,16 @@ class PipelineTests(unittest.TestCase):
             batch_size=1,
         )
         first = pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        first_parse = pipeline.parse_collection_plan_batch(plan["plan_id"], batch_size=1)
         second = pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        second_parse = pipeline.parse_collection_plan_batch(plan["plan_id"], batch_size=1)
 
         self.assertEqual(plan["summary"]["documents_seen"], 2)
         self.assertEqual(first["summary"]["documents_seen"], 1)
-        self.assertEqual(first["summary"]["rows_inserted"], 1)
+        self.assertEqual(first["summary"]["rows_inserted"], 0)
+        self.assertEqual(first_parse["summary"]["rows_inserted"], 1)
         self.assertEqual(second["summary"]["documents_seen"], 1)
+        self.assertEqual(second_parse["summary"]["rows_inserted"], 1)
         with self.db.session() as conn:
             plan_row = conn.execute(
                 "SELECT * FROM collection_plans WHERE id = ?",
@@ -249,7 +253,7 @@ class PipelineTests(unittest.TestCase):
             ).fetchone()
             documents = conn.execute(
                 """
-                SELECT status, rows_inserted
+                SELECT status, parse_status, rows_inserted
                 FROM collection_plan_documents
                 WHERE plan_id = ?
                 ORDER BY id ASC
@@ -267,6 +271,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(plan_row["status"], "completed")
         self.assertEqual([row["status"] for row in documents], ["collected", "collected"])
+        self.assertEqual([row["parse_status"] for row in documents], ["parsed", "parsed"])
         self.assertEqual([row["rows_inserted"] for row in documents], [1, 1])
         self.assertEqual(pending, 2)
         progress = RestaurantService(self.db).ops_logs(plan_id=plan["plan_id"], limit=10)["progress"]
@@ -333,9 +338,10 @@ class PipelineTests(unittest.TestCase):
             end_date="2026-12-31",
             limit=10,
         )
-        self.assertEqual(candidate_board["groups"]["needs_review"]["total"], 2)
+        self.assertEqual(candidate_board["groups"]["needs_review"]["total"], 0)
         self.assertEqual(candidate_board["groups"]["needs_review"]["pending_total"], 2)
         self.assertEqual(candidate_board["groups"]["needs_review"]["manual_total"], 0)
+        self.assertEqual(candidate_board["groups"]["needs_review"]["items"], [])
         self.assertEqual(candidate_board["selected"]["total"], 2)
         pending_candidate_page = RestaurantService(self.db).admin_candidates(
             start_date="2026-01-01",
@@ -367,11 +373,16 @@ class PipelineTests(unittest.TestCase):
             batch_size=1,
         )
         result = pipeline.run_collection_plan_batches(plan["plan_id"], batch_size=1)
+        parse_result = pipeline.parse_collection_plan_batches(plan["plan_id"], batch_size=1)
 
         self.assertEqual(result["summary"]["batches_run"], 2)
         self.assertEqual(result["summary"]["pending_before"], 2)
         self.assertEqual(result["summary"]["pending_after"], 0)
-        self.assertEqual(result["summary"]["rows_inserted"], 2)
+        self.assertEqual(result["summary"]["rows_inserted"], 0)
+        self.assertEqual(parse_result["summary"]["batches_run"], 2)
+        self.assertEqual(parse_result["summary"]["pending_before"], 2)
+        self.assertEqual(parse_result["summary"]["pending_after"], 0)
+        self.assertEqual(parse_result["summary"]["rows_inserted"], 2)
         with self.db.session() as conn:
             remaining = conn.execute(
                 """
@@ -381,8 +392,18 @@ class PipelineTests(unittest.TestCase):
                 """,
                 (plan["plan_id"],),
             ).fetchone()["c"]
+            remaining_parse = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                  AND parse_status IN ('not_requested', 'failed', 'unsupported')
+                """,
+                (plan["plan_id"],),
+            ).fetchone()["c"]
 
         self.assertEqual(remaining, 0)
+        self.assertEqual(remaining_parse, 0)
 
     def test_collection_plan_skips_previously_collected_documents(self) -> None:
         adapter = PlanningAdapter()
@@ -396,6 +417,7 @@ class PipelineTests(unittest.TestCase):
             batch_size=1,
         )
         first_batch = pipeline.run_collection_plan_batch(first_plan["plan_id"], batch_size=1)
+        first_parse = pipeline.parse_collection_plan_batch(first_plan["plan_id"], batch_size=1)
         second_plan = pipeline.create_collection_plan(
             start_date="2026-01-01",
             end_date="2026-12-31",
@@ -406,6 +428,7 @@ class PipelineTests(unittest.TestCase):
         second_batch = pipeline.run_collection_plan_batch(second_plan["plan_id"], batch_size=10)
 
         self.assertEqual(first_batch["summary"]["documents_seen"], 1)
+        self.assertEqual(first_parse["summary"]["rows_inserted"], 1)
         self.assertEqual(second_plan["summary"]["documents_seen"], 2)
         self.assertEqual(second_plan["summary"]["documents_skipped_collected"], 1)
         self.assertEqual(second_batch["summary"]["documents_seen"], 1)
@@ -416,7 +439,7 @@ class PipelineTests(unittest.TestCase):
             ).fetchone()
             documents = conn.execute(
                 """
-                SELECT source_url, status, raw_document_id
+                SELECT source_url, status, parse_status, raw_document_id
                 FROM collection_plan_documents
                 WHERE plan_id = ?
                 ORDER BY source_url ASC
@@ -434,7 +457,185 @@ class PipelineTests(unittest.TestCase):
                 ("fixture://busan/planning/2", "duplicate"),
             ],
         )
+        self.assertEqual([row["parse_status"] for row in documents], ["not_requested", "parsed"])
         self.assertIsNotNone(documents[1]["raw_document_id"])
+        service = RestaurantService(self.db)
+        first_plan_pending = service.admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            parse_status="not_requested",
+            plan_id=first_plan["plan_id"],
+            limit=10,
+        )
+        second_plan_pending = service.admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            parse_status="not_requested",
+            plan_id=second_plan["plan_id"],
+            limit=10,
+        )
+        self.assertEqual(first_plan_pending["total"], 0)
+        self.assertEqual(second_plan_pending["total"], 1)
+        self.assertEqual(second_plan_pending["items"][0]["plan_id"], second_plan["plan_id"])
+
+    def test_parse_failed_document_is_not_treated_as_completed_duplicate(self) -> None:
+        adapter = FailingParsePlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        first_plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=1,
+            max_documents=1,
+            batch_size=1,
+        )
+        collection = pipeline.run_collection_plan_batch(first_plan["plan_id"], batch_size=1)
+        parsing = pipeline.parse_collection_plan_batch(first_plan["plan_id"], batch_size=1)
+        second_plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=1,
+            max_documents=1,
+            batch_size=1,
+        )
+
+        self.assertEqual(collection["summary"]["documents_seen"], 1)
+        self.assertEqual(parsing["summary"]["dlq"], 1)
+        self.assertEqual(parsing["summary"]["rows_inserted"], 0)
+        self.assertEqual(second_plan["summary"]["documents_skipped_collected"], 0)
+        with self.db.session() as conn:
+            first_document = conn.execute(
+                """
+                SELECT status, parse_status, parse_error_message
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                """,
+                (first_plan["plan_id"],),
+            ).fetchone()
+            second_document = conn.execute(
+                """
+                SELECT status, parse_status, raw_document_id
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                """,
+                (second_plan["plan_id"],),
+            ).fetchone()
+
+        self.assertEqual(first_document["status"], "collected")
+        self.assertEqual(first_document["parse_status"], "unsupported")
+        self.assertIn("unsupported encrypted DRM file", first_document["parse_error_message"])
+        self.assertEqual(second_document["status"], "collected")
+        self.assertEqual(second_document["parse_status"], "unsupported")
+        self.assertIsNotNone(second_document["raw_document_id"])
+
+    def test_unsupported_parse_documents_are_not_retried_automatically(self) -> None:
+        adapter = FailingParsePlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=1,
+            max_documents=1,
+            batch_size=1,
+        )
+        pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        first_parse = pipeline.parse_collection_plan_batch(plan["plan_id"], batch_size=1)
+        automatic_retry = pipeline.parse_collection_plan_batches(plan["plan_id"], batch_size=1)
+        failed_retry = pipeline.retry_collection_plan_parse_failures(
+            plan["plan_id"],
+            batch_size=1,
+        )
+
+        self.assertEqual(first_parse["summary"]["dlq"], 1)
+        self.assertEqual(automatic_retry["summary"]["pending_before"], 0)
+        self.assertEqual(automatic_retry["summary"]["documents_seen"], 0)
+        self.assertEqual(failed_retry["summary"]["retried_parse_failed"], 0)
+        with self.db.session() as conn:
+            document = conn.execute(
+                """
+                SELECT parse_status, parse_attempts
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                """,
+                (plan["plan_id"],),
+            ).fetchone()
+
+        self.assertEqual(document["parse_status"], "unsupported")
+        self.assertEqual(document["parse_attempts"], 1)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO collection_plan_documents
+                  (plan_id, source_url, source_title, department_name, published_at,
+                   status, parse_status, error_message)
+                VALUES (?, 'fixture://busan/planning/failed-collection',
+                        '수집 실패 업무추진비', '총무과', '2026-06-29',
+                        'failed', 'not_requested', 'download failed')
+                """,
+                (plan["plan_id"],),
+            )
+        document_board = RestaurantService(self.db).admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            limit=10,
+        )
+        unsupported_board = RestaurantService(self.db).admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            parse_status="unsupported",
+            limit=10,
+        )
+        pending_board = RestaurantService(self.db).admin_documents(
+            "2026-01-01",
+            "2026-12-31",
+            parse_status="not_requested",
+            limit=10,
+        )
+        self.assertEqual(document_board["summary"]["parse_pending"], 0)
+        self.assertEqual(document_board["summary"]["parse_failed"], 0)
+        self.assertEqual(document_board["summary"]["parse_unsupported"], 1)
+        self.assertEqual(unsupported_board["total"], 1)
+        self.assertEqual(pending_board["total"], 0)
+
+    def test_failed_parse_documents_retry_only_through_retry_action(self) -> None:
+        adapter = FlakyParsePlanningAdapter()
+        pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
+
+        plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_pages=1,
+            max_documents=1,
+            batch_size=1,
+        )
+        pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        first_parse = pipeline.parse_collection_plan_batch(plan["plan_id"], batch_size=1)
+        automatic_retry = pipeline.parse_collection_plan_batches(plan["plan_id"], batch_size=1)
+        failed_retry = pipeline.retry_collection_plan_parse_failures(
+            plan["plan_id"],
+            batch_size=1,
+        )
+
+        self.assertEqual(first_parse["summary"]["dlq"], 1)
+        self.assertEqual(automatic_retry["summary"]["pending_before"], 0)
+        self.assertEqual(automatic_retry["summary"]["documents_seen"], 0)
+        self.assertEqual(failed_retry["summary"]["retried_parse_failed"], 1)
+        self.assertEqual(failed_retry["summary"]["documents_parsed"], 1)
+        self.assertEqual(failed_retry["summary"]["rows_inserted"], 1)
+        with self.db.session() as conn:
+            document = conn.execute(
+                """
+                SELECT parse_status, parse_attempts, rows_inserted
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                """,
+                (plan["plan_id"],),
+            ).fetchone()
+
+        self.assertEqual(document["parse_status"], "parsed")
+        self.assertEqual(document["parse_attempts"], 2)
+        self.assertEqual(document["rows_inserted"], 1)
 
     def test_sqlite_schema_apply_and_development_rollback(self) -> None:
         self.assertGreater(self.db.count("regions"), 0)
@@ -1756,6 +1957,53 @@ class PlanningAdapter:
                 address="",
                 purpose="간담회",
                 amount=10000 + int(suffix),
+            )
+        ]
+
+
+class FailingParsePlanningAdapter(PlanningAdapter):
+    def discover_targets(self) -> list[CollectionTarget]:
+        return [
+            CollectionTarget(
+                source_url="fixture://busan/planning/drm",
+                source_title="DRM 업무추진비",
+                published_at="2026-06-30",
+                department_name="토목시설부",
+            )
+        ]
+
+    def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
+        raise ValueError("unsupported encrypted DRM file")
+
+
+class FlakyParsePlanningAdapter(PlanningAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.extract_calls = 0
+
+    def discover_targets(self) -> list[CollectionTarget]:
+        return [
+            CollectionTarget(
+                source_url="fixture://busan/planning/flaky",
+                source_title="임시 실패 업무추진비",
+                published_at="2026-06-30",
+                department_name="청년정책과",
+            )
+        ]
+
+    def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
+        self.extract_calls += 1
+        if self.extract_calls == 1:
+            raise RuntimeError("temporary parser outage")
+        return [
+            RawExpenseRow(
+                row_number=1,
+                department_name=document.department_name,
+                used_date="2026-06-30",
+                place_name="재시도식당",
+                address="",
+                purpose="간담회",
+                amount=18000,
             )
         ]
 

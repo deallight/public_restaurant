@@ -155,6 +155,40 @@ class PublicRestaurantApplication:
             max_batches=max_batches,
         )
 
+    def parse_collection_plan_batches(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).parse_collection_plan_batches(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+
+    def retry_collection_plan_parse_failures(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).retry_collection_plan_parse_failures(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+
     def verify_pending(self, limit: int = 100, sort: str = "verification_oldest") -> dict:
         return DailyPipeline(
             self.database,
@@ -219,11 +253,15 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 query = self._query(parsed.query)
                 if path == "/":
                     self._html(public_index(app.settings.naver_map_key))
-                elif path == "/admin":
+                elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
-                elif path == "/admin/workflow":
-                    self._html(admin_workflow_index())
+                elif path == "/admin/collection":
+                    self._html(admin_workflow_index("collection"))
+                elif path in {"/admin/parsing", "/admin/workflow"}:
+                    self._html(admin_workflow_index("parsing"))
                 elif path == "/admin/review":
+                    self._html(admin_workflow_index("review"))
+                elif path in {"/admin/review/results", "/admin/review/queue"}:
                     self._html(admin_review_index())
                 elif path == "/admin/map-issues":
                     self._html(map_issues_index())
@@ -238,10 +276,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             end_date=str(query.get("end_date", "")),
                             institution=str(query.get("institution", "")),
                             status=str(query.get("status", "")),
+                            parse_status=str(query.get("parse_status", "")),
                             q=str(query.get("q", "")),
                             sort=str(query.get("sort", "published_desc")),
                             limit=int(query.get("limit", "10") or "10"),
                             offset=int(query.get("offset", "0") or "0"),
+                            plan_id=int(query["plan_id"]) if query.get("plan_id") else None,
                         )
                     )
                 elif path.startswith("/admin/documents/") and path.endswith("/data"):
@@ -267,6 +307,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             "restaurants": app.service.list_map_restaurants(
                                 q=query.get("q", ""),
                                 category=query.get("category", ""),
+                                min_visit_count=query.get("min_visit_count", ""),
+                                search_mode=query.get("search_mode", ""),
                                 region=query.get("region", ""),
                                 bounds=query.get("bounds", ""),
                             )
@@ -339,7 +381,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             }
                         )
                     else:
-                        self._html(admin_index())
+                        self._html(admin_workflow_index("review"))
                 elif path == "/admin/review-reports":
                     self._json({"reports": app.service.review_reports()})
                 elif path == "/admin/map-issues/data":
@@ -419,6 +461,26 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     plan_id = int(path.split("/")[3])
                     self._json(
                         app.retry_collection_plan_failures(
+                            plan_id,
+                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                            max_batches=int(payload.get("max_batches", 100) or 100),
+                        ),
+                        status=201,
+                    )
+                elif path.startswith("/ops/collection-plans/") and path.endswith("/parse"):
+                    plan_id = int(path.split("/")[3])
+                    self._json(
+                        app.parse_collection_plan_batches(
+                            plan_id,
+                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                            max_batches=int(payload.get("max_batches", 100) or 100),
+                        ),
+                        status=201,
+                    )
+                elif path.startswith("/ops/collection-plans/") and path.endswith("/retry-parse-failed"):
+                    plan_id = int(path.split("/")[3])
+                    self._json(
+                        app.retry_collection_plan_parse_failures(
                             plan_id,
                             batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
                             max_batches=int(payload.get("max_batches", 100) or 100),

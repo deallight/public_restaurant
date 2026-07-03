@@ -126,15 +126,34 @@ class RestaurantService:
         self,
         q: str = "",
         category: str = "",
+        min_visit_count: int | str = 0,
+        search_mode: str = "",
         region: str = "",
         bounds: str = "",
     ) -> list[dict[str, Any]]:
+        try:
+            min_visit_count_value = int(min_visit_count or 0)
+        except (TypeError, ValueError) as exc:
+            raise AppError(400, "unsupported visit count filter") from exc
+        if min_visit_count_value < 0 or min_visit_count_value % 10 != 0:
+            raise AppError(400, "visit count filter must use units of 10")
         clauses = ["r.map_exposure_status = 'visible'", "r.verification_status = 'success'"]
         params: list[Any] = []
         if q:
-            clauses.append("(r.normalized_name LIKE ? OR r.normalized_address LIKE ?)")
             normalized = f"%{normalize_text(q)}%"
-            params.extend([normalized, normalized])
+            if search_mode == "address":
+                clauses.append("r.normalized_address LIKE ?")
+                params.append(normalized)
+            else:
+                clauses.append(
+                    """
+                    (
+                      r.normalized_name LIKE ?
+                      OR r.normalized_address LIKE ?
+                    )
+                    """
+                )
+                params.extend([normalized, normalized])
         if category:
             clauses.append("r.major_category = ?")
             params.append(category)
@@ -147,7 +166,27 @@ class RestaurantService:
                 south, west, north, east = parts
                 clauses.append("r.latitude BETWEEN ? AND ? AND r.longitude BETWEEN ? AND ?")
                 params.extend([south, north, west, east])
+        if min_visit_count_value:
+            clauses.append("COALESCE(es.visit_count, 0) >= ?")
+            params.append(min_visit_count_value)
         sql = f"""
+            WITH expense_stats AS (
+              SELECT
+                restaurant_id,
+                COUNT(*) AS visit_count,
+                COALESCE(SUM(amount), 0) AS total_amount
+              FROM restaurant_expense_links
+              GROUP BY restaurant_id
+            ),
+            review_stats AS (
+              SELECT
+                restaurant_id,
+                COALESCE(AVG(rating), 0) AS average_rating,
+                COUNT(*) AS review_count
+              FROM restaurant_reviews
+              WHERE status = 'visible'
+              GROUP BY restaurant_id
+            )
             SELECT
               r.id,
               r.canonical_name AS name,
@@ -158,16 +197,15 @@ class RestaurantService:
               r.latitude,
               rg.sido,
               rg.sigungu,
-              COUNT(rel.id) AS visit_count,
-              COALESCE(SUM(rel.amount), 0) AS total_amount,
-              COALESCE(AVG(CASE WHEN rv.status = 'visible' THEN rv.rating END), 0) AS average_rating,
-              COUNT(CASE WHEN rv.status = 'visible' THEN rv.id END) AS review_count
+              COALESCE(es.visit_count, 0) AS visit_count,
+              COALESCE(es.total_amount, 0) AS total_amount,
+              COALESCE(rs.average_rating, 0) AS average_rating,
+              COALESCE(rs.review_count, 0) AS review_count
             FROM restaurants r
             LEFT JOIN regions rg ON rg.id = r.region_id
-            LEFT JOIN restaurant_expense_links rel ON rel.restaurant_id = r.id
-            LEFT JOIN restaurant_reviews rv ON rv.restaurant_id = r.id
+            LEFT JOIN expense_stats es ON es.restaurant_id = r.id
+            LEFT JOIN review_stats rs ON rs.restaurant_id = r.id
             WHERE {' AND '.join(clauses)}
-            GROUP BY r.id, rg.id
             ORDER BY visit_count DESC, average_rating DESC, r.id ASC
         """
         with self.database.session() as conn:
@@ -514,13 +552,29 @@ class RestaurantService:
             "rejected": "AND c.status = 'rejected'",
         }.get(selected_status, "")
         groups = {
-            "needs_review": {"label": "수동검토", "items": [], "total": 0},
+            "needs_review": {
+                "label": "수동검토",
+                "items": [],
+                "total": 0,
+                "pending_total": 0,
+                "manual_total": 0,
+            },
             "verified": {"label": "승인", "items": [], "total": 0},
             "rejected": {"label": "반려", "items": [], "total": 0},
         }
         with self.database.session() as conn:
             for status in groups:
                 offset = max(0, int(offsets.get(status, 0) or 0))
+                if status == "needs_review":
+                    group_count_clause = "c.status = 'needs_review'"
+                    group_row_clause = (
+                        "c.status = 'needs_review' AND c.verification_status <> 'not_requested'"
+                    )
+                    group_status_params: list[Any] = []
+                else:
+                    group_count_clause = "c.status = ?"
+                    group_row_clause = "c.status = ?"
+                    group_status_params = [status]
                 count_row = conn.execute(
                     f"""
                         SELECT COUNT(*) AS count
@@ -529,17 +583,19 @@ class RestaurantService:
                         JOIN expense_records er ON er.id = c.expense_record_id
                         JOIN institutions i ON i.id = c.institution_id
                         JOIN raw_documents rd ON rd.id = er.raw_document_id
-                        WHERE c.status = ?
+                        WHERE {group_count_clause}
                         {date_clause}
                         {search_clause}
                         {institution_clause}
                         """,
-                    [status, *date_params, *search_params, *institution_params],
+                    [*group_status_params, *date_params, *search_params, *institution_params],
                 ).fetchone()
-                groups[status]["total"] = int(count_row["count"] or 0)
                 if status == "needs_review":
                     groups[status]["pending_total"] = int(count_row["pending_count"] or 0)
                     groups[status]["manual_total"] = int(count_row["manual_count"] or 0)
+                    groups[status]["total"] = int(count_row["manual_count"] or 0)
+                else:
+                    groups[status]["total"] = int(count_row["count"] or 0)
                 rows = [
                     dict(row)
                     for row in conn.execute(
@@ -592,7 +648,7 @@ class RestaurantService:
                           ORDER BY verified_at DESC, id DESC
                           LIMIT 1
                         )
-                        WHERE c.status = ?
+                        WHERE {group_row_clause}
                         {date_clause}
                         {search_clause}
                         {institution_clause}
@@ -600,7 +656,7 @@ class RestaurantService:
                         LIMIT ? OFFSET ?
                         """,
                         [
-                            status,
+                            *group_status_params,
                             *date_params,
                             *search_params,
                             *institution_params,
@@ -1970,6 +2026,10 @@ class RestaurantService:
                           rows_seen,
                           rows_inserted,
                           attempts,
+                          parse_status,
+                          parse_attempts,
+                          parse_error_message,
+                          parsed_at,
                           error_message,
                           source_url,
                           raw_document_id,
@@ -2415,10 +2475,12 @@ class RestaurantService:
         end_date: str,
         institution: str = "",
         status: str = "",
+        parse_status: str = "",
         q: str = "",
         sort: str = "published_desc",
         limit: int = 10,
         offset: int = 0,
+        plan_id: int | None = None,
     ) -> dict[str, Any]:
         try:
             start = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -2438,10 +2500,26 @@ class RestaurantService:
             "failed",
         }:
             raise AppError(400, "unsupported document status")
+        parse_status_filter = str(parse_status or "").strip()
+        if parse_status_filter and parse_status_filter not in {
+            "not_requested",
+            "parsing",
+            "parsed",
+            "empty",
+            "failed",
+            "unsupported",
+        }:
+            raise AppError(400, "unsupported parse status")
+        selected_plan_id = int(plan_id) if plan_id else None
 
         with self.database.session() as conn:
+            params: list[Any] = [start_date, end_date]
+            plan_clause = ""
+            if selected_plan_id:
+                plan_clause = " AND cpd.plan_id = ?"
+                params.append(selected_plan_id)
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                   cpd.id,
                   cpd.plan_id,
@@ -2454,6 +2532,10 @@ class RestaurantService:
                   cpd.rows_seen,
                   cpd.rows_inserted,
                   cpd.attempts,
+                  cpd.parse_status,
+                  cpd.parse_attempts,
+                  cpd.parse_error_message,
+                  cpd.parsed_at,
                   cpd.error_message,
                   cpd.created_at,
                   cpd.updated_at,
@@ -2477,10 +2559,11 @@ class RestaurantService:
                 LEFT JOIN restaurant_candidates c ON c.expense_record_id = er.id
                 WHERE cpd.published_at >= ?
                   AND cpd.published_at <= ?
+                  {plan_clause}
                 GROUP BY cpd.id
                 ORDER BY cpd.plan_id DESC, cpd.id DESC
                 """,
-                (start_date, end_date),
+                params,
             ).fetchall()
 
         latest_by_url: dict[str, sqlite3.Row] = {}
@@ -2522,6 +2605,16 @@ class RestaurantService:
             for item in documents
             if (not institution_filter or item["institution_label"] == institution_filter)
             and (not status_filter or item["status"] == status_filter)
+            and (
+                not parse_status_filter
+                or (
+                    item["parse_status"] == parse_status_filter
+                    and (
+                        parse_status_filter != "not_requested"
+                        or item["status"] in {"collected", "duplicate"}
+                    )
+                )
+            )
             and (
                 not search_text
                 or search_text
@@ -2565,8 +2658,10 @@ class RestaurantService:
             "end_date": end_date,
             "city": "부산광역시",
             "institution": institution_filter,
+            "plan_id": selected_plan_id,
             "institutions": institutions,
             "status": status_filter,
+            "parse_status": parse_status_filter,
             "sort": sort_key,
             "q": str(q or ""),
             "items": page,
@@ -2581,6 +2676,22 @@ class RestaurantService:
                     1 for item in filtered if item["status"] in {"collected", "duplicate"}
                 ),
                 "failed": sum(1 for item in filtered if item["status"] == "failed"),
+                "parse_failed": sum(1 for item in filtered if item["parse_status"] == "failed"),
+                "parse_unsupported": sum(
+                    1 for item in filtered if item["parse_status"] == "unsupported"
+                ),
+                "parse_empty": sum(1 for item in filtered if item["parse_status"] == "empty"),
+                "parse_success": sum(1 for item in filtered if item["parse_status"] == "parsed"),
+                "parse_completed": sum(
+                    1 for item in filtered if item["parse_status"] in {"parsed", "empty"}
+                ),
+                "parsed": sum(1 for item in filtered if item["parse_status"] == "parsed"),
+                "parse_pending": sum(
+                    1
+                    for item in filtered
+                    if item["status"] in {"collected", "duplicate"}
+                    and item["parse_status"] == "not_requested"
+                ),
                 "candidates": sum(int(item["candidate_count"]) for item in filtered),
                 "verification_completed": sum(
                     int(item["verification_completed"]) for item in filtered
@@ -3183,6 +3294,7 @@ class RestaurantService:
             payload["failure_type"] = ", ".join(
                 sorted({str(item.get("detected_type") or "unknown") for item in diagnostics})
             )
+        payload["parse_failure_type"] = payload["failure_type"] if payload.get("parse_error_message") else ""
         return payload
 
     def _source_payload(self, row: sqlite3.Row) -> dict[str, Any]:

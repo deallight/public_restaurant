@@ -656,6 +656,7 @@ function renderCollectionPlanStatus(payload, label) {
       <li><span>배치 크기</span><strong>${summary.batch_size || document.querySelector("#collection-batch-size")?.value || "-"}</strong></li>
       <li><span>신규 문서</span><strong>${summary.documents_inserted || 0}</strong></li>
       <li><span>중복 문서</span><strong>${summary.documents_duplicate || 0}</strong></li>
+      <li><span>파싱 문서</span><strong>${summary.documents_parsed || 0}</strong></li>
       <li><span>신규 행</span><strong>${summary.rows_inserted || 0}</strong></li>
       <li><span>검증 대기 추가</span><strong>${summary.needs_review || 0}</strong></li>
       <li><span>DLQ</span><strong>${summary.dlq || 0}</strong></li>
@@ -755,6 +756,41 @@ async function retryCollectionPlanFailures(button) {
   }
 }
 
+async function parseCollectionPlan(button) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "실행 중";
+  try {
+    if (!currentCollectionPlanId) {
+      const logs = await fetchJson("/ops/logs?limit=1");
+      currentCollectionPlanId = logs.selected_plan_id;
+    }
+    if (!currentCollectionPlanId) throw new Error("먼저 수집 대상을 확정해야 합니다.");
+    const result = await fetchJson(`/ops/collection-plans/${currentCollectionPlanId}/parse`, {
+      method: "POST",
+      body: JSON.stringify({
+        batch_size: Number(document.querySelector("#collection-batch-size")?.value || 20),
+        max_batches: 100,
+      }),
+    });
+    renderCollectionPlanStatus(result, original);
+    await Promise.all([
+      loadSources(),
+      loadVerificationStatus(),
+      loadReviewQueue(),
+      loadReports(),
+      loadCollectionProgress(),
+    ]);
+  } catch (error) {
+    document.querySelector("#collection-plan-status").innerHTML = `
+      <div><strong>${escapeHtml(original)} 실패</strong><small>${escapeHtml(error.message)}</small></div>
+    `;
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
 async function runBatch(url, button, payload = {}) {
   const original = button.textContent;
   button.disabled = true;
@@ -797,6 +833,10 @@ document.querySelector("#create-collection-plan")?.addEventListener("click", asy
 
 document.querySelector("#run-plan-batch")?.addEventListener("click", async (event) => {
   await runCollectionPlanBatch(event.currentTarget);
+});
+
+document.querySelector("#parse-plan-batch")?.addEventListener("click", async (event) => {
+  await parseCollectionPlan(event.currentTarget);
 });
 
 document.querySelector("#retry-plan-failed")?.addEventListener("click", async (event) => {

@@ -296,6 +296,7 @@ async function loadCurrentPlan() {
 function renderBatchResult(payload, label) {
   const summary = payload.summary || {};
   const isVerification = summary.rows_processed !== undefined;
+  const isParsing = summary.documents_parsed !== undefined;
   const metrics = isVerification
     ? [
       ["검증 대기", `${summary.pending_before ?? "-"}→${summary.pending_after ?? "-"}`],
@@ -305,11 +306,17 @@ function renderBatchResult(payload, label) {
       ["반려", summary.rejected || 0],
       ["DLQ", summary.dlq || 0],
     ]
+    : isParsing
+    ? [
+      ["파싱 대기", `${summary.pending_before ?? "-"}→${summary.pending_after ?? "-"}`],
+      ["파싱 문서", `${summary.documents_parsed || 0}/${summary.documents_seen || 0}`],
+      ["빈 문서", summary.documents_empty || 0],
+      ["신규 행", summary.rows_inserted || 0],
+      ["검증 대기", summary.needs_review || 0],
+      ["DLQ", summary.dlq || 0],
+    ]
     : [
       ["문서", `${summary.documents_inserted || 0}/${summary.documents_seen || 0}`],
-      ["신규 행", summary.rows_inserted || 0],
-      ["확인 행", summary.rows_seen || 0],
-      ["검증 대기", summary.needs_review || 0],
       ["DLQ", summary.dlq || 0],
     ];
   document.querySelector("#batch-status").innerHTML = `
@@ -339,7 +346,7 @@ async function runAction(button, action) {
   }
 }
 
-document.querySelector("#load-dashboard").addEventListener("click", async (event) => {
+document.querySelector("#load-dashboard")?.addEventListener("click", async (event) => {
   const button = event.currentTarget;
   const original = button.textContent;
   button.disabled = true;
@@ -354,7 +361,7 @@ document.querySelector("#load-dashboard").addEventListener("click", async (event
   }
 });
 
-document.querySelector("#create-collection-plan").addEventListener("click", (event) => {
+document.querySelector("#create-collection-plan")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, async () => {
     const payload = await fetchJson("/ops/collection-plans", {
       method: "POST",
@@ -365,7 +372,7 @@ document.querySelector("#create-collection-plan").addEventListener("click", (eve
   });
 });
 
-document.querySelector("#run-plan-batch").addEventListener("click", (event) => {
+document.querySelector("#run-plan-batch")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, async () => {
     if (!dashboardState.currentPlanId) await loadCurrentPlan();
     if (!dashboardState.currentPlanId) throw new Error("먼저 수집 대상을 확정해야 합니다.");
@@ -380,7 +387,21 @@ document.querySelector("#run-plan-batch").addEventListener("click", (event) => {
   });
 });
 
-document.querySelector("#retry-plan-failed").addEventListener("click", (event) => {
+document.querySelector("#parse-plan-batch")?.addEventListener("click", (event) => {
+  runAction(event.currentTarget, async () => {
+    if (!dashboardState.currentPlanId) await loadCurrentPlan();
+    if (!dashboardState.currentPlanId) throw new Error("먼저 수집 대상을 확정해야 합니다.");
+    return fetchJson(`/ops/collection-plans/${dashboardState.currentPlanId}/parse`, {
+      method: "POST",
+      body: JSON.stringify({
+        batch_size: Number(document.querySelector("#collection-batch-size")?.value || 20),
+        max_batches: 100,
+      }),
+    });
+  });
+});
+
+document.querySelector("#retry-plan-failed")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, async () => {
     if (!dashboardState.currentPlanId) await loadCurrentPlan();
     if (!dashboardState.currentPlanId) throw new Error("먼저 수집 대상을 확정해야 합니다.");
@@ -394,21 +415,21 @@ document.querySelector("#retry-plan-failed").addEventListener("click", (event) =
   });
 });
 
-document.querySelector("#run-live").addEventListener("click", (event) => {
+document.querySelector("#run-live")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, () => fetchJson("/ops/run-busan-live", {
     method: "POST",
     body: JSON.stringify(liveCollectionPayload()),
   }));
 });
 
-document.querySelector("#verify-collected").addEventListener("click", (event) => {
+document.querySelector("#verify-collected")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, () => fetchJson("/ops/verify-collected", {
     method: "POST",
     body: JSON.stringify({ limit: 100 }),
   }));
 });
 
-document.querySelector("#verify-pending").addEventListener("click", (event) => {
+document.querySelector("#verify-pending")?.addEventListener("click", (event) => {
   runAction(event.currentTarget, () => fetchJson("/ops/verify-pending", {
     method: "POST",
     body: JSON.stringify({ limit: 100 }),

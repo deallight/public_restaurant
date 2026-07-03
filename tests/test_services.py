@@ -86,21 +86,115 @@ class ServiceTests(unittest.TestCase):
             return int(review.lastrowid)
 
     def test_map_ranking_category_and_search(self) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO restaurants
+                  (region_id, canonical_name, normalized_name, major_category, address,
+                   road_address, normalized_address, longitude, latitude,
+                   verification_status, map_exposure_status)
+                VALUES (1, '서울테스트식당', '서울테스트식당', 'restaurant',
+                        '서울특별시 중구 세종대로 110', '서울특별시 중구 세종대로 110',
+                        '서울특별시 중구 세종대로 110', 126.978, 37.5665,
+                        'success', 'visible')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO restaurants
+                  (region_id, canonical_name, normalized_name, major_category, address,
+                   road_address, normalized_address, longitude, latitude,
+                   verification_status, map_exposure_status)
+                VALUES (1, '서울이름부산식당', '서울이름부산식당', 'restaurant',
+                        '부산광역시 연제구 중앙대로 1001', '부산광역시 연제구 중앙대로 1001',
+                        '부산광역시 연제구 중앙대로 1001', 129.0756416, 35.1795543,
+                        'success', 'visible')
+                """
+            )
         all_restaurants = self.service.list_map_restaurants()
         cafes = self.service.list_map_restaurants(category="cafe")
         ranking = self.service.rankings()
         search = self.service.search("광안리")
+        region_search = self.service.search("수영구")
+        city_search = self.service.list_map_restaurants(q="부산광역시")
+        default_seoul_search = self.service.list_map_restaurants(q="서울")
+        outside_city_search = self.service.list_map_restaurants(q="서울", search_mode="address")
 
-        self.assertEqual(len(all_restaurants), 3)
+        self.assertEqual(len(all_restaurants), 5)
         self.assertEqual(len(cafes), 1)
         self.assertEqual(cafes[0]["category_label"], "카페")
         self.assertGreaterEqual(ranking[0]["visit_count"], ranking[-1]["visit_count"])
         self.assertEqual(search[0]["name"], "광안리커피")
+        self.assertEqual(region_search[0]["name"], "광안리커피")
+        self.assertNotIn("서울테스트식당", [restaurant["name"] for restaurant in city_search])
+        self.assertIn("서울이름부산식당", [restaurant["name"] for restaurant in default_seoul_search])
+        self.assertEqual([restaurant["name"] for restaurant in outside_city_search], ["서울테스트식당"])
         for restaurant in all_restaurants:
             self.assertIsNotNone(restaurant["latitude"])
             self.assertIsNotNone(restaurant["longitude"])
             self.assertTrue(restaurant["naver_map_query"])
             self.assertTrue(restaurant["naver_map_url"].startswith("https://map.naver.com/p/search/"))
+
+    def test_map_restaurants_filters_by_ten_unit_visit_count(self) -> None:
+        with self.db.session() as conn:
+            restaurant_id = conn.execute(
+                "SELECT id FROM restaurants WHERE canonical_name = ?",
+                ("부산돼지국밥 시청점",),
+            ).fetchone()["id"]
+            for index in range(9):
+                doc = conn.execute(
+                    """
+                    INSERT INTO raw_documents
+                      (institution_id, source_url, source_title, published_at, collected_at, content_hash)
+                    VALUES (1, ?, '방문횟수 필터 테스트', '2026-06-05', CURRENT_TIMESTAMP, ?)
+                    """,
+                    (f"fixture://visit-filter/{index}", f"visit-filter-{index}"),
+                )
+                expense = conn.execute(
+                    """
+                    INSERT INTO expense_records
+                      (raw_document_id, institution_id, region_id, source_row_number, department_name,
+                       used_date, place_name, purpose, amount, participants, payment_method,
+                       original_row_json, normalized_place_name, normalized_purpose,
+                       is_food_candidate, candidate_reason, row_hash)
+                    VALUES (?, 1, 1, ?, '총무과', '2026-06-05', '부산돼지국밥 시청점',
+                            '업무협의 간담회', 10000, '4명', 'card', '{}',
+                            '부산돼지국밥 시청점', '업무협의 간담회', 1,
+                            'visit_filter_test', ?)
+                    """,
+                    (doc.lastrowid, index + 10, f"visit-filter-row-{index}"),
+                )
+                candidate = conn.execute(
+                    """
+                    INSERT INTO restaurant_candidates
+                      (expense_record_id, institution_id, region_id, original_place_name,
+                       normalized_place_name, original_address, normalized_address, used_date,
+                       amount, place_major_category, status, verification_status,
+                       manual_review_status, extraction_reason)
+                    VALUES (?, 1, 1, '부산돼지국밥 시청점', '부산돼지국밥 시청점',
+                            '부산광역시 연제구 중앙대로 1001',
+                            '부산광역시 연제구 중앙대로 1001', '2026-06-05',
+                            10000, 'restaurant', 'verified', 'success',
+                            'approved', 'visit_filter_test')
+                    """,
+                    (expense.lastrowid,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO restaurant_expense_links
+                      (restaurant_id, expense_record_id, candidate_id, used_date, amount, link_reason)
+                    VALUES (?, ?, ?, '2026-06-05', 10000, 'visit_filter_test')
+                    """,
+                    (restaurant_id, expense.lastrowid, candidate.lastrowid),
+                )
+
+        filtered = self.service.list_map_restaurants(min_visit_count=10)
+        names = [restaurant["name"] for restaurant in filtered]
+
+        self.assertEqual(names, ["부산돼지국밥 시청점"])
+        self.assertEqual(filtered[0]["visit_count"], 10)
+        with self.assertRaises(AppError):
+            self.service.list_map_restaurants(min_visit_count=15)
 
     def test_naver_map_query_strips_floor_for_map_link(self) -> None:
         query = naver_map_query("토곡정", "부산광역시 연제구 토곡로 7 1층")
@@ -338,6 +432,48 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(any(row["original_place_name"] == "승인식당" for row in groups["verified"]["items"]))
         self.assertTrue(any(row["original_place_name"] == "반려식당" for row in groups["rejected"]["items"]))
         self.assertTrue(any(row["candidate_id"] == pending_candidate_id for row in groups["needs_review"]["items"]))
+
+    def test_admin_candidates_pending_status_selects_unverified_candidates(self) -> None:
+        review_id = self._insert_manual_review_with_provider("pending-select", "검증대기식당", 30000)
+        with self.db.session() as conn:
+            candidate_id = conn.execute(
+                "SELECT candidate_id FROM manual_review_tasks WHERE id = ?",
+                (review_id,),
+            ).fetchone()["candidate_id"]
+            conn.execute(
+                """
+                UPDATE restaurant_candidates
+                SET verification_status = 'not_requested',
+                    review_note = 'PENDING_VERIFICATION'
+                WHERE id = ?
+                """,
+                (candidate_id,),
+            )
+            conn.execute(
+                """
+                UPDATE manual_review_tasks
+                SET reason = 'PENDING_VERIFICATION'
+                WHERE candidate_id = ?
+                """,
+                (candidate_id,),
+            )
+
+        payload = self.service.admin_candidates(
+            status="pending",
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            limit=10,
+        )
+        selected = payload["selected"]
+
+        self.assertEqual(selected["label"], "검증 대기")
+        self.assertEqual(selected["total"], 1)
+        self.assertEqual(selected["items"][0]["candidate_id"], candidate_id)
+        self.assertEqual(selected["items"][0]["verification_status"], "not_requested")
+        self.assertEqual(payload["groups"]["needs_review"]["pending_total"], 1)
+        self.assertEqual(payload["groups"]["needs_review"]["manual_total"], 0)
+        self.assertEqual(payload["groups"]["needs_review"]["total"], 0)
+        self.assertFalse(payload["groups"]["needs_review"]["items"])
 
     def test_admin_candidate_pagination_uses_status_offsets(self) -> None:
         context = RequestContext(actor_id="admin")

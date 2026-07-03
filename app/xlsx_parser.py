@@ -25,14 +25,31 @@ class ParsedExpenseRow:
 
 
 def parse_expense_xlsx(payload: bytes) -> list[ParsedExpenseRow]:
-    rows = _read_rows(payload)
+    parsed: list[ParsedExpenseRow] = []
+    errors: list[ValueError] = []
+    recognized_sheets = 0
+    for rows in _read_sheets(payload):
+        try:
+            sheet_rows = _parse_sheet_rows(rows)
+        except ValueError as exc:
+            errors.append(exc)
+            continue
+        recognized_sheets += 1
+        parsed.extend(sheet_rows)
+    if not parsed and errors and not recognized_sheets:
+        raise errors[0]
+    return parsed
+
+
+def _parse_sheet_rows(rows: list[list[str]]) -> list[ParsedExpenseRow]:
     header_index, header = _find_header(rows)
     mapping = _header_mapping(header)
+    default_year = _infer_default_year(rows[: header_index + 1])
     parsed: list[ParsedExpenseRow] = []
     for row_number, row in enumerate(rows[header_index + 1 :], start=1):
         place = _cell(row, mapping["place"])
         amount = _amount(_cell(row, mapping["amount"]))
-        used_date = _date(_cell(row, mapping["date"]))
+        used_date = _date(_cell(row, mapping["date"]), default_year=default_year)
         if not place or _is_placeholder_place(place) or not amount or not used_date:
             continue
         if _normalize(place) in {"계", "합계", "총계"}:
@@ -53,23 +70,31 @@ def parse_expense_xlsx(payload: bytes) -> list[ParsedExpenseRow]:
 
 
 def _read_rows(payload: bytes) -> list[list[str]]:
+    return _read_sheets(payload)[0]
+
+
+def _read_sheets(payload: bytes) -> list[list[list[str]]]:
     if _looks_like_html(payload):
-        return _read_html_tables(payload)
+        return [_read_html_tables(payload)]
     if payload.startswith(b"\x9b DRMONE") or b"DRMONE" in payload[:64]:
         raise ValueError("unsupported encrypted DRM file")
     if payload.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
         raise ValueError("unsupported legacy xls binary file")
     try:
-        return _read_first_sheet(payload)
+        return _read_workbook_sheets(payload)
     except BadZipFile as exc:
         raise ValueError("unsupported spreadsheet file: not xlsx/html") from exc
 
 
-def _read_first_sheet(payload: bytes) -> list[list[str]]:
+def _read_workbook_sheets(payload: bytes) -> list[list[list[str]]]:
     with ZipFile(BytesIO(payload)) as archive:
         shared = _shared_strings(archive)
-        sheet_name = _first_sheet_path(archive)
-        sheet = ET.fromstring(archive.read(sheet_name))
+        sheet_names = _sheet_paths(archive)
+        return [_read_sheet_rows(archive, sheet_name, shared) for sheet_name in sheet_names]
+
+
+def _read_sheet_rows(archive: ZipFile, sheet_name: str, shared: list[str]) -> list[list[str]]:
+    sheet = ET.fromstring(archive.read(sheet_name))
     rows: list[list[str]] = []
     for row in sheet.findall(".//m:sheetData/m:row", NS):
         values: dict[int, str] = {}
@@ -143,12 +168,23 @@ def _shared_strings(archive: ZipFile) -> list[str]:
     return [_text(si) for si in root.findall("m:si", NS)]
 
 
-def _first_sheet_path(archive: ZipFile) -> str:
+def _sheet_paths(archive: ZipFile) -> list[str]:
     names = archive.namelist()
-    for name in names:
-        if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
-            return name
-    raise ValueError("xlsx has no worksheet")
+    sheet_names = [
+        name
+        for name in names
+        if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+    ]
+    if not sheet_names:
+        raise ValueError("xlsx has no worksheet")
+    return sorted(sheet_names, key=_sheet_sort_key)
+
+
+def _sheet_sort_key(path: str) -> tuple[int, str]:
+    match = re.search(r"sheet(\d+)\.xml$", path)
+    if match:
+        return (int(match.group(1)), path)
+    return (0, path)
 
 
 def _cell_value(cell: ET.Element, shared: list[str]) -> str:
@@ -188,19 +224,45 @@ def _header_mapping(header: list[str]) -> dict[str, int]:
     mapping = {
         "date": _find_label(
             normalized,
-            ["일시", "날짜", "사용일자", "집행일자", "사용일", "일자", "집행일", "지출일자", "사용일시"],
+            [
+                "일시",
+                "날짜",
+                "사용일자",
+                "집행일자",
+                "사용일",
+                "일자",
+                "집행일",
+                "지출일자",
+                "사용일시",
+                "결의일자",
+                "지급일자",
+                "원인행위일",
+                "품의일자",
+            ],
         ),
         "place": _find_label(
             normalized,
-            ["장소", "사용장소", "집행장소", "업소명", "상호", "상호명", "사용처", "지급처", "업체명"],
+            [
+                "장소",
+                "사용장소",
+                "집행장소",
+                "업소명",
+                "상호",
+                "상호명",
+                "사용처",
+                "지급처",
+                "업체명",
+                "거래처",
+                "거래처명",
+            ],
         ),
         "amount": _find_amount(normalized),
     }
     optional = {
         "department": ["사용자", "부서", "담당부서", "집행자"],
-        "purpose": ["집행목적", "사용목적", "사용내역", "집행내용", "내용", "목적", "내역"],
+        "purpose": ["집행목적", "사용목적", "사용내역", "집행내용", "내용", "목적", "내역", "적요"],
         "participants": ["대상인원수", "대상인원", "참석인원", "인원"],
-        "payment_method": ["결제방법", "사용방법", "지급방법"],
+        "payment_method": ["결제방법", "사용방법", "지급방법", "집행방식", "명령구분"],
     }
     for key, labels in optional.items():
         try:
@@ -211,13 +273,25 @@ def _header_mapping(header: list[str]) -> dict[str, int]:
 
 
 def _is_place_header(value: str) -> bool:
-    return value in {"장소", "사용장소", "집행장소", "업소명", "상호", "상호명", "사용처", "지급처", "업체명"} or (
+    return value in {
+        "장소",
+        "사용장소",
+        "집행장소",
+        "업소명",
+        "상호",
+        "상호명",
+        "사용처",
+        "지급처",
+        "업체명",
+        "거래처",
+        "거래처명",
+    } or (
         "장소" in value and "목적" not in value
     )
 
 
 def _is_amount_header(value: str) -> bool:
-    return any(token in value for token in ["금액", "집행액", "지출액", "사용액"])
+    return any(token in value for token in ["금액", "집행액", "지출액", "사용액", "집행금액"])
 
 
 def _find_label(values: list[str], candidates: list[str]) -> int:
@@ -271,7 +345,7 @@ def _amount(value: str) -> int:
     return int(float(match.group(0).replace(",", "")))
 
 
-def _date(value: str) -> str:
+def _date(value: str, default_year: int | None = None) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
@@ -280,18 +354,57 @@ def _date(value: str) -> str:
         year = int(compact[:4])
         month = int(compact[4:6])
         day = int(compact[6:8])
-        return datetime(year, month, day).date().isoformat()
+        return _date_or_empty(year, month, day)
+    if re.fullmatch(r"\d{6}", text):
+        year = _two_digit_year(int(compact[:2]))
+        month = int(compact[2:4])
+        day = int(compact[4:6])
+        return _date_or_empty(year, month, day)
     if re.fullmatch(r"\d+(?:\.\d+)?", text):
         serial = float(text)
         if not 1 <= serial <= 60000:
             return ""
         return (datetime(1899, 12, 30) + timedelta(days=serial)).date().isoformat()
-    text = text.replace(".", "-").replace("/", "-")
-    match = re.search(r"(20\d{2})-?(\d{1,2})-?(\d{1,2})", text)
-    if not match:
+    normalized = re.sub(r"\([^)]*\)", "", text)
+    normalized = normalized.replace("년", ".").replace("월", ".").replace("일", ".")
+    normalized = normalized.replace("/", ".").replace("-", ".")
+    normalized = re.sub(r"\s+", "", normalized)
+    match = re.search(r"(20\d{2}|[2-9]\d)\.(\d{1,2})\.(\d{1,2})", normalized)
+    if match:
+        raw_year, month, day = match.groups()
+        year = int(raw_year) if len(raw_year) == 4 else _two_digit_year(int(raw_year))
+        return _date_or_empty(year, int(month), int(day))
+    match = re.search(r"(20\d{2}|[2-9]\d)\.(\d{1,2})\.?중?", normalized)
+    if match:
+        raw_year, month = match.groups()
+        year = int(raw_year) if len(raw_year) == 4 else _two_digit_year(int(raw_year))
+        return _date_or_empty(year, int(month), 1)
+    if default_year:
+        match = re.search(r"(\d{1,2})\.(\d{1,2})", normalized)
+        if match:
+            month, day = (int(part) for part in match.groups())
+            return _date_or_empty(default_year, month, day)
+    return ""
+
+
+def _infer_default_year(rows: list[list[str]]) -> int | None:
+    for row in rows[:10]:
+        for cell in row:
+            match = re.search(r"(20\d{2})\s*년", str(cell or ""))
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _two_digit_year(value: int) -> int:
+    return 2000 + value if value < 70 else 1900 + value
+
+
+def _date_or_empty(year: int, month: int, day: int) -> str:
+    try:
+        return datetime(year, month, day).date().isoformat()
+    except ValueError:
         return ""
-    year, month, day = (int(part) for part in match.groups())
-    return datetime(year, month, day).date().isoformat()
 
 
 def _is_placeholder_place(value: str) -> bool:

@@ -87,6 +87,26 @@ class Database:
                 "created_batch_job_id": "INTEGER REFERENCES batch_jobs(id)",
             },
         )
+        self._ensure_columns(
+            conn,
+            "collection_plan_documents",
+            {
+                "parse_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+                "parse_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "parse_error_message": "TEXT",
+                "parsed_at": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            conn,
+            "raw_documents",
+            {
+                "parse_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+                "parsed_at": "TEXT",
+                "parse_error_message": "TEXT",
+            },
+        )
+        self._backfill_parse_status(conn)
 
     def _ensure_columns(
         self,
@@ -101,6 +121,70 @@ class Database:
         for column_name, column_sql in columns.items():
             if column_name not in existing:
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+    def _backfill_parse_status(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE raw_documents
+            SET parse_status = 'parsed',
+                parsed_at = COALESCE(parsed_at, collected_at)
+            WHERE parse_status = 'not_requested'
+              AND EXISTS (
+                SELECT 1
+                FROM expense_records er
+                WHERE er.raw_document_id = raw_documents.id
+              )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE collection_plan_documents
+            SET parse_status = 'parsed',
+                parsed_at = COALESCE(parsed_at, updated_at)
+            WHERE parse_status = 'not_requested'
+              AND rows_seen > 0
+            """
+        )
+        conn.execute(
+            """
+            UPDATE collection_plan_documents
+            SET parse_status = (
+                  SELECT rd.parse_status
+                  FROM raw_documents rd
+                  WHERE rd.id = collection_plan_documents.raw_document_id
+                ),
+                parsed_at = COALESCE(
+                  parsed_at,
+                  (
+                    SELECT rd.parsed_at
+                    FROM raw_documents rd
+                    WHERE rd.id = collection_plan_documents.raw_document_id
+                  ),
+                  updated_at
+                )
+            WHERE parse_status = 'not_requested'
+              AND raw_document_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM raw_documents rd
+                WHERE rd.id = collection_plan_documents.raw_document_id
+                  AND rd.parse_status IN ('parsed', 'empty')
+              )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE collection_plan_documents
+            SET rows_seen = (
+                  SELECT COUNT(*)
+                  FROM expense_records er
+                  WHERE er.raw_document_id = collection_plan_documents.raw_document_id
+                )
+            WHERE rows_seen = 0
+              AND raw_document_id IS NOT NULL
+              AND parse_status = 'parsed'
+            """
+        )
 
     def rollback_schema(self) -> None:
         """Drop the development SQLite schema in dependency order.

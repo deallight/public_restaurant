@@ -6,6 +6,23 @@ from datetime import date
 
 def public_index(naver_map_key: str) -> str:
     escaped_key = html.escape(naver_map_key)
+    category_filters = [
+        ("", "전체"),
+        ("restaurant", "음식점"),
+        ("cafe", "카페"),
+        ("bar", "주점"),
+        ("other", "기타"),
+    ]
+    category_buttons = "\n".join(
+        f'          <button type="button" data-filter="category" data-value="{html.escape(value)}"'
+        f' aria-pressed="{"true" if not value else "false"}">{html.escape(label)}</button>'
+        for value, label in category_filters
+    )
+    visit_buttons = "\n".join(
+        f'          <button type="button" data-filter="min_visit_count" data-value="{count}"'
+        f' aria-pressed="false">{count}회 이상</button>'
+        for count in range(10, 110, 10)
+    )
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -20,19 +37,26 @@ def public_index(naver_map_key: str) -> str:
 <body>
   <main class="shell">
     <section class="map-stage">
-      <div class="topbar">
-        <div class="brand">공공 맛집 지도</div>
-        <form id="search-form" class="searchbar">
-          <input id="q" name="q" type="search" placeholder="상호, 주소 검색" autocomplete="off">
-          <select id="category" name="category" aria-label="카테고리">
-            <option value="">전체</option>
-            <option value="restaurant">음식점</option>
-            <option value="cafe">카페</option>
-            <option value="bar">주점</option>
-            <option value="other">기타</option>
-          </select>
-          <button type="submit">검색</button>
-        </form>
+      <div class="map-controls">
+        <div class="topbar">
+          <div class="brand">공공 맛집 지도</div>
+          <form id="search-form" class="searchbar">
+            <input id="q" name="q" type="search" placeholder="상호, 주소, 지역 검색" autocomplete="off">
+            <button type="submit">검색</button>
+            <details id="visit-filter-toggle" class="visit-filter-toggle">
+              <summary><span id="visit-filter-label">방문 전체</span></summary>
+              <div class="visit-filter-menu" role="group" aria-label="방문횟수">
+                <button type="button" data-filter="min_visit_count" data-value="" aria-pressed="true">방문 전체</button>
+{visit_buttons}
+              </div>
+            </details>
+          </form>
+        </div>
+        <div id="filter-index" class="filter-index" aria-label="필터 선택">
+          <div class="filter-index-group" role="group" aria-label="카테고리">
+{category_buttons}
+          </div>
+        </div>
       </div>
       <div id="map" class="map" aria-label="지도"></div>
       <aside class="ranking-panel">
@@ -66,9 +90,11 @@ def admin_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a class="active" href="/admin">수집</a>
-        <a href="/admin/workflow">수집·검증</a>
+        <a class="active" href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -173,15 +199,13 @@ def admin_index() -> str:
       <div class="section-head">
         <div>
           <span class="dashboard-eyebrow">수집 실행</span>
-          <h2>부산시 수집·검증 작업</h2>
+          <h2>부산시 수집 작업</h2>
         </div>
         <div class="collection-operation-actions">
           <button id="create-collection-plan" type="button">수집 대상 확정</button>
           <button id="run-plan-batch" type="button">계획 배치 수집</button>
           <button id="retry-plan-failed" type="button">실패 문서 재처리</button>
           <button id="run-live" type="button">즉시 수집</button>
-          <button id="verify-collected" type="button">수집 데이터 검증</button>
-          <button id="verify-pending" type="button">수동검토 재검증</button>
         </div>
       </div>
       <div class="live-collect-controls" aria-label="부산시 수집 조건">
@@ -216,142 +240,66 @@ def admin_index() -> str:
     )
 
 
-def admin_workflow_index() -> str:
-    today = date.today()
-    markup = """<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>수집·검증 작업판</title>
-  <link rel="stylesheet" href="/static/styles.css">
-</head>
-<body>
-  <main class="admin-shell workflow-shell">
-    <header class="dashboard-header">
-      <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
-      <nav class="dashboard-nav" aria-label="관리자 메뉴">
-        <a href="/">운영 맵</a>
-        <a href="/admin">수집</a>
-        <a class="active" href="/admin/workflow">수집·검증</a>
-        <a href="/admin/documents">문서</a>
-        <a href="/admin/review">검토</a>
-        <a href="/admin/logs">로그</a>
-      </nav>
-    </header>
+def admin_parsing_index() -> str:
+    return admin_workflow_index("parsing")
 
-    <section class="workflow-head">
-      <div>
-        <span class="dashboard-eyebrow">부산광역시 업무추진비</span>
-        <h1>수집·검증 작업판</h1>
-        <p id="workflow-range-label">__START_DATE__ ~ __END_DATE__</p>
-      </div>
-      <a class="button-link secondary" href="/admin/logs">실행 로그</a>
-    </section>
 
-    <section class="workflow-scope-controls" aria-label="수집 검증 조회 범위">
-      <label>
-        <span>도시 선택</span>
-        <select id="workflow-city">
-          <option value="busan">부산광역시</option>
-        </select>
-      </label>
-      <label>
-        <span>순위 선택</span>
-        <select id="workflow-priority">
-          <option value="">전체 순위</option>
-        </select>
-      </label>
-      <label>
-        <span>기관 선택</span>
-        <select id="workflow-institution">
-          <option value="">전체 기관</option>
-        </select>
-      </label>
-    </section>
+def _workflow_status_strip(mode: str) -> str:
+    if mode == "review":
+        items = [
+            ("검증 후보", "workflow-candidate-total"),
+            ("승인", "workflow-approved-total"),
+            ("수동검토", "workflow-review-total"),
+            ("반려", "workflow-rejected-total"),
+        ]
+    elif mode == "parsing":
+        items = [
+            ("문서", "workflow-document-total"),
+            ("수집 완료", "workflow-document-collected"),
+            ("파싱 대기", "workflow-parse-pending"),
+            ("파싱 완료", "workflow-parse-success"),
+            ("파싱 실패", "workflow-parse-failed"),
+        ]
+    else:
+        items = [
+            ("문서", "workflow-document-total"),
+            ("수집 완료", "workflow-document-collected"),
+            ("수집 실패", "workflow-document-failed"),
+        ]
+    cells = "\n".join(
+        f'      <div><span>{label}</span><strong id="{element_id}">0</strong></div>'
+        for label, element_id in items
+    )
+    return f"""    <section class="workflow-status-strip workflow-status-strip-compact" aria-label="작업 요약">
+{cells}
+    </section>"""
 
-    <ol id="workflow-steps" class="workflow-steps" aria-label="수집 검증 단계">
-      <li data-step="period" class="active">
-        <span>1</span>
-        <strong>기간 설정</strong>
-        <small id="workflow-step-period">대기</small>
-      </li>
-      <li data-step="list">
-        <span>2</span>
-        <strong>목록 가져오기</strong>
-        <small id="workflow-step-list">문서 0건</small>
-      </li>
-      <li data-step="collect-batch">
-        <span>3</span>
-        <strong>수집 배치</strong>
-        <small id="workflow-step-collect-batch">20건</small>
-      </li>
-      <li data-step="collect">
-        <span>4</span>
-        <strong>문서 수집</strong>
-        <small id="workflow-step-collect">대기</small>
-      </li>
-      <li data-step="verify-batch">
-        <span>5</span>
-        <strong>검증 배치</strong>
-        <small id="workflow-step-verify-batch">100건</small>
-      </li>
-      <li data-step="result">
-        <span>6</span>
-        <strong>결과 분류</strong>
-        <small id="workflow-step-result">승인 0 · 수동 0 · 반려 0</small>
-      </li>
-    </ol>
 
-    <section class="workflow-controls" aria-label="수집 검증 실행 조건">
-      <label>
-        <span>수집 시작일</span>
-        <input id="workflow-start-date" type="date" value="__START_DATE__">
-      </label>
-      <label>
-        <span>수집 종료일</span>
-        <input id="workflow-end-date" type="date" value="__END_DATE__">
-      </label>
-      <label>
-        <span>수집 배치 크기</span>
-        <input id="workflow-batch-size" type="number" min="1" max="200" value="20">
-      </label>
-      <label>
-        <span>검증 배치 크기</span>
-        <input id="workflow-verify-limit" type="number" min="1" max="300" value="100">
-      </label>
-      <button id="workflow-fetch-list" type="button">목록 가져오기</button>
-      <button id="workflow-run-collection" type="button">수집</button>
-      <button id="workflow-retry-collection" class="secondary" type="button">재수집</button>
-      <button id="workflow-run-verification" type="button">검증</button>
-      <button id="workflow-refresh" class="secondary" type="button">새로고침</button>
-    </section>
-
-    <section class="workflow-status-strip" aria-label="현재 상태">
-      <div><span>문서</span><strong id="workflow-document-total">0</strong></div>
-      <div><span>수집 완료</span><strong id="workflow-document-collected">0</strong></div>
-      <div><span>수집 실패</span><strong id="workflow-document-failed">0</strong></div>
-      <div><span>검증 후보</span><strong id="workflow-candidate-total">0</strong></div>
-      <div><span>승인</span><strong id="workflow-approved-total">0</strong></div>
-      <div><span>수동검토</span><strong id="workflow-review-total">0</strong></div>
-      <div><span>반려</span><strong id="workflow-rejected-total">0</strong></div>
-    </section>
-
-    <section class="workflow-main-grid">
-      <article class="workflow-panel workflow-collection-panel">
+def _workflow_document_panel(show_parse_status: bool) -> str:
+    parse_status_hidden = "" if show_parse_status else " hidden"
+    return f"""      <article class="workflow-panel workflow-collection-panel">
         <header class="workflow-panel-head">
           <div>
             <span class="dashboard-eyebrow">수집 목록</span>
             <h2>기간 내 게시물</h2>
           </div>
           <div class="workflow-panel-tools">
-            <select id="workflow-document-status" aria-label="수집 상태">
+            <select id="workflow-document-status" aria-label="문서 상태">
               <option value="">전체 상태</option>
               <option value="pending">대기</option>
               <option value="processing">처리 중</option>
-              <option value="collected">수집</option>
+              <option value="collected">수집 완료</option>
               <option value="duplicate">기존 문서</option>
-              <option value="failed">실패</option>
+              <option value="failed">수집 실패</option>
+            </select>
+            <select id="workflow-parse-status" aria-label="파싱 상태"{parse_status_hidden}>
+              <option value="">전체 파싱 상태</option>
+              <option value="not_requested">파싱 대기</option>
+              <option value="parsing">파싱 중</option>
+              <option value="parsed">파싱 완료</option>
+              <option value="empty">빈 문서</option>
+              <option value="failed">파싱 실패</option>
+              <option value="unsupported">지원 불가</option>
             </select>
             <a class="dashboard-text-link" href="/admin/documents">전체 문서</a>
           </div>
@@ -364,18 +312,20 @@ def admin_workflow_index() -> str:
                 <th>작성일</th>
                 <th>제목</th>
                 <th>진행</th>
-                <th>수집 성공/실패</th>
+                <th>상태</th>
               </tr>
             </thead>
             <tbody id="workflow-document-rows">
-              <tr><td colspan="5">수집 목록을 불러오는 중입니다.</td></tr>
+              <tr><td colspan="5">수집 문서를 불러오는 중입니다.</td></tr>
             </tbody>
           </table>
         </div>
         <div id="workflow-document-pagination" class="workflow-pagination" aria-label="수집 목록 페이지"></div>
-      </article>
+      </article>"""
 
-      <article id="workflow-verification" class="workflow-panel workflow-verification-panel">
+
+def _workflow_candidate_panel() -> str:
+    return """      <article id="workflow-verification" class="workflow-panel workflow-verification-panel">
         <header class="workflow-panel-head">
           <div>
             <span class="dashboard-eyebrow">검증</span>
@@ -383,69 +333,209 @@ def admin_workflow_index() -> str:
           </div>
           <div class="workflow-panel-tools">
             <select id="workflow-candidate-status" aria-label="검증 상태">
-              <option value="">전체 상태</option>
-              <option value="pending" selected>검증 대기</option>
-              <option value="verified">승인</option>
+              <option value="pending">검증 대기</option>
               <option value="needs_review">수동검토</option>
+              <option value="verified">승인</option>
               <option value="rejected">반려</option>
             </select>
             <select id="workflow-candidate-sort" aria-label="검증 정렬">
-              <option value="verification_oldest" selected>검증 대기 오래된순</option>
-              <option value="used_date_desc">방문일 최신순</option>
-              <option value="used_date_asc">방문일 오래된순</option>
-              <option value="source_published_desc">문서 작성일 최신순</option>
-              <option value="source_published_asc">문서 작성일 오래된순</option>
+              <option value="verification_oldest">검증 대기 오래된순</option>
+              <option value="id_desc">최신순</option>
               <option value="amount_desc">금액 높은순</option>
-              <option value="name_asc">상호명순</option>
-              <option value="id_desc">등록 최신순</option>
             </select>
             <input id="workflow-candidate-search" type="search" placeholder="상호, 주소, 기관 검색">
             <button id="workflow-candidate-search-button" class="secondary" type="button">검색</button>
           </div>
         </header>
-        <div class="workflow-verification-layout">
-          <div class="workflow-table-wrap">
-            <table class="workflow-table workflow-verification-table">
-              <thead>
-                <tr>
-                  <th>순번</th>
-                  <th>문서 작성일</th>
-                  <th>방문일</th>
-                  <th>원문 가게명</th>
-                  <th>원문 주소</th>
-                  <th>진행</th>
-                  <th>검증 결과</th>
-                </tr>
-              </thead>
-              <tbody id="workflow-candidate-rows">
-                <tr><td colspan="7">검증 항목을 불러오는 중입니다.</td></tr>
-              </tbody>
-            </table>
-          </div>
-          <div id="workflow-candidate-pagination" class="workflow-pagination" aria-label="검증 항목 페이지"></div>
-          <aside class="workflow-log-panel" aria-live="polite">
-            <strong>상태 로그</strong>
-            <div id="workflow-log-list"></div>
-          </aside>
+        <div class="workflow-table-wrap">
+          <table class="workflow-table workflow-verification-table">
+            <thead>
+              <tr>
+                <th>순번</th>
+                <th>문서 작성일</th>
+                <th>방문일</th>
+                <th>원문 가게명</th>
+                <th>원문 주소</th>
+                <th>진행</th>
+                <th>상태</th>
+              </tr>
+            </thead>
+            <tbody id="workflow-candidate-rows">
+              <tr><td colspan="7">검증 항목을 불러오는 중입니다.</td></tr>
+            </tbody>
+          </table>
         </div>
-      </article>
+        <div id="workflow-candidate-pagination" class="workflow-pagination" aria-label="검증 항목 페이지"></div>
+      </article>"""
+
+
+def _workflow_log_panel() -> str:
+    return """      <aside class="workflow-log-panel" aria-label="상태 로그">
+        <strong>상태 로그</strong>
+        <div id="workflow-log-list"></div>
+      </aside>"""
+
+
+def _workflow_main_content(mode: str) -> str:
+    if mode == "review":
+        return f"""    <section class="workflow-main-grid workflow-review-log-grid">
+{_workflow_candidate_panel()}
+{_workflow_log_panel()}
+    </section>"""
+    return f"""    <section class="workflow-main-grid workflow-document-log-grid">
+{_workflow_document_panel(show_parse_status=mode == "parsing")}
+{_workflow_log_panel()}
+    </section>"""
+
+
+def admin_workflow_index(mode: str = "collection") -> str:
+    today = date.today()
+    safe_mode = mode if mode in {"collection", "parsing", "review"} else "collection"
+    page_meta = {
+        "collection": {
+            "title": "수집 작업판",
+            "eyebrow": "부산광역시 업무추진비",
+            "subtitle": "목록 확인과 문서 수집 상태를 한 화면에서 관리합니다.",
+            "active_collection": ' class="active"',
+            "active_parsing": "",
+            "active_review": "",
+            "hide_fetch": "",
+            "hide_collect": "",
+            "hide_retry": "",
+            "hide_parse": " hidden",
+            "hide_verify": " hidden",
+            "batch_control": """      <label>
+        <span>수집 배치 크기</span>
+        <input id="workflow-batch-size" type="number" min="1" max="500" value="100">
+      </label>""",
+            "verify_control": "",
+            "head_action": '<a class="button-link secondary" href="/admin/documents">문서 게시판</a>',
+        },
+        "parsing": {
+            "title": "파싱 작업판",
+            "eyebrow": "부산광역시 업무추진비",
+            "subtitle": "수집된 원문 문서의 파싱 상태와 신규 행 생성 결과를 확인합니다.",
+            "active_collection": "",
+            "active_parsing": ' class="active"',
+            "active_review": "",
+            "hide_fetch": " hidden",
+            "hide_collect": " hidden",
+            "hide_retry": " hidden",
+            "hide_parse": "",
+            "hide_verify": " hidden",
+            "batch_control": """      <label>
+        <span>파싱 배치 크기</span>
+        <input id="workflow-batch-size" type="number" min="1" max="500" value="100">
+      </label>""",
+            "verify_control": "",
+            "head_action": '<a class="button-link secondary" href="/admin/documents">문서 게시판</a>',
+        },
+        "review": {
+            "title": "검토 작업판",
+            "eyebrow": "부산광역시 업무추진비",
+            "subtitle": "검증 후보와 승인·수동검토·반려 결과를 검토합니다.",
+            "active_collection": "",
+            "active_parsing": "",
+            "active_review": ' class="active"',
+            "hide_fetch": " hidden",
+            "hide_collect": " hidden",
+            "hide_retry": " hidden",
+            "hide_parse": " hidden",
+            "hide_verify": "",
+            "batch_control": "",
+            "verify_control": """      <label>
+        <span>검증 배치 크기</span>
+        <input id="workflow-verify-limit" type="number" min="1" max="500" value="100">
+      </label>""",
+            "head_action": '<a class="button-link secondary" href="/admin/review/results">검증 결과 수정</a>',
+        },
+    }[safe_mode]
+    markup = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__TITLE__</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="admin-shell workflow-shell" data-workflow-mode="__MODE__">
+    <header class="dashboard-header">
+      <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
+      <nav class="dashboard-nav" aria-label="관리자 메뉴">
+        <a href="/">운영 맵</a>
+        <a href="/admin">대시보드</a>
+        <a__ACTIVE_COLLECTION__ href="/admin/collection">수집</a>
+        <a__ACTIVE_PARSING__ href="/admin/parsing">파싱</a>
+        <a__ACTIVE_REVIEW__ href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
+        <a href="/admin/logs">로그</a>
+      </nav>
+    </header>
+
+    <section class="workflow-head">
+      <div>
+        <span class="dashboard-eyebrow">__EYEBROW__</span>
+        <h1>__TITLE__</h1>
+        <p id="workflow-range-label">__START_DATE__ ~ __END_DATE__</p>
+      </div>
+      __HEAD_ACTION__
     </section>
 
-    <section class="workflow-db-panel">
-      <header class="workflow-panel-head">
-        <div>
-          <span class="dashboard-eyebrow">DB 조회</span>
-          <h2>검증 결과별 항목</h2>
-        </div>
-        <a class="dashboard-text-link" href="/admin/review">상세 검토</a>
-      </header>
-      <div id="workflow-status-tabs" class="workflow-status-tabs" data-active="needs_review">
-        <button type="button" data-status="verified">승인</button>
-        <button class="active" type="button" data-status="needs_review">수동검토</button>
-        <button type="button" data-status="rejected">반려</button>
-      </div>
-      <div id="workflow-db-list" class="workflow-db-list"></div>
+    <section class="workflow-scope-controls" aria-label="조회 범위">
+      <label>
+        <span>도시 선택</span>
+        <select id="workflow-city" aria-label="도시 선택">
+          <option value="busan">부산광역시</option>
+        </select>
+      </label>
+      <label>
+        <span>순위 선택</span>
+        <select id="workflow-priority" aria-label="순위 선택">
+          <option value="">전체 순위</option>
+        </select>
+      </label>
+      <label>
+        <span>기관 선택</span>
+        <select id="workflow-institution" aria-label="기관 선택">
+          <option value="">전체 기관</option>
+        </select>
+      </label>
     </section>
+
+    <ol id="workflow-steps" class="workflow-steps" aria-label="작업 단계">
+      <li data-step="period"><span>1</span><strong>기간 설정</strong><small id="workflow-step-period">__START_DATE__ ~ __END_DATE__</small></li>
+      <li data-step="list"><span>2</span><strong>목록 가져오기</strong><small id="workflow-step-list">문서 0건</small></li>
+      <li data-step="collect-batch"><span>3</span><strong>수집 배치</strong><small id="workflow-step-collect-batch">100건</small></li>
+      <li data-step="collect"><span>4</span><strong>문서 수집</strong><small id="workflow-step-collect">대기</small></li>
+      <li data-step="parse"><span>5</span><strong>문서 파싱</strong><small id="workflow-step-parse">대기</small></li>
+      <li data-step="verify-batch"><span>6</span><strong>검증 배치</strong><small id="workflow-step-verify-batch">100건</small></li>
+      <li data-step="result"><span>7</span><strong>결과 분류</strong><small id="workflow-step-result">승인 0 · 수동 0 · 반려 0</small></li>
+    </ol>
+
+    <section class="workflow-controls" aria-label="작업 실행 조건">
+      <label>
+        <span>수집 시작일</span>
+        <input id="workflow-start-date" type="date" value="__START_DATE__">
+      </label>
+      <label>
+        <span>수집 종료일</span>
+        <input id="workflow-end-date" type="date" value="__END_DATE__">
+      </label>
+__BATCH_CONTROL__
+__VERIFY_CONTROL__
+      <button id="workflow-fetch-list" type="button"__HIDE_FETCH__>목록 가져오기</button>
+      <button id="workflow-run-collection" type="button"__HIDE_COLLECT__>수집</button>
+      <button id="workflow-run-parse" type="button"__HIDE_PARSE__>파싱</button>
+      <button id="workflow-retry-parse" class="secondary" type="button"__HIDE_PARSE__>실패 재파싱</button>
+      <button id="workflow-retry-collection" class="secondary" type="button"__HIDE_RETRY__>재수집</button>
+      <button id="workflow-run-verification" type="button"__HIDE_VERIFY__>검증</button>
+      <button id="workflow-refresh" class="secondary" type="button">새로고침</button>
+    </section>
+
+__STATUS_STRIP__
+
+__WORKFLOW_MAIN__
 
     <div id="workflow-toast" class="workflow-toast" hidden></div>
   </main>
@@ -453,7 +543,24 @@ def admin_workflow_index() -> str:
 </body>
 </html>"""
     return (
-        markup.replace("__START_DATE__", f"{today.year}-01-01")
+        markup.replace("__MODE__", safe_mode)
+        .replace("__TITLE__", html.escape(page_meta["title"]))
+        .replace("__EYEBROW__", html.escape(page_meta["eyebrow"]))
+        .replace("__SUBTITLE__", html.escape(page_meta["subtitle"]))
+        .replace("__HEAD_ACTION__", page_meta["head_action"])
+        .replace("__ACTIVE_COLLECTION__", page_meta["active_collection"])
+        .replace("__ACTIVE_PARSING__", page_meta["active_parsing"])
+        .replace("__ACTIVE_REVIEW__", page_meta["active_review"])
+        .replace("__HIDE_FETCH__", page_meta["hide_fetch"])
+        .replace("__HIDE_COLLECT__", page_meta["hide_collect"])
+        .replace("__HIDE_RETRY__", page_meta["hide_retry"])
+        .replace("__HIDE_PARSE__", page_meta["hide_parse"])
+        .replace("__HIDE_VERIFY__", page_meta["hide_verify"])
+        .replace("__BATCH_CONTROL__", page_meta["batch_control"])
+        .replace("__VERIFY_CONTROL__", page_meta["verify_control"])
+        .replace("__STATUS_STRIP__", _workflow_status_strip(safe_mode))
+        .replace("__WORKFLOW_MAIN__", _workflow_main_content(safe_mode))
+        .replace("__START_DATE__", f"{today.year}-01-01")
         .replace("__END_DATE__", today.isoformat())
     )
 
@@ -464,7 +571,7 @@ def admin_review_index() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>데이터 검토</title>
+  <title>검증 결과 수정</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -473,15 +580,19 @@ def admin_review_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a href="/admin">수집</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
     <section class="verification-section">
       <div class="section-head">
-        <h1>데이터 검토</h1>
+        <h1>검증 결과 수정</h1>
         <div class="admin-actions">
+          <a class="button-link secondary" href="/admin/review">검토 작업판</a>
           <a class="button-link" href="/admin/map-issues">지도 문제 항목</a>
         </div>
       </div>
@@ -492,7 +603,7 @@ def admin_review_index() -> str:
       <div id="verification-status" class="verification-status"></div>
     </section>
     <section class="manual-review-section">
-      <h2>후보 데이터 <small id="review-queue-summary"></small></h2>
+      <h2>승인·수동검토·반려 항목 <small id="review-queue-summary"></small></h2>
       <div id="review-queue" class="admin-list"></div>
       <section class="review-reports-section">
         <h2>리뷰 신고</h2>
@@ -520,8 +631,11 @@ def map_issues_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a href="/admin">수집</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -554,8 +668,11 @@ def ops_logs_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a href="/admin">수집</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
         <a class="active" href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -615,8 +732,11 @@ def admin_documents_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a class="active" href="/admin">수집</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -626,7 +746,7 @@ def admin_documents_index() -> str:
         <h1>기관별 수집 문서</h1>
         <p>수집 문서, 파싱 결과, 검증 진행 상태를 기관 단위로 조회합니다.</p>
       </div>
-      <a class="button-link secondary" href="/admin">대시보드로</a>
+      <a class="button-link secondary" href="/admin/collection">수집 화면으로</a>
     </section>
     <section class="document-filter-panel">
       <div class="document-filter-grid">
@@ -725,8 +845,11 @@ def admin_document_detail_index() -> str:
       <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
       <nav class="dashboard-nav" aria-label="관리자 메뉴">
         <a href="/">운영 맵</a>
-        <a class="active" href="/admin">수집</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>

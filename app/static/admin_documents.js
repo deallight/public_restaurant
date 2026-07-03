@@ -30,6 +30,17 @@ function statusLabel(status) {
   }[status] || status || "미확인";
 }
 
+function parseStatusLabel(status) {
+  return {
+    not_requested: "파싱 대기",
+    parsing: "파싱 중",
+    parsed: "파싱 완료",
+    empty: "파싱 결과 없음",
+    failed: "파싱 실패",
+    unsupported: "지원 불가",
+  }[status] || status || "파싱 대기";
+}
+
 const state = {
   offset: 0,
   limit: 10,
@@ -107,7 +118,7 @@ function renderBoard(payload) {
             <th>문서 제목</th>
             <th>집행 내역</th>
             <th>검증 상태</th>
-            <th>시도</th>
+            <th>수집/파싱</th>
           </tr>
         </thead>
         <tbody>
@@ -138,8 +149,9 @@ function renderBoard(payload) {
                     <i style="width:${Number(item.verification_percent || 0)}%"></i>
                   </span>
                   <small>승인 ${item.approved_count} · 수동 ${item.review_count} · 반려 ${item.rejected_count}</small>
+                  <small>${escapeHtml(parseStatusLabel(item.parse_status))}${item.parse_error_message ? ` · ${escapeHtml(short(item.parse_error_message, 52))}` : ""}</small>
                 </td>
-                <td>${Number(item.attempts || 0)}</td>
+                <td>${Number(item.attempts || 0)} / ${Number(item.parse_attempts || 0)}</td>
               </tr>
             `;
           }).join("")}

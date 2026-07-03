@@ -436,12 +436,14 @@ class BusanCityLiveAdapter:
         start_date: str = "",
         end_date: str = "",
         raw_dir: Path | None = None,
+        filter_rows_by_used_date: bool = True,
     ) -> None:
         self.max_pages = max_pages
         self.max_documents = max_documents
         self.start_date = _parse_iso_date(start_date)
         self.end_date = _parse_iso_date(end_date)
         self.raw_dir = raw_dir or BASE_DIR / "var" / "raw" / "busan_city"
+        self.filter_rows_by_used_date = filter_rows_by_used_date
 
     def discover(self) -> list[SourceDocument]:
         documents: list[SourceDocument] = []
@@ -525,7 +527,7 @@ class BusanCityLiveAdapter:
                 parse_errors.append(f"{attachment.filename}: {exc}")
                 continue
             for parsed in parsed_rows:
-                if not self._is_within_date_range(parsed.used_date):
+                if self.filter_rows_by_used_date and not self._is_within_date_range(parsed.used_date):
                     continue
                 rows.append(
                     RawExpenseRow(
@@ -850,9 +852,18 @@ class DailyPipeline:
                             },
                             str(exc),
                         )
+                        self._mark_document_parse_failed(
+                            conn,
+                            raw_document_id,
+                            self._parse_error_status(exc),
+                            str(exc),
+                        )
                         continue
+                    document_rows_seen = 0
+                    document_rows_inserted = 0
                     for raw_row in extracted_rows:
                         summary["rows_seen"] += 1
+                        document_rows_seen += 1
                         try:
                             normalized = self._normalize(raw_row)
                             expense_id, inserted_row = self._upsert_expense(
@@ -860,6 +871,7 @@ class DailyPipeline:
                             )
                             if inserted_row:
                                 summary["rows_inserted"] += 1
+                                document_rows_inserted += 1
                             candidate_id = self._upsert_candidate(
                                 conn, source, expense_id, raw_row, normalized
                             )
@@ -884,6 +896,13 @@ class DailyPipeline:
                         except Exception as exc:  # pragma: no cover - defensive DLQ guard
                             summary["dlq"] += 1
                             self._insert_dlq(conn, batch_id, "row", raw_row.__dict__, str(exc))
+                    self._mark_document_parsed(
+                        conn,
+                        raw_document_id,
+                        "parsed" if document_rows_seen > 0 else "empty",
+                        document_rows_seen,
+                        document_rows_inserted,
+                    )
                 self._finish_batch(conn, batch_id, "success", summary)
                 return {"batch_id": batch_id, "status": "success", "summary": summary}
             except Exception as exc:
@@ -962,18 +981,32 @@ class DailyPipeline:
                 targets = self.adapter.discover_targets()  # type: ignore[attr-defined]
                 for target in targets:
                     summary["documents_seen"] += 1
-                    existing_raw_document_id = self._existing_collected_document_id(
+                    existing_document = self._existing_document_for_target(
                         conn,
                         source,
                         target,
                     )
-                    status = "duplicate" if existing_raw_document_id else "pending"
+                    existing_raw_document_id = (
+                        int(existing_document["id"]) if existing_document is not None else None
+                    )
+                    existing_parse_status = (
+                        str(existing_document["parse_status"] or "not_requested")
+                        if existing_document is not None
+                        else "not_requested"
+                    )
+                    existing_rows_seen = (
+                        int(existing_document["expense_count"] or 0)
+                        if existing_document is not None
+                        else 0
+                    )
+                    parse_complete = existing_parse_status in {"parsed", "empty"} or existing_rows_seen > 0
+                    status = "duplicate" if parse_complete else "collected" if existing_raw_document_id else "pending"
                     inserted = conn.execute(
                         """
                         INSERT OR IGNORE INTO collection_plan_documents
                           (plan_id, source_url, source_title, department_name, published_at,
-                           status, raw_document_id, metadata_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           status, raw_document_id, rows_seen, parse_status, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             plan_id,
@@ -983,8 +1016,12 @@ class DailyPipeline:
                             target.published_at,
                             status,
                             existing_raw_document_id,
+                            existing_rows_seen,
+                            existing_parse_status if existing_raw_document_id else "not_requested",
                             safe_json_dumps(
                                 {"skip_reason": "already_collected"}
+                                if parse_complete
+                                else {"skip_reason": "already_downloaded_pending_parse"}
                                 if existing_raw_document_id
                                 else {}
                             ),
@@ -992,7 +1029,7 @@ class DailyPipeline:
                     ).rowcount
                     if inserted:
                         summary["documents_inserted"] += 1
-                        if existing_raw_document_id:
+                        if parse_complete:
                             summary["documents_skipped_collected"] += 1
                 self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
                 self._finish_batch(conn, batch_id, "success", summary)
@@ -1069,8 +1106,6 @@ class DailyPipeline:
                         """,
                         (batch_id, utc_now(), target_row["id"]),
                     )
-                    doc_rows_seen = 0
-                    doc_rows_inserted = 0
                     document: SourceDocument | None = None
                     try:
                         document = self.adapter.fetch_document(
@@ -1086,44 +1121,22 @@ class DailyPipeline:
                             summary["documents_inserted"] += 1
                         else:
                             summary["documents_duplicate"] += 1
-                        extracted_rows = self.adapter.extract(document)
-                        for raw_row in extracted_rows:
-                            doc_rows_seen += 1
-                            summary["rows_seen"] += 1
-                            normalized = self._normalize(raw_row)
-                            expense_id, inserted_row = self._upsert_expense(
-                                conn, source, raw_document_id, raw_row, normalized
-                            )
-                            candidate_id = self._upsert_candidate(
-                                conn, source, expense_id, raw_row, normalized
-                            )
-                            if inserted_row:
-                                doc_rows_inserted += 1
-                                summary["rows_inserted"] += 1
-                                if not self._candidate_is_resolved(conn, candidate_id):
-                                    self._defer_candidate_verification(conn, candidate_id)
-                                    summary["needs_review"] += 1
-                        document_status = (
-                            "collected"
-                            if inserted_doc or doc_rows_inserted > 0
-                            else "duplicate"
-                        )
                         conn.execute(
                             """
                             UPDATE collection_plan_documents
-                            SET status = ?,
+                            SET status = 'collected',
                                 raw_document_id = ?,
-                                rows_seen = ?,
-                                rows_inserted = ?,
+                                parse_status = CASE
+                                  WHEN parse_status IN ('parsed', 'empty') THEN parse_status
+                                  ELSE 'not_requested'
+                                END,
+                                parse_error_message = NULL,
                                 error_message = NULL,
                                 updated_at = ?
                             WHERE id = ?
                             """,
                             (
-                                document_status,
                                 raw_document_id,
-                                doc_rows_seen,
-                                doc_rows_inserted,
                                 utc_now(),
                                 target_row["id"],
                             ),
@@ -1156,8 +1169,8 @@ class DailyPipeline:
                             WHERE id = ?
                             """,
                             (
-                                doc_rows_seen,
-                                doc_rows_inserted,
+                                0,
+                                0,
                                 str(exc),
                                 safe_json_dumps(
                                     {
@@ -1241,6 +1254,339 @@ class DailyPipeline:
             "summary": summary,
         }
 
+    def parse_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict[str, Any]:
+        self.database.initialize()
+        with self.database.session() as conn:
+            plan = conn.execute("SELECT * FROM collection_plans WHERE id = ?", (plan_id,)).fetchone()
+            if plan is None:
+                raise RuntimeError(f"collection plan not found: {plan_id}")
+            if hasattr(self.adapter, "start_date"):
+                self.adapter.start_date = _parse_iso_date(plan["start_date"])  # type: ignore[attr-defined]
+            if hasattr(self.adapter, "end_date"):
+                self.adapter.end_date = _parse_iso_date(plan["end_date"])  # type: ignore[attr-defined]
+            if hasattr(self.adapter, "filter_rows_by_used_date"):
+                self.adapter.filter_rows_by_used_date = False  # type: ignore[attr-defined]
+            source = self._load_source(conn)
+            capped_batch_size = max(1, min(int(batch_size or plan["batch_size"] or 20), 200))
+            batch_id = self._create_batch(conn, "collection_plan_parse")
+            summary = {
+                "plan_id": plan_id,
+                "batch_size": capped_batch_size,
+                "documents_seen": 0,
+                "documents_parsed": 0,
+                "documents_empty": 0,
+                "rows_seen": 0,
+                "rows_inserted": 0,
+                "approved": 0,
+                "rejected": 0,
+                "needs_review": 0,
+                "dlq": 0,
+            }
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                      cpd.id AS collection_document_id,
+                      cpd.raw_document_id,
+                      cpd.metadata_json AS collection_metadata_json,
+                      rd.source_url,
+                      rd.source_title,
+                      rd.published_at,
+                      rd.raw_content_path,
+                      rd.metadata_json AS raw_metadata_json
+                    FROM collection_plan_documents cpd
+                    JOIN raw_documents rd ON rd.id = cpd.raw_document_id
+                    WHERE cpd.plan_id = ?
+                      AND cpd.status IN ('collected', 'duplicate')
+                      AND cpd.parse_status = 'not_requested'
+                    ORDER BY cpd.published_at DESC, cpd.id ASC
+                    LIMIT ?
+                    """,
+                    (plan_id, capped_batch_size),
+                ).fetchall()
+                for row in rows:
+                    summary["documents_seen"] += 1
+                    document = self._source_document_from_raw_row(row)
+                    now = utc_now()
+                    conn.execute(
+                        """
+                        UPDATE collection_plan_documents
+                        SET parse_status = 'parsing',
+                            parse_attempts = parse_attempts + 1,
+                            parse_error_message = NULL,
+                            batch_job_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (batch_id, now, row["collection_document_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE raw_documents
+                        SET parse_status = 'parsing',
+                            parse_error_message = NULL
+                        WHERE id = ?
+                        """,
+                        (row["raw_document_id"],),
+                    )
+                    doc_rows_seen = 0
+                    doc_rows_inserted = 0
+                    try:
+                        extracted_rows = self.adapter.extract(document)
+                        for raw_row in extracted_rows:
+                            doc_rows_seen += 1
+                            summary["rows_seen"] += 1
+                            normalized = self._normalize(raw_row)
+                            expense_id, inserted_row = self._upsert_expense(
+                                conn, source, int(row["raw_document_id"]), raw_row, normalized
+                            )
+                            candidate_id = self._upsert_candidate(
+                                conn, source, expense_id, raw_row, normalized
+                            )
+                            if inserted_row:
+                                doc_rows_inserted += 1
+                                summary["rows_inserted"] += 1
+                                if not self._candidate_is_resolved(conn, candidate_id):
+                                    self._defer_candidate_verification(conn, candidate_id)
+                                    summary["needs_review"] += 1
+                        parse_status = "parsed" if doc_rows_seen > 0 else "empty"
+                        if parse_status == "parsed":
+                            summary["documents_parsed"] += 1
+                        else:
+                            summary["documents_empty"] += 1
+                        self._mark_document_parsed(
+                            conn,
+                            int(row["raw_document_id"]),
+                            parse_status,
+                            doc_rows_seen,
+                            doc_rows_inserted,
+                        )
+                        conn.execute(
+                            """
+                            UPDATE collection_plan_documents
+                            SET parse_status = ?,
+                                rows_seen = ?,
+                                rows_inserted = ?,
+                                parse_error_message = NULL,
+                                parsed_at = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                parse_status,
+                                doc_rows_seen,
+                                doc_rows_inserted,
+                                utc_now(),
+                                utc_now(),
+                                row["collection_document_id"],
+                            ),
+                        )
+                    except Exception as exc:
+                        parse_status = self._parse_error_status(exc)
+                        summary["dlq"] += 1
+                        self._insert_dlq(
+                            conn,
+                            batch_id,
+                            "collection_plan_parse",
+                            {
+                                "plan_id": plan_id,
+                                "raw_document_id": row["raw_document_id"],
+                                "source_url": row["source_url"],
+                                "source_title": row["source_title"],
+                                "attachment_diagnostics": _attachment_diagnostics(document.attachments),
+                            },
+                            str(exc),
+                        )
+                        self._mark_document_parse_failed(
+                            conn,
+                            int(row["raw_document_id"]),
+                            parse_status,
+                            str(exc),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE collection_plan_documents
+                            SET parse_status = ?,
+                                rows_seen = ?,
+                                rows_inserted = ?,
+                                parse_error_message = ?,
+                                metadata_json = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                parse_status,
+                                doc_rows_seen,
+                                doc_rows_inserted,
+                                str(exc),
+                                safe_json_dumps(
+                                    {
+                                        **safe_json_loads(row["collection_metadata_json"], {}),
+                                        "attachment_diagnostics": _attachment_diagnostics(document.attachments),
+                                    }
+                                ),
+                                utc_now(),
+                                row["collection_document_id"],
+                            ),
+                        )
+                self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
+                self._finish_batch(conn, batch_id, "success", summary)
+                return {
+                    "batch_id": batch_id,
+                    "plan_id": plan_id,
+                    "status": "success",
+                    "summary": summary,
+                }
+            except Exception as exc:
+                self._refresh_collection_plan_counts(conn, plan_id, extra_summary=summary)
+                self._finish_batch(conn, batch_id, "failed", summary, str(exc))
+                raise
+
+    def parse_collection_plan_batches(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict[str, Any]:
+        self.database.initialize()
+        capped_max_batches = max(1, min(int(max_batches or 100), 500))
+        pending_before = self._collection_plan_parse_pending_count(plan_id)
+        summary: dict[str, Any] = {
+            "plan_id": plan_id,
+            "batches_run": 0,
+            "batch_ids": [],
+            "pending_before": pending_before,
+            "pending_after": pending_before,
+            "documents_seen": 0,
+            "documents_parsed": 0,
+            "documents_empty": 0,
+            "rows_seen": 0,
+            "rows_inserted": 0,
+            "approved": 0,
+            "rejected": 0,
+            "needs_review": 0,
+            "dlq": 0,
+        }
+        last_batch_id: int | None = None
+        previous_pending = pending_before
+        for _ in range(capped_max_batches):
+            if self._collection_plan_parse_pending_count(plan_id) <= 0:
+                break
+            result = self.parse_collection_plan_batch(plan_id=plan_id, batch_size=batch_size)
+            batch_summary = result.get("summary", {})
+            if int(batch_summary.get("documents_seen") or 0) <= 0:
+                break
+            last_batch_id = int(result["batch_id"])
+            summary["batches_run"] += 1
+            summary["batch_ids"].append(last_batch_id)
+            for key in [
+                "documents_seen",
+                "documents_parsed",
+                "documents_empty",
+                "rows_seen",
+                "rows_inserted",
+                "approved",
+                "rejected",
+                "needs_review",
+                "dlq",
+            ]:
+                summary[key] += int(batch_summary.get(key) or 0)
+            summary["pending_after"] = self._collection_plan_parse_pending_count(plan_id)
+            if summary["pending_after"] <= 0:
+                break
+            if summary["pending_after"] >= previous_pending:
+                break
+            previous_pending = summary["pending_after"]
+        return {
+            "batch_id": last_batch_id,
+            "plan_id": plan_id,
+            "status": "success",
+            "summary": summary,
+        }
+
+    def retry_collection_plan_parse_failures(
+        self,
+        plan_id: int,
+        batch_size: int | None = None,
+        max_batches: int = 100,
+    ) -> dict[str, Any]:
+        self.database.initialize()
+        with self.database.session() as conn:
+            failed_before = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM collection_plan_documents
+                    WHERE plan_id = ?
+                      AND status IN ('collected', 'duplicate')
+                      AND raw_document_id IS NOT NULL
+                      AND parse_status = 'failed'
+                    """,
+                    (plan_id,),
+                ).fetchone()["count"]
+                or 0
+            )
+            if failed_before <= 0:
+                pending = self._collection_plan_parse_pending_count(plan_id)
+                return {
+                    "batch_id": None,
+                    "plan_id": plan_id,
+                    "status": "success",
+                    "summary": {
+                        "plan_id": plan_id,
+                        "retried_parse_failed": 0,
+                        "batches_run": 0,
+                        "pending_before": pending,
+                        "pending_after": pending,
+                        "documents_seen": 0,
+                        "documents_parsed": 0,
+                        "documents_empty": 0,
+                        "rows_seen": 0,
+                        "rows_inserted": 0,
+                        "approved": 0,
+                        "rejected": 0,
+                        "needs_review": 0,
+                        "dlq": 0,
+                    },
+                }
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE raw_documents
+                SET parse_status = 'not_requested',
+                    parse_error_message = NULL
+                WHERE id IN (
+                  SELECT raw_document_id
+                  FROM collection_plan_documents
+                  WHERE plan_id = ?
+                    AND status IN ('collected', 'duplicate')
+                    AND raw_document_id IS NOT NULL
+                    AND parse_status = 'failed'
+                )
+                """,
+                (plan_id,),
+            )
+            conn.execute(
+                """
+                UPDATE collection_plan_documents
+                SET parse_status = 'not_requested',
+                    parse_error_message = NULL,
+                    updated_at = ?
+                WHERE plan_id = ?
+                  AND status IN ('collected', 'duplicate')
+                  AND raw_document_id IS NOT NULL
+                  AND parse_status = 'failed'
+                """,
+                (now, plan_id),
+            )
+        result = self.parse_collection_plan_batches(
+            plan_id=plan_id,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+        result["summary"]["retried_parse_failed"] = failed_before
+        return result
+
     def retry_collection_plan_failures(
         self,
         plan_id: int,
@@ -1313,6 +1659,21 @@ class DailyPipeline:
                 SELECT COUNT(*) AS count
                 FROM collection_plan_documents
                 WHERE plan_id = ? AND status = 'pending'
+                """,
+                (plan_id,),
+            ).fetchone()
+            return int(row["count"] or 0)
+
+    def _collection_plan_parse_pending_count(self, plan_id: int) -> int:
+        with self.database.session() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                  AND status IN ('collected', 'duplicate')
+                  AND raw_document_id IS NOT NULL
+                  AND parse_status = 'not_requested'
                 """,
                 (plan_id,),
             ).fetchone()
@@ -1674,25 +2035,28 @@ class DailyPipeline:
             raise RuntimeError(f"source registry not found: {self.adapter.source_key}")
         return source
 
-    def _existing_collected_document_id(
+    def _existing_document_for_target(
         self,
         conn: sqlite3.Connection,
         source: sqlite3.Row,
         target: CollectionTarget,
-    ) -> int | None:
-        row = conn.execute(
+    ) -> sqlite3.Row | None:
+        return conn.execute(
             """
-            SELECT id
-            FROM raw_documents
-            WHERE institution_id = ?
-              AND source_url = ?
-              AND status IN ('parsed', 'collected')
-            ORDER BY id DESC
+            SELECT
+              rd.id,
+              rd.parse_status,
+              COUNT(er.id) AS expense_count
+            FROM raw_documents rd
+            LEFT JOIN expense_records er ON er.raw_document_id = rd.id
+            WHERE rd.institution_id = ?
+              AND rd.source_url = ?
+            GROUP BY rd.id
+            ORDER BY rd.id DESC
             LIMIT 1
             """,
             (source["institution_id"], target.source_url),
         ).fetchone()
-        return int(row["id"]) if row else None
 
     def _upsert_document(
         self, conn: sqlite3.Connection, source: sqlite3.Row, document: SourceDocument
@@ -1711,8 +2075,8 @@ class DailyPipeline:
             """
             INSERT INTO raw_documents
               (institution_id, source_registry_id, source_url, source_title, published_at,
-               collected_at, content_hash, raw_content_path, status, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               collected_at, content_hash, raw_content_path, status, parse_status, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source["institution_id"],
@@ -1723,7 +2087,8 @@ class DailyPipeline:
                 utc_now(),
                 content_hash,
                 document.raw_content_path,
-                "parsed",
+                "collected",
+                "not_requested",
                 safe_json_dumps(
                     {
                         "adapter": self.adapter.source_key,
@@ -1734,6 +2099,88 @@ class DailyPipeline:
             ),
         )
         return int(cur.lastrowid), True
+
+    def _source_document_from_raw_row(self, row: sqlite3.Row) -> SourceDocument:
+        metadata = safe_json_loads(row["raw_metadata_json"], {})
+        attachments: list[SourceAttachment] = []
+        for item in metadata.get("attachments") or []:
+            if not isinstance(item, dict):
+                continue
+            attachments.append(
+                SourceAttachment(
+                    filename=str(item.get("filename") or ""),
+                    url=str(item.get("url") or ""),
+                    content_path=str(item.get("content_path") or ""),
+                    content_hash=str(item.get("content_hash") or ""),
+                    media_type=str(item.get("media_type") or ""),
+                )
+            )
+        return SourceDocument(
+            source_url=str(row["source_url"] or ""),
+            source_title=str(row["source_title"] or ""),
+            published_at=str(row["published_at"] or ""),
+            content=safe_json_dumps(
+                {
+                    "url": row["source_url"],
+                    "title": row["source_title"],
+                    "department": metadata.get("department_name") or "",
+                    "attachment_hashes": [attachment.content_hash for attachment in attachments],
+                }
+            ),
+            department_name=str(metadata.get("department_name") or ""),
+            raw_content_path=row["raw_content_path"],
+            attachments=tuple(attachments),
+        )
+
+    def _parse_error_status(self, exc: Exception) -> str:
+        message = str(exc).lower()
+        return "unsupported" if "unsupported" in message or isinstance(exc, UnsupportedDocumentError) else "failed"
+
+    def _mark_document_parsed(
+        self,
+        conn: sqlite3.Connection,
+        raw_document_id: int,
+        parse_status: str,
+        rows_seen: int,
+        rows_inserted: int,
+    ) -> None:
+        metadata_row = conn.execute(
+            "SELECT metadata_json FROM raw_documents WHERE id = ?", (raw_document_id,)
+        ).fetchone()
+        metadata = safe_json_loads(metadata_row["metadata_json"], {}) if metadata_row else {}
+        metadata["parse_summary"] = {
+            "rows_seen": rows_seen,
+            "rows_inserted": rows_inserted,
+        }
+        conn.execute(
+            """
+            UPDATE raw_documents
+            SET status = 'parsed',
+                parse_status = ?,
+                parsed_at = ?,
+                parse_error_message = NULL,
+                metadata_json = ?
+            WHERE id = ?
+            """,
+            (parse_status, utc_now(), safe_json_dumps(metadata), raw_document_id),
+        )
+
+    def _mark_document_parse_failed(
+        self,
+        conn: sqlite3.Connection,
+        raw_document_id: int,
+        parse_status: str,
+        error_message: str,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE raw_documents
+            SET parse_status = ?,
+                parse_error_message = ?
+            WHERE id = ?
+            """,
+            (parse_status, error_message, raw_document_id),
+        )
 
     def _normalize(self, raw_row: RawExpenseRow) -> NormalizedExpenseRow:
         return NormalizedExpenseRow(

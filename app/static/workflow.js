@@ -37,6 +37,17 @@ function documentStatusLabel(status) {
   }[status] || status || "미확인";
 }
 
+function parseStatusLabel(status) {
+  return {
+    not_requested: "파싱 대기",
+    parsing: "파싱 중",
+    parsed: "파싱 완료",
+    empty: "파싱 결과 없음",
+    failed: "파싱 실패",
+    unsupported: "지원 불가",
+  }[status] || status || "파싱 대기";
+}
+
 function candidateStatusMeta(item) {
   if (item.candidate_status === "verified") {
     return { label: "승인", className: "verified", percent: 100 };
@@ -54,7 +65,45 @@ function compactText(...values) {
   return values.filter((value) => String(value || "").trim()).join(" · ");
 }
 
+const WORKFLOW_LOCAL_LOG_KEY = "publicRestaurant.workflow.localLogs";
+
+function select(selector) {
+  return document.querySelector(selector);
+}
+
+function setText(selector, value) {
+  const node = select(selector);
+  if (node) node.textContent = value;
+}
+
+function on(selector, eventName, handler) {
+  const node = select(selector);
+  if (node) node.addEventListener(eventName, handler);
+}
+
+function loadStoredLocalLogs() {
+  try {
+    const raw = window.sessionStorage?.getItem(WORKFLOW_LOCAL_LOG_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredLocalLogs() {
+  try {
+    window.sessionStorage?.setItem(
+      WORKFLOW_LOCAL_LOG_KEY,
+      JSON.stringify(workflowState.localLogs.slice(0, 20))
+    );
+  } catch {
+    // Ignore storage failures; persisted server logs still render.
+  }
+}
+
 const workflowState = {
+  mode: document.querySelector("[data-workflow-mode]")?.dataset.workflowMode || "collection",
   documents: null,
   candidates: null,
   dashboard: null,
@@ -67,7 +116,7 @@ const workflowState = {
   candidateLimit: 25,
   selectedPriority: "",
   selectedInstitution: "",
-  localLogs: [],
+  localLogs: loadStoredLocalLogs(),
   verificationProgress: null,
   verificationProgressTimer: null,
   syncedPlanPeriod: false,
@@ -75,14 +124,14 @@ const workflowState = {
 
 function periodPayload() {
   return {
-    start_date: document.querySelector("#workflow-start-date").value,
-    end_date: document.querySelector("#workflow-end-date").value,
-    batch_size: Number(document.querySelector("#workflow-batch-size").value || 20),
+    start_date: select("#workflow-start-date")?.value || "",
+    end_date: select("#workflow-end-date")?.value || "",
+    batch_size: Number(select("#workflow-batch-size")?.value || 20),
   };
 }
 
 function verifyLimit() {
-  return Number(document.querySelector("#workflow-verify-limit").value || 100);
+  return Number(select("#workflow-verify-limit")?.value || 100);
 }
 
 function selectedInstitution() {
@@ -91,15 +140,18 @@ function selectedInstitution() {
 
 function documentQueryParams() {
   const period = periodPayload();
-  return new URLSearchParams({
+  const params = new URLSearchParams({
     start_date: period.start_date,
     end_date: period.end_date,
     institution: selectedInstitution(),
-    status: document.querySelector("#workflow-document-status").value,
+    status: select("#workflow-document-status")?.value || "",
+    parse_status: select("#workflow-parse-status")?.value || "",
     sort: "published_desc",
     limit: String(workflowState.documentLimit),
     offset: String(workflowState.documentOffset),
   });
+  if (workflowState.currentPlanId) params.set("plan_id", String(workflowState.currentPlanId));
+  return params;
 }
 
 function candidateQueryParams() {
@@ -108,9 +160,9 @@ function candidateQueryParams() {
     start_date: period.start_date,
     end_date: period.end_date,
     institution: selectedInstitution(),
-    status: document.querySelector("#workflow-candidate-status").value,
-    q: document.querySelector("#workflow-candidate-search").value.trim(),
-    sort: document.querySelector("#workflow-candidate-sort").value,
+    status: select("#workflow-candidate-status")?.value || "needs_review",
+    q: select("#workflow-candidate-search")?.value.trim() || "",
+    sort: select("#workflow-candidate-sort")?.value || "verification_oldest",
     limit: String(workflowState.candidateLimit),
     offset: String(workflowState.candidateOffset),
     needs_review_offset: "0",
@@ -134,7 +186,8 @@ function logsQueryParams() {
 }
 
 function showToast(message, isError = false) {
-  const toast = document.querySelector("#workflow-toast");
+  const toast = select("#workflow-toast");
+  if (!toast) return;
   toast.hidden = false;
   toast.className = `workflow-toast ${isError ? "error" : "success"}`;
   toast.textContent = message;
@@ -151,6 +204,7 @@ function appendLog(message, tone = "info") {
     time: new Date().toISOString(),
   });
   workflowState.localLogs = workflowState.localLogs.slice(0, 20);
+  saveStoredLocalLogs();
   renderLogPanel();
 }
 
@@ -163,11 +217,12 @@ function setStepStatus(step, status) {
 
 function candidateTotals() {
   const groups = workflowState.candidates?.groups || {};
-  const needsReview = Number(groups.needs_review?.total || 0);
+  const pending = Number(groups.needs_review?.pending_total || 0);
+  const manual = Number(groups.needs_review?.manual_total ?? groups.needs_review?.total ?? 0);
   return {
-    needs_review: needsReview,
-    pending: Number(groups.needs_review?.pending_total || 0),
-    manual: Number(groups.needs_review?.manual_total ?? needsReview),
+    needs_review: pending + manual,
+    pending,
+    manual,
     verified: Number(groups.verified?.total || 0),
     rejected: Number(groups.rejected?.total || 0),
   };
@@ -179,34 +234,58 @@ function updateStepsAndSummary() {
   const documentTotal = Number(summary.documents || 0);
   const collected = Number(summary.collected || 0);
   const failed = Number(summary.failed || 0);
+  const parsed = Number(summary.parsed || 0);
+  const parsePending = Number(summary.parse_pending || 0);
+  const parseFailed = Number(summary.parse_failed || 0);
+  const parseUnsupported = Number(summary.parse_unsupported || 0);
+  const parseEmpty = Number(summary.parse_empty || 0);
   const totals = candidateTotals();
   const candidateTotal = totals.needs_review + totals.verified + totals.rejected;
   const batchSize = Number(period.batch_size || 20);
   const verifyBatchSize = verifyLimit();
 
-  document.querySelector("#workflow-range-label").textContent = `${period.start_date} ~ ${period.end_date}`;
-  document.querySelector("#workflow-step-period").textContent = `${period.start_date} ~ ${period.end_date}`;
-  document.querySelector("#workflow-step-list").textContent = `문서 ${formatNumber(documentTotal)}건`;
-  document.querySelector("#workflow-step-collect-batch").textContent = `${formatNumber(batchSize)}건`;
-  document.querySelector("#workflow-step-collect").textContent =
-    failed ? `실패 ${formatNumber(failed)}건` : `수집 ${formatNumber(collected)}건`;
-  document.querySelector("#workflow-step-verify-batch").textContent =
-    `${formatNumber(verifyBatchSize)}건 · 대기 ${formatNumber(totals.pending)}`;
-  document.querySelector("#workflow-step-result").textContent =
-    `승인 ${formatNumber(totals.verified)} · 수동 ${formatNumber(totals.manual)} · 반려 ${formatNumber(totals.rejected)}`;
+  setText("#workflow-range-label", `${period.start_date} ~ ${period.end_date}`);
+  setText("#workflow-step-period", `${period.start_date} ~ ${period.end_date}`);
+  setText("#workflow-step-list", `문서 ${formatNumber(documentTotal)}건`);
+  setText("#workflow-step-collect-batch", `${formatNumber(batchSize)}건`);
+  setText(
+    "#workflow-step-collect",
+    failed ? `실패 ${formatNumber(failed)}건` : `수집 ${formatNumber(collected)}건`
+  );
+  setText(
+    "#workflow-step-parse",
+    parseFailed
+      ? `실패 ${formatNumber(parseFailed)}건`
+      : parseUnsupported
+      ? `지원 불가 ${formatNumber(parseUnsupported)}건`
+      : parsePending
+      ? `대기 ${formatNumber(parsePending)}건`
+      : parseEmpty
+      ? `빈 문서 ${formatNumber(parseEmpty)}건`
+      : `완료 ${formatNumber(parsed)}건`
+  );
+  setText("#workflow-step-verify-batch", `${formatNumber(verifyBatchSize)}건 · 대기 ${formatNumber(totals.pending)}`);
+  setText("#workflow-step-result", `승인 ${formatNumber(totals.verified)} · 수동 ${formatNumber(totals.manual)} · 반려 ${formatNumber(totals.rejected)}`);
 
-  document.querySelector("#workflow-document-total").textContent = formatNumber(documentTotal);
-  document.querySelector("#workflow-document-collected").textContent = formatNumber(collected);
-  document.querySelector("#workflow-document-failed").textContent = formatNumber(failed);
-  document.querySelector("#workflow-candidate-total").textContent = formatNumber(candidateTotal);
-  document.querySelector("#workflow-approved-total").textContent = formatNumber(totals.verified);
-  document.querySelector("#workflow-review-total").textContent = formatNumber(totals.manual);
-  document.querySelector("#workflow-rejected-total").textContent = formatNumber(totals.rejected);
+  setText("#workflow-document-total", formatNumber(documentTotal));
+  setText("#workflow-document-collected", formatNumber(collected));
+  setText("#workflow-document-failed", formatNumber(failed));
+  setText("#workflow-parse-pending", formatNumber(parsePending));
+  setText("#workflow-parse-success", formatNumber(parsed));
+  setText("#workflow-parse-failed", formatNumber(parseFailed));
+  setText("#workflow-candidate-total", formatNumber(candidateTotal));
+  setText("#workflow-approved-total", formatNumber(totals.verified));
+  setText("#workflow-review-total", formatNumber(totals.manual));
+  setText("#workflow-rejected-total", formatNumber(totals.rejected));
 
   setStepStatus("period", "done");
   setStepStatus("list", documentTotal ? "done" : "active");
   setStepStatus("collect-batch", documentTotal ? "active" : "");
   setStepStatus("collect", failed ? "warn" : collected ? "done" : documentTotal ? "active" : "");
+  setStepStatus(
+    "parse",
+    parseFailed || parseUnsupported ? "warn" : parsePending ? "active" : parsed || parseEmpty ? "done" : ""
+  );
   setStepStatus("verify-batch", totals.pending ? "active" : candidateTotal ? "done" : "");
   setStepStatus("result", totals.verified || totals.rejected || totals.manual ? "done" : "");
 }
@@ -214,6 +293,7 @@ function updateStepsAndSummary() {
 function renderScopeFilters() {
   const prioritySelect = document.querySelector("#workflow-priority");
   const institutionSelect = document.querySelector("#workflow-institution");
+  if (!prioritySelect || !institutionSelect) return;
   const priorities = workflowState.dashboard?.priorities || [];
   const previousPriority = workflowState.selectedPriority || prioritySelect.value || "";
   const previousInstitution = workflowState.selectedInstitution || institutionSelect.value || "";
@@ -254,6 +334,7 @@ function renderScopeFilters() {
 
 function renderDocumentRows() {
   const node = document.querySelector("#workflow-document-rows");
+  if (!node) return;
   const payload = workflowState.documents || {};
   const items = payload.items || [];
   if (!items.length) {
@@ -283,11 +364,11 @@ function renderDocumentRows() {
           <span class="workflow-progress ${statusClass}" aria-label="${escapeHtml(documentStatusLabel(item.status))} ${statusPercent}%">
             <i style="width:${statusPercent}%"></i>
           </span>
-          <small>검증 ${item.verification_completed || 0}/${item.candidate_count || 0}</small>
+          <small>${escapeHtml(parseStatusLabel(item.parse_status))}${item.parse_error_message ? ` · ${escapeHtml(shortText(item.parse_error_message, 42))}` : ""}</small>
         </td>
         <td>
           <span class="workflow-status-pill ${statusClass}">${escapeHtml(documentStatusLabel(item.status))}</span>
-          <small>행 ${formatNumber(item.rows_seen || 0)} · 시도 ${formatNumber(item.attempts || 0)}</small>
+          <small>행 ${formatNumber(item.rows_seen || 0)} · 수집 ${formatNumber(item.attempts || 0)} · 파싱 ${formatNumber(item.parse_attempts || 0)}</small>
         </td>
       </tr>
     `;
@@ -352,6 +433,7 @@ function progressStatusMeta(item, progress) {
 
 function renderCandidateRows() {
   const node = document.querySelector("#workflow-candidate-rows");
+  if (!node) return;
   const selected = workflowState.candidates?.selected || {};
   const items = selected.items || [];
   if (!items.length) {
@@ -424,6 +506,7 @@ function renderCandidatePagination() {
 
 function renderDbList() {
   const node = document.querySelector("#workflow-db-list");
+  if (!node) return;
   const group = workflowState.candidates?.groups?.[workflowState.activeStatus] || { items: [], total: 0 };
   const items = group.items || [];
   if (!items.length) {
@@ -476,16 +559,26 @@ function logToneFromStatus(status) {
 
 function batchLogMessage(batch) {
   const summary = batch.summary || {};
-  if (batch.job_type === "collection_plan_run") {
-    return `수집 배치 ${batch.status}: 대기 ${formatNumber(summary.pending_before)}→${formatNumber(summary.pending_after)} · 신규 행 ${formatNumber(summary.rows_inserted || 0)} · 실패 ${formatNumber(summary.dlq || 0)}`;
+  const jobType = batch.job_type || batch.job_name || "";
+  if (jobType === "collection_plan_batch" || jobType === "collection_plan_run") {
+    return `수집 배치 ${batch.status}: 대기 ${formatNumber(summary.pending_before)}→${formatNumber(summary.pending_after)} · 문서 ${formatNumber(summary.documents_seen || 0)} · 실패 ${formatNumber(summary.dlq || 0)}`;
   }
-  if (batch.job_type === "collection_plan_discover") {
+  if (jobType === "collection_plan_parse") {
+    const retried = Number(summary.retried_parse_failed || 0);
+    return [
+      `파싱 ${batch.status}: 문서 ${formatNumber(summary.documents_parsed || 0)}/${formatNumber(summary.documents_seen || 0)}`,
+      retried ? `재시도 ${formatNumber(retried)}` : "",
+      `신규 행 ${formatNumber(summary.rows_inserted || 0)}`,
+      `실패 ${formatNumber(summary.dlq || 0)}`,
+    ].filter(Boolean).join(" · ");
+  }
+  if (jobType === "collection_plan_discover") {
     return `목록 가져오기 ${batch.status}: 문서 ${formatNumber(summary.documents_inserted || 0)}/${formatNumber(summary.documents_seen || 0)} · 기존 ${formatNumber(summary.documents_skipped_collected || 0)} · 실패 ${formatNumber(summary.dlq || 0)}`;
   }
-  if (batch.job_type === "verify_collected_candidates") {
+  if (jobType === "verify_collected_candidates" || jobType === "verify_collected") {
     return `검증 ${batch.status}: 처리 ${formatNumber(summary.rows_processed || 0)} · 승인 ${formatNumber(summary.approved || 0)} · 수동 ${formatNumber(summary.needs_review || 0)} · 반려 ${formatNumber(summary.rejected || 0)}`;
   }
-  return `${batch.job_type || "작업"} ${batch.status || ""}`.trim();
+  return `${jobType || "작업"} ${batch.status || ""}`.trim();
 }
 
 function persistedLogEntries() {
@@ -505,6 +598,7 @@ function persistedLogEntries() {
 
 function renderLogPanel() {
   const node = document.querySelector("#workflow-log-list");
+  if (!node) return;
   const entries = [...workflowState.localLogs, ...persistedLogEntries()]
     .sort((a, b) => String(b.time || "").localeCompare(String(a.time || "")))
     .slice(0, 40);
@@ -544,7 +638,8 @@ function syncPeriodFromSelectedPlan(logs) {
   }
   if (plan.start_date) document.querySelector("#workflow-start-date").value = plan.start_date;
   if (plan.end_date) document.querySelector("#workflow-end-date").value = plan.end_date;
-  if (plan.batch_size) document.querySelector("#workflow-batch-size").value = Number(plan.batch_size);
+  const batchSize = document.querySelector("#workflow-batch-size");
+  if (plan.batch_size && batchSize) batchSize.value = Number(plan.batch_size);
   workflowState.syncedPlanPeriod = true;
 }
 
@@ -554,7 +649,6 @@ function renderAll() {
   renderDocumentPagination();
   renderCandidateRows();
   renderCandidatePagination();
-  renderDbList();
   renderLogPanel();
   updateStepsAndSummary();
 }
@@ -565,11 +659,17 @@ async function loadWorkflowData() {
   workflowState.currentPlanId = logs.selected_plan_id || workflowState.currentPlanId;
   syncPeriodFromSelectedPlan(logs);
 
+  const shouldLoadDocuments = Boolean(select("#workflow-document-rows"));
+  const shouldLoadCandidates = Boolean(select("#workflow-candidate-rows"));
   const [dashboard, documents, candidates, progress] = await Promise.all([
     fetchJson(`/ops/dashboard?${dashboardQueryParams().toString()}`),
-    fetchJson(`/admin/documents/data?${documentQueryParams().toString()}`),
-    fetchJson(`/admin/candidates?${candidateQueryParams().toString()}`),
-    fetchJson("/ops/verification-progress"),
+    shouldLoadDocuments
+      ? fetchJson(`/admin/documents/data?${documentQueryParams().toString()}`)
+      : Promise.resolve({ summary: {}, items: [], total: 0 }),
+    shouldLoadCandidates
+      ? fetchJson(`/admin/candidates?${candidateQueryParams().toString()}`)
+      : Promise.resolve({ groups: {}, selected: { items: [], total: 0 } }),
+    shouldLoadCandidates ? fetchJson("/ops/verification-progress") : Promise.resolve({ items: [] }),
   ]);
   workflowState.dashboard = dashboard;
   workflowState.documents = documents;
@@ -579,6 +679,7 @@ async function loadWorkflowData() {
 }
 
 async function refreshVerificationProgress() {
+  if (!select("#workflow-candidate-rows")) return { items: [] };
   const progress = await fetchJson("/ops/verification-progress");
   workflowState.verificationProgress = progress;
   renderCandidateRows();
@@ -607,12 +708,21 @@ function actionSummary(payload) {
   if (summary.rows_processed !== undefined) {
     return `처리 ${formatNumber(summary.rows_processed)} · 승인 ${formatNumber(summary.approved)} · 수동 ${formatNumber(summary.needs_review)} · 반려 ${formatNumber(summary.rejected)}`;
   }
+  if (summary.documents_parsed !== undefined) {
+    const retried = Number(summary.retried_parse_failed || 0);
+    return [
+      retried ? `재시도 ${formatNumber(retried)}` : "",
+      `파싱 ${formatNumber(summary.documents_parsed)}/${formatNumber(summary.documents_seen || 0)}`,
+      `빈 문서 ${formatNumber(summary.documents_empty || 0)}`,
+      `신규 행 ${formatNumber(summary.rows_inserted || 0)}`,
+      `실패 ${formatNumber(summary.dlq || 0)}`,
+    ].filter(Boolean).join(" · ");
+  }
   if (summary.documents_seen !== undefined) {
     const skipped = Number(summary.documents_skipped_collected || 0);
     return [
       `문서 ${formatNumber(summary.documents_inserted || 0)}/${formatNumber(summary.documents_seen || 0)}`,
       skipped ? `기존 ${formatNumber(skipped)}` : "",
-      `신규 행 ${formatNumber(summary.rows_inserted || 0)}`,
       `실패 ${formatNumber(summary.dlq || 0)}`,
     ].filter(Boolean).join(" · ");
   }
@@ -672,7 +782,14 @@ function resetPages() {
   workflowState.candidateOffset = 0;
 }
 
-document.querySelector("#workflow-fetch-list").addEventListener("click", (event) => {
+function applyWorkflowMode() {
+  const parseStatus = select("#workflow-parse-status");
+  if (parseStatus) {
+    parseStatus.hidden = workflowState.mode !== "parsing";
+  }
+}
+
+on("#workflow-fetch-list", "click", (event) => {
   runWorkflowAction(event.currentTarget, "목록 가져오기", async () => {
     const payload = await fetchJson("/ops/collection-plans", {
       method: "POST",
@@ -684,51 +801,77 @@ document.querySelector("#workflow-fetch-list").addEventListener("click", (event)
   });
 });
 
-document.querySelector("#workflow-run-collection").addEventListener("click", (event) => {
+on("#workflow-run-collection", "click", (event) => {
   runWorkflowAction(event.currentTarget, "수집", async () => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/run`, {
       method: "POST",
       body: JSON.stringify({
-        batch_size: Number(document.querySelector("#workflow-batch-size").value || 20),
+        batch_size: Number(select("#workflow-batch-size")?.value || 20),
         repeat: true,
         max_batches: 100,
       }),
     });
-  }, { scrollTo: "#workflow-verification" });
+  }, { scrollTo: ".workflow-log-panel" });
 });
 
-document.querySelector("#workflow-retry-collection").addEventListener("click", (event) => {
+on("#workflow-run-parse", "click", (event) => {
+  runWorkflowAction(event.currentTarget, "파싱", async () => {
+    const planId = await ensurePlanId();
+    return fetchJson(`/ops/collection-plans/${planId}/parse`, {
+      method: "POST",
+      body: JSON.stringify({
+        batch_size: Number(select("#workflow-batch-size")?.value || 20),
+        max_batches: 100,
+      }),
+    });
+  }, { scrollTo: ".workflow-log-panel" });
+});
+
+on("#workflow-retry-parse", "click", (event) => {
+  runWorkflowAction(event.currentTarget, "실패 재파싱", async () => {
+    const planId = await ensurePlanId();
+    return fetchJson(`/ops/collection-plans/${planId}/retry-parse-failed`, {
+      method: "POST",
+      body: JSON.stringify({
+        batch_size: Number(select("#workflow-batch-size")?.value || 20),
+        max_batches: 100,
+      }),
+    });
+  }, { scrollTo: ".workflow-log-panel" });
+});
+
+on("#workflow-retry-collection", "click", (event) => {
   runWorkflowAction(event.currentTarget, "재수집", async () => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/retry-failed`, {
       method: "POST",
       body: JSON.stringify({
-        batch_size: Number(document.querySelector("#workflow-batch-size").value || 20),
+        batch_size: Number(select("#workflow-batch-size")?.value || 20),
         max_batches: 100,
       }),
     });
-  }, { scrollTo: "#workflow-verification" });
+  }, { scrollTo: ".workflow-log-panel" });
 });
 
-document.querySelector("#workflow-run-verification").addEventListener("click", (event) => {
+on("#workflow-run-verification", "click", (event) => {
   runWorkflowAction(event.currentTarget, "검증 대기 검증", () => fetchJson("/ops/verify-collected", {
     method: "POST",
     body: JSON.stringify({
       limit: verifyLimit(),
-      sort: document.querySelector("#workflow-candidate-sort").value,
+      sort: select("#workflow-candidate-sort")?.value || "verification_oldest",
     }),
-  }), { scrollTo: ".workflow-db-panel", trackVerificationProgress: true });
+  }), { scrollTo: ".workflow-log-panel", trackVerificationProgress: true });
 });
 
-document.querySelector("#workflow-refresh").addEventListener("click", (event) => {
+on("#workflow-refresh", "click", (event) => {
   runWorkflowAction(event.currentTarget, "새로고침", async () => {
     await loadWorkflowData();
     return { status: "success" };
   });
 });
 
-document.querySelector("#workflow-priority").addEventListener("change", (event) => {
+on("#workflow-priority", "change", (event) => {
   workflowState.selectedPriority = event.currentTarget.value;
   workflowState.selectedInstitution = "";
   resetPages();
@@ -736,68 +879,63 @@ document.querySelector("#workflow-priority").addEventListener("change", (event) 
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-institution").addEventListener("change", (event) => {
+on("#workflow-institution", "change", (event) => {
   workflowState.selectedInstitution = event.currentTarget.value;
   resetPages();
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-city").addEventListener("change", () => {
+on("#workflow-city", "change", () => {
   resetPages();
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-document-status").addEventListener("change", () => {
+on("#workflow-document-status", "change", () => {
   workflowState.documentOffset = 0;
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-candidate-status").addEventListener("change", () => {
+on("#workflow-parse-status", "change", () => {
+  workflowState.documentOffset = 0;
+  loadWorkflowData().catch((error) => showToast(error.message, true));
+});
+
+on("#workflow-candidate-status", "change", () => {
   workflowState.candidateOffset = 0;
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-candidate-sort").addEventListener("change", () => {
+on("#workflow-candidate-sort", "change", () => {
   workflowState.candidateOffset = 0;
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-candidate-search-button").addEventListener("click", () => {
+on("#workflow-candidate-search-button", "click", () => {
   workflowState.candidateOffset = 0;
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelector("#workflow-candidate-search").addEventListener("keydown", (event) => {
+on("#workflow-candidate-search", "keydown", (event) => {
   if (event.key === "Enter") {
     workflowState.candidateOffset = 0;
     loadWorkflowData().catch((error) => showToast(error.message, true));
   }
 });
 
-document.querySelector("#workflow-batch-size").addEventListener("input", updateStepsAndSummary);
-document.querySelector("#workflow-verify-limit").addEventListener("input", updateStepsAndSummary);
-document.querySelector("#workflow-start-date").addEventListener("change", () => {
+on("#workflow-batch-size", "input", updateStepsAndSummary);
+on("#workflow-verify-limit", "input", updateStepsAndSummary);
+on("#workflow-start-date", "change", () => {
   workflowState.currentPlanId = null;
   resetPages();
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
-document.querySelector("#workflow-end-date").addEventListener("change", () => {
+on("#workflow-end-date", "change", () => {
   workflowState.currentPlanId = null;
   resetPages();
   loadWorkflowData().catch((error) => showToast(error.message, true));
 });
 
-document.querySelectorAll("#workflow-status-tabs button").forEach((button) => {
-  button.addEventListener("click", () => {
-    workflowState.activeStatus = button.dataset.status;
-    document.querySelector("#workflow-status-tabs").dataset.active = workflowState.activeStatus;
-    document.querySelectorAll("#workflow-status-tabs button").forEach((item) => {
-      item.classList.toggle("active", item === button);
-    });
-    renderDbList();
-  });
-});
-
+applyWorkflowMode();
 loadWorkflowData().catch((error) => {
   appendLog(`초기 조회 실패: ${error.message}`, "error");
   showToast(error.message, true);
