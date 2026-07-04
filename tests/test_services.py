@@ -116,6 +116,11 @@ class ServiceTests(unittest.TestCase):
         ranking = self.service.rankings()
         search = self.service.search("광안리")
         region_search = self.service.search("수영구")
+        bounded_region_search = self.service.list_map_restaurants(
+            q="부산광역시 수영구",
+            search_mode="address",
+            bounds="35.145,129.108,35.162,129.13",
+        )
         city_search = self.service.list_map_restaurants(q="부산광역시")
         default_seoul_search = self.service.list_map_restaurants(q="서울")
         outside_city_search = self.service.list_map_restaurants(q="서울", search_mode="address")
@@ -126,6 +131,7 @@ class ServiceTests(unittest.TestCase):
         self.assertGreaterEqual(ranking[0]["visit_count"], ranking[-1]["visit_count"])
         self.assertEqual(search[0]["name"], "광안리커피")
         self.assertEqual(region_search[0]["name"], "광안리커피")
+        self.assertEqual([restaurant["name"] for restaurant in bounded_region_search], ["광안리커피"])
         self.assertNotIn("서울테스트식당", [restaurant["name"] for restaurant in city_search])
         self.assertIn("서울이름부산식당", [restaurant["name"] for restaurant in default_seoul_search])
         self.assertEqual([restaurant["name"] for restaurant in outside_city_search], ["서울테스트식당"])
@@ -134,6 +140,51 @@ class ServiceTests(unittest.TestCase):
             self.assertIsNotNone(restaurant["longitude"])
             self.assertTrue(restaurant["naver_map_query"])
             self.assertTrue(restaurant["naver_map_url"].startswith("https://map.naver.com/p/search/"))
+
+    def test_map_region_search_excludes_name_only_matches(self) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO restaurants
+                  (region_id, canonical_name, normalized_name, major_category, address,
+                   road_address, normalized_address, longitude, latitude,
+                   verification_status, map_exposure_status)
+                VALUES (1, '기장꼼장어', '기장꼼장어', 'restaurant',
+                        '부산광역시 연제구 중앙대로 1001', '부산광역시 연제구 중앙대로 1001',
+                        '부산광역시 연제구 중앙대로 1001', 129.0756416, 35.1795543,
+                        'success', 'visible')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO restaurants
+                  (region_id, canonical_name, normalized_name, major_category, address,
+                   road_address, normalized_address, longitude, latitude,
+                   verification_status, map_exposure_status)
+                VALUES (1, '기장바다식당', '기장바다식당', 'restaurant',
+                        '부산광역시 기장군 기장읍 기장해안로 100',
+                        '부산광역시 기장군 기장읍 기장해안로 100',
+                        '부산광역시 기장군 기장읍 기장해안로 100', 129.222312, 35.244498,
+                        'success', 'visible')
+                """
+            )
+
+        default_search_names = [
+            restaurant["name"] for restaurant in self.service.list_map_restaurants(q="기장")
+        ]
+        region_search_names = [
+            restaurant["name"]
+            for restaurant in self.service.list_map_restaurants(
+                q="부산광역시 기장군",
+                search_mode="address",
+                bounds="35.14,129.11,35.39,129.35",
+            )
+        ]
+
+        self.assertIn("기장꼼장어", default_search_names)
+        self.assertIn("기장바다식당", default_search_names)
+        self.assertNotIn("기장꼼장어", region_search_names)
+        self.assertEqual(region_search_names, ["기장바다식당"])
 
     def test_map_restaurants_filters_by_ten_unit_visit_count(self) -> None:
         with self.db.session() as conn:

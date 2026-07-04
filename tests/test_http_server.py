@@ -46,7 +46,7 @@ class HttpServerTests(unittest.TestCase):
 
     def test_public_admin_and_ops_api(self) -> None:
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
-        self.assertIn("공공 맛집 지도", index)
+        self.assertIn("공기밥", index)
         self.assertIn("filter-index", index)
         self.assertIn("visit-filter-toggle", index)
         self.assertIn("visit-filter-label", index)

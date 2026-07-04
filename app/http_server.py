@@ -252,7 +252,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 path = parsed.path
                 query = self._query(parsed.query)
                 if path == "/":
-                    self._html(public_index(app.settings.naver_map_key))
+                    self._html(public_index(app.settings.naver_map_key, app.settings.app_name))
                 elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
                 elif path == "/admin/collection":

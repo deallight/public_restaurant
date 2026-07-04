@@ -35,6 +35,134 @@ const regionSearches = [
     viewport: { minLat: 35.04, maxLat: 35.32, minLng: 128.82, maxLng: 129.31 },
   },
   {
+    aliases: ["중구"],
+    query: "부산광역시 중구",
+    center: { latitude: 35.106214, longitude: 129.032352 },
+    zoom: 14,
+    viewport: { minLat: 35.085, maxLat: 35.115, minLng: 129.02, maxLng: 129.05 },
+    useBounds: true,
+  },
+  {
+    aliases: ["서구"],
+    query: "부산광역시 서구",
+    center: { latitude: 35.097955, longitude: 129.024356 },
+    zoom: 13,
+    viewport: { minLat: 35.06, maxLat: 35.13, minLng: 128.98, maxLng: 129.04 },
+    useBounds: true,
+  },
+  {
+    aliases: ["동구"],
+    query: "부산광역시 동구",
+    center: { latitude: 35.129274, longitude: 129.045325 },
+    zoom: 13,
+    viewport: { minLat: 35.1, maxLat: 35.15, minLng: 129.025, maxLng: 129.07 },
+    useBounds: true,
+  },
+  {
+    aliases: ["영도", "영도구"],
+    query: "부산광역시 영도구",
+    center: { latitude: 35.091212, longitude: 129.067875 },
+    zoom: 13,
+    viewport: { minLat: 35.05, maxLat: 35.105, minLng: 129.02, maxLng: 129.09 },
+    useBounds: true,
+  },
+  {
+    aliases: ["부산진", "부산진구"],
+    query: "부산광역시 부산진구",
+    center: { latitude: 35.163087, longitude: 129.053174 },
+    zoom: 13,
+    viewport: { minLat: 35.135, maxLat: 35.19, minLng: 129.03, maxLng: 129.08 },
+    useBounds: true,
+  },
+  {
+    aliases: ["남구"],
+    query: "부산광역시 남구",
+    center: { latitude: 35.136578, longitude: 129.084163 },
+    zoom: 13,
+    viewport: { minLat: 35.095, maxLat: 35.155, minLng: 129.055, maxLng: 129.13 },
+    useBounds: true,
+  },
+  {
+    aliases: ["북구"],
+    query: "부산광역시 북구",
+    center: { latitude: 35.197185, longitude: 128.990438 },
+    zoom: 12,
+    viewport: { minLat: 35.18, maxLat: 35.27, minLng: 128.98, maxLng: 129.07 },
+    useBounds: true,
+  },
+  {
+    aliases: ["사하", "사하구"],
+    query: "부산광역시 사하구",
+    center: { latitude: 35.104585, longitude: 128.974817 },
+    zoom: 12,
+    viewport: { minLat: 35.05, maxLat: 35.13, minLng: 128.94, maxLng: 129.03 },
+    useBounds: true,
+  },
+  {
+    aliases: ["금정", "금정구"],
+    query: "부산광역시 금정구",
+    center: { latitude: 35.242992, longitude: 129.092074 },
+    zoom: 12,
+    viewport: { minLat: 35.2, maxLat: 35.31, minLng: 129.03, maxLng: 129.12 },
+    useBounds: true,
+  },
+  {
+    aliases: ["강서", "강서구"],
+    query: "부산광역시 강서구",
+    center: { latitude: 35.212217, longitude: 128.980387 },
+    zoom: 12,
+    viewport: { minLat: 35.05, maxLat: 35.24, minLng: 128.8, maxLng: 128.99 },
+    useBounds: true,
+  },
+  {
+    aliases: ["연제", "연제구"],
+    query: "부산광역시 연제구",
+    center: { latitude: 35.176193, longitude: 129.079915 },
+    zoom: 13,
+    viewport: { minLat: 35.165, maxLat: 35.205, minLng: 129.055, maxLng: 129.105 },
+    useBounds: true,
+  },
+  {
+    aliases: ["수영", "수영구"],
+    query: "부산광역시 수영구",
+    center: { latitude: 35.145703, longitude: 129.113222 },
+    zoom: 13,
+    viewport: { minLat: 35.13, maxLat: 35.18, minLng: 129.09, maxLng: 129.14 },
+    useBounds: true,
+  },
+  {
+    aliases: ["사상", "사상구"],
+    query: "부산광역시 사상구",
+    center: { latitude: 35.152624, longitude: 128.991248 },
+    zoom: 13,
+    viewport: { minLat: 35.12, maxLat: 35.19, minLng: 128.95, maxLng: 129.03 },
+    useBounds: true,
+  },
+  {
+    aliases: ["기장", "기장군"],
+    query: "부산광역시 기장군",
+    center: { latitude: 35.244498, longitude: 129.222312 },
+    zoom: 12,
+    viewport: { minLat: 35.14, maxLat: 35.39, minLng: 129.11, maxLng: 129.35 },
+    useBounds: true,
+  },
+  {
+    aliases: ["정관", "정관읍"],
+    query: "부산광역시 기장군 정관읍",
+    center: { latitude: 35.321865, longitude: 129.17669 },
+    zoom: 14,
+    viewport: { minLat: 35.295, maxLat: 35.34, minLng: 129.15, maxLng: 129.205 },
+    useBounds: true,
+  },
+  {
+    aliases: ["일광", "일광읍"],
+    query: "부산광역시 기장군 일광읍",
+    center: { latitude: 35.264365, longitude: 129.233195 },
+    zoom: 14,
+    viewport: { minLat: 35.24, maxLat: 35.29, minLng: 129.2, maxLng: 129.27 },
+    useBounds: true,
+  },
+  {
     aliases: ["대전", "대전시", "대전광역시"],
     query: "대전",
     center: { latitude: 36.3504119, longitude: 127.3845475 },
@@ -82,6 +210,86 @@ const regionSearches = [
     center: { latitude: 36.4801322, longitude: 127.2890215 },
     zoom: 11,
     viewport: { minLat: 36.38, maxLat: 36.62, minLng: 127.16, maxLng: 127.43 },
+  },
+  {
+    aliases: ["해운대", "해운대구"],
+    query: "부산광역시 해운대구",
+    center: { latitude: 35.163132, longitude: 129.163543 },
+    zoom: 13,
+    viewport: { minLat: 35.145, maxLat: 35.185, minLng: 129.135, maxLng: 129.19 },
+    useBounds: true,
+  },
+  {
+    aliases: ["서면"],
+    query: "부산광역시 부산진구",
+    center: { latitude: 35.157662, longitude: 129.05903 },
+    zoom: 15,
+    viewport: { minLat: 35.145, maxLat: 35.171, minLng: 129.043, maxLng: 129.075 },
+    useBounds: true,
+  },
+  {
+    aliases: ["전포", "전포동", "전포카페거리"],
+    query: "부산광역시 부산진구",
+    center: { latitude: 35.15433, longitude: 129.06372 },
+    zoom: 15,
+    viewport: { minLat: 35.145, maxLat: 35.164, minLng: 129.055, maxLng: 129.074 },
+    useBounds: true,
+  },
+  {
+    aliases: ["광안리"],
+    query: "부산광역시 수영구",
+    center: { latitude: 35.15317, longitude: 129.11867 },
+    zoom: 15,
+    viewport: { minLat: 35.145, maxLat: 35.162, minLng: 129.108, maxLng: 129.13 },
+    useBounds: true,
+  },
+  {
+    aliases: ["센텀", "센텀시티"],
+    query: "부산광역시 해운대구",
+    center: { latitude: 35.16887, longitude: 129.13134 },
+    zoom: 15,
+    viewport: { minLat: 35.158, maxLat: 35.178, minLng: 129.118, maxLng: 129.144 },
+    useBounds: true,
+  },
+  {
+    aliases: ["부산대", "부산대학교", "부대앞"],
+    query: "부산광역시 금정구",
+    center: { latitude: 35.23121, longitude: 129.08449 },
+    zoom: 15,
+    viewport: { minLat: 35.221, maxLat: 35.24, minLng: 129.073, maxLng: 129.096 },
+    useBounds: true,
+  },
+  {
+    aliases: ["경성대", "부경대", "경성대부경대"],
+    query: "부산광역시 남구",
+    center: { latitude: 35.13754, longitude: 129.10053 },
+    zoom: 15,
+    viewport: { minLat: 35.128, maxLat: 35.147, minLng: 129.089, maxLng: 129.112 },
+    useBounds: true,
+  },
+  {
+    aliases: ["남포", "남포동", "자갈치"],
+    query: "부산광역시 중구",
+    center: { latitude: 35.09796, longitude: 129.03473 },
+    zoom: 15,
+    viewport: { minLat: 35.088, maxLat: 35.108, minLng: 129.023, maxLng: 129.046 },
+    useBounds: true,
+  },
+  {
+    aliases: ["동래", "동래구"],
+    query: "부산광역시 동래구",
+    center: { latitude: 35.20554, longitude: 129.08367 },
+    zoom: 14,
+    viewport: { minLat: 35.186, maxLat: 35.224, minLng: 129.062, maxLng: 129.105 },
+    useBounds: true,
+  },
+  {
+    aliases: ["연산", "연산동"],
+    query: "부산광역시 연제구",
+    center: { latitude: 35.18605, longitude: 129.08124 },
+    zoom: 15,
+    viewport: { minLat: 35.174, maxLat: 35.198, minLng: 129.066, maxLng: 129.096 },
+    useBounds: true,
   },
 ];
 
@@ -143,7 +351,10 @@ async function loadRestaurants(options = {}) {
   if (regionFocus) {
     params.set("q", regionFocus.query);
     params.set("search_mode", "address");
-  } else if (isRegionLikeQuery(q)) {
+    if (regionFocus.useBounds && regionFocus.viewport) {
+      params.set("bounds", viewportBounds(regionFocus.viewport));
+    }
+  } else if (isAddressLikeQuery(q)) {
     params.set("q", q);
     params.set("search_mode", "address");
   } else if (q) {
@@ -176,9 +387,22 @@ function regionSearchFor(value) {
   return regionSearches.find((region) => region.aliases.some((alias) => compactSearchText(alias) === query)) || null;
 }
 
-function isRegionLikeQuery(value) {
-  const query = compactSearchText(value);
-  return /(특별시|광역시|특별자치시|특별자치도|도|시|군|구|읍|면|동)$/.test(query);
+function viewportBounds(viewport) {
+  return [viewport.minLat, viewport.minLng, viewport.maxLat, viewport.maxLng].join(",");
+}
+
+function isAddressLikeQuery(value) {
+  const query = String(value || "").replace(/\s+/g, " ").trim();
+  const compact = compactSearchText(query);
+  if (!compact) return false;
+  return (
+    /(특별시|광역시|특별자치시|특별자치도|도|시|군|구|읍|면|동|리)$/.test(compact)
+    || /(특별시|광역시|특별자치시|특별자치도)/.test(compact)
+    || /[가-힣0-9]+(?:시|군|구|읍|면|동|리)\s+[가-힣0-9]/.test(query)
+    || /[가-힣0-9]+(?:대로|로|길)\s*\d/.test(query)
+    || /(?:^|\s)(?:산\s*)?\d{1,5}(?:-\d{1,5})?(?:\s|$)/.test(query)
+    || /^\d{5}$/.test(compact)
+  );
 }
 
 function updateFilterIndex() {
@@ -284,35 +508,31 @@ function naverPosition(restaurant) {
   return new naver.maps.LatLng(position.latitude, position.longitude);
 }
 
-function focusNaverMapOnRestaurant(restaurant, zoom = 16) {
-  if (!state.map) return;
-  const position = naverPosition(restaurant);
-  if (!position) return;
+function focusNaverMapOnPoint(position, zoom, options = {}) {
+  if (!state.map || !position) return;
   const currentZoom = typeof state.map.getZoom === "function" ? state.map.getZoom() : 0;
-  const targetZoom = currentZoom && currentZoom > zoom ? currentZoom : zoom;
+  const targetZoom = options.keepCloserZoom && currentZoom && currentZoom > zoom ? currentZoom : zoom;
   if (typeof state.map.morph === "function") {
     state.map.morph(position, targetZoom);
     return;
   }
   state.map.setCenter(position);
-  if (typeof state.map.setZoom === "function") {
-    if (!currentZoom || currentZoom < targetZoom) {
-      state.map.setZoom(targetZoom, true);
-    }
+  if (typeof state.map.setZoom === "function" && currentZoom !== targetZoom) {
+    state.map.setZoom(targetZoom, true);
   }
+}
+
+function focusNaverMapOnRestaurant(restaurant, zoom = 16) {
+  if (!state.map) return;
+  const position = naverPosition(restaurant);
+  if (!position) return;
+  focusNaverMapOnPoint(position, zoom, { keepCloserZoom: true });
 }
 
 function focusNaverMapOnRegion(region) {
   if (!state.map || !window.naver?.maps) return;
   const center = new naver.maps.LatLng(region.center.latitude, region.center.longitude);
-  if (typeof state.map.panTo === "function") {
-    state.map.panTo(center);
-  } else {
-    state.map.setCenter(center);
-  }
-  if (typeof state.map.setZoom === "function") {
-    state.map.setZoom(region.zoom, true);
-  }
+  focusNaverMapOnPoint(center, region.zoom);
 }
 
 function focusNaverMapOnRestaurants(restaurants) {

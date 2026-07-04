@@ -56,7 +56,7 @@ class Settings:
     google_client_secret: str = ""
     google_redirect_uri: str = ""
     data_go_kr_service_key: str = ""
-    app_name: str = "공공 맛집 지도"
+    app_name: str = "공기밥"
     review_rate_limit_per_hour: int = 3
 
 

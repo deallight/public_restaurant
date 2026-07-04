@@ -4,8 +4,9 @@ import html
 from datetime import date
 
 
-def public_index(naver_map_key: str) -> str:
+def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
     escaped_key = html.escape(naver_map_key)
+    escaped_app_name = html.escape(app_name)
     category_filters = [
         ("", "전체"),
         ("restaurant", "음식점"),
@@ -28,7 +29,7 @@ def public_index(naver_map_key: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>공공 맛집 지도</title>
+  <title>{escaped_app_name}</title>
   <link rel="stylesheet" href="/static/styles.css">
   <script>
     window.NAVER_MAP_KEY = "{escaped_key}";
@@ -39,7 +40,7 @@ def public_index(naver_map_key: str) -> str:
     <section class="map-stage">
       <div class="map-controls">
         <div class="topbar">
-          <div class="brand">공공 맛집 지도</div>
+          <div class="brand">{escaped_app_name}</div>
           <form id="search-form" class="searchbar">
             <input id="q" name="q" type="search" placeholder="상호, 주소, 지역 검색" autocomplete="off">
             <button type="submit">검색</button>
