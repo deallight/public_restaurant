@@ -67,6 +67,15 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires a PostgreSQL"):
                 load_settings()
 
+    def test_postgres_runtime_prepare_never_initializes_schema(self) -> None:
+        database = Database("postgresql://restaurant_app@127.0.0.1/example_test")
+        with patch.object(database, "verify_schema") as verify_schema, patch.object(
+            database, "_initialize_postgres"
+        ) as initialize_postgres:
+            database.prepare()
+        verify_schema.assert_called_once_with()
+        initialize_postgres.assert_not_called()
+
     def test_migration_rejects_default_live_sqlite_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "var" / "public_restaurant.db"

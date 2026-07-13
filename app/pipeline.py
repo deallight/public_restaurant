@@ -813,7 +813,7 @@ class DailyPipeline:
         summary["permit_advisory_checked"] = summary.get("permit_advisory_checked", 0) + 1
 
     def run(self) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         with self.database.session() as conn:
             batch_id = self._create_batch(conn)
             summary = {
@@ -932,7 +932,7 @@ class DailyPipeline:
         max_documents: int = COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
         batch_size: int = 20,
     ) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         if not hasattr(self.adapter, "discover_targets"):
             raise RuntimeError("adapter does not support collection planning")
         self.adapter.max_pages = max(1, min(int(max_pages or COLLECTION_SCAN_SAFETY_MAX_PAGES), COLLECTION_SCAN_SAFETY_MAX_PAGES))  # type: ignore[attr-defined]
@@ -1044,7 +1044,7 @@ class DailyPipeline:
                 raise
 
     def run_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         with self.database.session() as conn:
             plan = conn.execute("SELECT * FROM collection_plans WHERE id = ?", (plan_id,)).fetchone()
             if plan is None:
@@ -1201,7 +1201,7 @@ class DailyPipeline:
         batch_size: int | None = None,
         max_batches: int = 100,
     ) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         capped_max_batches = max(1, min(int(max_batches or 100), 500))
         pending_before = self._collection_plan_pending_count(plan_id)
         summary: dict[str, Any] = {
@@ -1254,7 +1254,7 @@ class DailyPipeline:
         }
 
     def parse_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         with self.database.session() as conn:
             plan = conn.execute("SELECT * FROM collection_plans WHERE id = ?", (plan_id,)).fetchone()
             if plan is None:
@@ -1447,7 +1447,7 @@ class DailyPipeline:
         batch_size: int | None = None,
         max_batches: int = 100,
     ) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         capped_max_batches = max(1, min(int(max_batches or 100), 500))
         pending_before = self._collection_plan_parse_pending_count(plan_id)
         summary: dict[str, Any] = {
@@ -1509,7 +1509,7 @@ class DailyPipeline:
         batch_size: int | None = None,
         max_batches: int = 100,
     ) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         with self.database.session() as conn:
             failed_before = int(
                 conn.execute(
@@ -1592,7 +1592,7 @@ class DailyPipeline:
         batch_size: int | None = None,
         max_batches: int = 100,
     ) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         with self.database.session() as conn:
             failed_before = int(
                 conn.execute(
@@ -1705,7 +1705,7 @@ class DailyPipeline:
         }.get(str(sort or "verification_oldest"), fallback)
 
     def _verify_pending(self, limit: int, job_name: str, initial_only: bool, sort: str) -> dict[str, Any]:
-        self.database.initialize()
+        self.database.prepare()
         capped_limit = max(1, min(limit, 500))
         with self.database.session() as conn:
             batch_id = self._create_batch(conn, job_name)

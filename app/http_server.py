@@ -45,10 +45,7 @@ class PublicRestaurantApplication:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.database = Database(settings.database_url or settings.db_path)
-        if self.database.backend == "sqlite":
-            self.database.initialize()
-        else:
-            self.database.verify_schema()
+        self.database.prepare()
         geocoding_client = None
         if settings.naver_maps_client_id and settings.naver_maps_client_secret:
             geocoding_client = NaverMapsGeocodingClient(

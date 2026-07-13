@@ -87,6 +87,13 @@ class Database:
             self._migrate_schema(conn)
             self.seed_core(conn)
 
+    def prepare(self) -> None:
+        """Prepare a runtime connection without applying PostgreSQL DDL."""
+        if self.backend == "postgresql":
+            self.verify_schema()
+        else:
+            self.initialize()
+
     def schema_issues(self, require_migration: bool = True) -> list[str]:
         if self.backend == "sqlite":
             return []
