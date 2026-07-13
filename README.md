@@ -2,7 +2,7 @@
 
 부산 지역 공공기관의 업무추진비 공개 문서를 수집해, 실제 음식점 방문 내역을 검증하고 지도·검색·랭킹으로 보여주는 서비스 MVP입니다. 흩어진 문서형 공공데이터를 바로 지도에 올리지 않고 `수집 -> 파싱 -> 후보 추출 -> 검증 -> 수동검토 -> 공개` 흐름으로 처리해 데이터 신뢰도를 높이는 데 초점을 둡니다.
 
-현재 저장소는 Python 표준 라이브러리 기반 웹앱, SQLite 개발 DB, PostgreSQL 운영 백엔드를 포함합니다. `DATABASE_URL`로 백엔드를 선택하며 `APP_ENV=production`에서는 PostgreSQL만 허용합니다.
+현재 저장소는 Python 표준 라이브러리 기반 웹앱과 PostgreSQL 기본 개발·운영 백엔드를 포함합니다. `DATABASE_URL`로 백엔드를 선택하며 `APP_ENV=production`에서는 PostgreSQL만 허용합니다. SQLite는 기존 데이터 이관, 롤백, 호환성 회귀 테스트를 위해 유지합니다.
 
 ## 현재 구현 범위
 
@@ -20,8 +20,8 @@
 이 프로젝트는 프레임워크보다 데이터 흐름 검증에 집중한 MVP입니다.
 
 - 웹 서버: Python 표준 라이브러리 `http.server`의 `ThreadingHTTPServer`
-- 로컬 DB: SQLite, 기본 경로 `var/public_restaurant.db`
-- 운영 DB: PostgreSQL 16 이상, `psycopg` 3 기반 공통 연결 어댑터
+- 기본 개발·운영 DB: PostgreSQL 16 이상, `psycopg` 3 기반 공통 연결 어댑터
+- SQLite: 기존 DB 이관, 롤백, 호환성 회귀 테스트용. `DATABASE_URL`이 없을 때만 `APP_DB_PATH`를 사용
 - 프론트엔드: 서버 렌더링 HTML 문자열과 정적 JavaScript/CSS
 - 지도: `NAVER_MAP_KEY` 또는 `NAVER_MAPS_CLIENT_ID`가 있으면 네이버 지도 JS API 사용, 없으면 로컬 fallback 지도 사용
 - 외부 연동: Naver Search Local, NCP Maps Geocoding, Naver Login, Google OAuth, 공공데이터포털 인허가 API
@@ -39,24 +39,45 @@
 - `app/source_catalog.py`: 현재/예정 수집 대상 기관 카탈로그
 - `database/`: PostgreSQL 차이 분석, 마이그레이션, 이관·롤백 runbook과 기존 설계 후보 SQL
 
-## 빠른 실행
+## 빠른 실행: Mac PostgreSQL 개발 환경
 
-Python 3.10 이상을 권장합니다. SQLite 개발은 별도 패키지가 필요 없고 PostgreSQL은 고정된 드라이버를 설치합니다.
+Python 3.10 이상과 PostgreSQL 16 이상을 권장합니다. 기본 개발 DB는 Mac 로컬의 `public_restaurant_dev` PostgreSQL입니다. 정상 앱 시작은 DDL을 자동 실행하지 않습니다.
 
-```bash
-python3 -m scripts.init_db
-python3 -m scripts.run_daily
-python3 -m app.server --host 127.0.0.1 --port 8000
-```
-
-PostgreSQL 테스트/운영 환경은 다음과 같이 준비합니다. 정상 앱 시작은 DDL을 자동 실행하지 않습니다.
+최초 한 번, 프로젝트 가상환경과 PostgreSQL 드라이버를 준비합니다.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-export DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_test'
-python3 -m scripts.render_postgres_schema > /tmp/public_restaurant-0001.sql
-python3 -m scripts.init_db --apply
+```
+
+Mac 로컬 클러스터는 `/Users/deallight/develop/server_pc/.postgres`에 두고, 개발 DB는 `public_restaurant_dev`를 사용합니다. `.env`에는 아래 설정을 둡니다. `.env`는 Git에 포함하지 않습니다.
+
+```text
+APP_ENV=development
+DATABASE_URL=postgresql:///public_restaurant_dev?host=/Users/deallight/develop/server_pc/.postgres/socket
+```
+
+새 개발 DB에 스키마를 적용할 때만 명시적으로 실행합니다.
+
+```bash
+.venv/bin/python -m scripts.init_db --apply
+.venv/bin/python -m scripts.check_db_schema
+```
+
+평소 개발 서버 실행은 다음 명령을 사용합니다.
+
+```bash
+.venv/bin/python -m app.server --host 127.0.0.1 --port 8000
+```
+
+`source .venv/bin/activate`로 가상환경을 활성화했다면 마지막 명령은 `python3 -m app.server --host 127.0.0.1 --port 8000`으로 실행해도 됩니다.
+
+Mac을 재시작한 뒤 PostgreSQL이 실행 중이지 않다면 다음으로 개발 클러스터를 시작합니다.
+
+```bash
+pg_ctl -D /Users/deallight/develop/server_pc/.postgres/data \
+  -o "-p 5432 -k /Users/deallight/develop/server_pc/.postgres/socket -h 127.0.0.1" \
+  -l /Users/deallight/develop/server_pc/.postgres/postgres.log start
 ```
 
 브라우저에서 다음 주소를 엽니다.
@@ -84,8 +105,8 @@ curl http://127.0.0.1:8000/api/map/restaurants
 | --- | --- |
 | `APP_HOST`, `APP_PORT` | 서버 바인딩 주소와 포트 |
 | `APP_ENV` | `development` 또는 `production`; production은 PostgreSQL을 강제 |
-| `DATABASE_URL` | `postgresql://...` 운영/통합 DB URL. 비밀번호는 secret 환경으로만 주입 |
-| `APP_DB_PATH` | SQLite DB 경로 |
+| `DATABASE_URL` | 기본 개발·운영 DB URL. Mac 개발은 Unix socket URL을, N150 운영은 secret 환경의 `postgresql://...` URL을 사용 |
+| `APP_DB_PATH` | `DATABASE_URL`이 없을 때만 쓰는 SQLite 호환성·롤백 DB 경로 |
 | `NAVER_MAP_KEY` | 네이버 지도 JS API Client ID. `NAVER_MAPS_CLIENT_ID`로도 대체 가능 |
 | `NAVER_MAPS_CLIENT_ID`, `NAVER_MAPS_CLIENT_SECRET` | NCP Maps Geocoding |
 | `NAVER_SEARCH_CLIENT_ID`, `NAVER_SEARCH_CLIENT_SECRET` | Naver Search Local API |

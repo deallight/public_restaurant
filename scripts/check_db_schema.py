@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 
+from app.config import load_settings
 from app.database import Database
 
 
 def main() -> None:
-    database_url = os.getenv("DATABASE_URL", "")
+    database_url = load_settings().database_url
     if not database_url.startswith(("postgresql://", "postgres://")):
         raise SystemExit("DATABASE_URL must point to PostgreSQL")
     issues = Database(database_url).schema_issues(require_migration=True)
