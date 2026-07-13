@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,11 +36,11 @@ class RequestContext:
     actor_id: str = "system"
 
 
-def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def row_to_dict(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-def row_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
+def row_value(row: Any | dict[str, Any], key: str) -> Any:
     if isinstance(row, dict):
         return row.get(key)
     if key in row.keys():
@@ -57,11 +56,11 @@ def first_text(*values: Any) -> str:
     return ""
 
 
-def candidate_effective_place_name(candidate: sqlite3.Row | dict[str, Any]) -> str:
+def candidate_effective_place_name(candidate: Any | dict[str, Any]) -> str:
     return first_text(row_value(candidate, "review_place_name"), row_value(candidate, "original_place_name"))
 
 
-def candidate_effective_normalized_place_name(candidate: sqlite3.Row | dict[str, Any]) -> str:
+def candidate_effective_normalized_place_name(candidate: Any | dict[str, Any]) -> str:
     return first_text(
         row_value(candidate, "review_normalized_place_name"),
         normalize_text(candidate_effective_place_name(candidate)),
@@ -69,11 +68,11 @@ def candidate_effective_normalized_place_name(candidate: sqlite3.Row | dict[str,
     )
 
 
-def candidate_effective_address(candidate: sqlite3.Row | dict[str, Any]) -> str:
+def candidate_effective_address(candidate: Any | dict[str, Any]) -> str:
     return first_text(row_value(candidate, "review_address"), row_value(candidate, "original_address"))
 
 
-def candidate_effective_normalized_address(candidate: sqlite3.Row | dict[str, Any]) -> str:
+def candidate_effective_normalized_address(candidate: Any | dict[str, Any]) -> str:
     return first_text(
         row_value(candidate, "review_normalized_address"),
         normalize_address(candidate_effective_address(candidate)),
@@ -81,7 +80,7 @@ def candidate_effective_normalized_address(candidate: sqlite3.Row | dict[str, An
     )
 
 
-def candidate_effective_major_category(candidate: sqlite3.Row | dict[str, Any]) -> str:
+def candidate_effective_major_category(candidate: Any | dict[str, Any]) -> str:
     return first_text(row_value(candidate, "review_major_category"), row_value(candidate, "place_major_category"), "other")
 
 
@@ -1091,7 +1090,7 @@ class RestaurantService:
 
     def _update_candidate_review_values(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         name: str,
         address: str,
@@ -1236,7 +1235,7 @@ class RestaurantService:
                 )
             ]
 
-    def _restaurant_from_candidate_override(self, conn: sqlite3.Connection, candidate: sqlite3.Row) -> int:
+    def _restaurant_from_candidate_override(self, conn: Any, candidate: Any) -> int:
         linked = conn.execute(
             """
             SELECT r.*
@@ -1356,7 +1355,7 @@ class RestaurantService:
 
     def _link_candidate_expense(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         restaurant_id: int,
         candidate_id: int,
         link_reason: str,
@@ -1391,9 +1390,9 @@ class RestaurantService:
 
     def _apply_provider_verification_to_candidate(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
-        verification: sqlite3.Row,
+        verification: Any,
         note: str,
     ) -> None:
         name = verification["provider_place_name"] or ""
@@ -1401,7 +1400,7 @@ class RestaurantService:
         category = verification["provider_category"] or "other"
         self._update_candidate_review_values(conn, candidate_id, name, address, category, note)
 
-    def _geocode_candidate_override(self, conn: sqlite3.Connection, candidate_id: int) -> dict[str, Any]:
+    def _geocode_candidate_override(self, conn: Any, candidate_id: int) -> dict[str, Any]:
         candidate = conn.execute("SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)).fetchone()
         if candidate is None:
             return {"status": "candidate_missing"}
@@ -1526,7 +1525,7 @@ class RestaurantService:
             "updated_restaurants": updated_restaurants,
         }
 
-    def _refresh_provider_candidates(self, conn: sqlite3.Connection, candidate_id: int) -> dict[str, Any]:
+    def _refresh_provider_candidates(self, conn: Any, candidate_id: int) -> dict[str, Any]:
         if self.naver_client is None:
             return {"status": "skipped", "reason": "naver_search_not_configured"}
         candidate = conn.execute(
@@ -1565,7 +1564,7 @@ class RestaurantService:
 
     def _upsert_admin_provider_candidate(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         row: NormalizedExpenseRow,
         place: PlaceCandidate,
@@ -1624,7 +1623,7 @@ class RestaurantService:
             ),
         )
 
-    def _unlink_candidate_from_restaurants(self, conn: sqlite3.Connection, candidate_id: int) -> None:
+    def _unlink_candidate_from_restaurants(self, conn: Any, candidate_id: int) -> None:
         restaurant_ids = [
             int(row["restaurant_id"])
             for row in conn.execute(
@@ -1653,7 +1652,7 @@ class RestaurantService:
 
     def _set_candidate_approved(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         context: RequestContext,
         reviewer_note: str,
@@ -1689,7 +1688,7 @@ class RestaurantService:
 
     def _set_candidate_rejected(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         context: RequestContext,
         rejection_reason: str,
@@ -1728,7 +1727,7 @@ class RestaurantService:
 
     def _set_candidate_needs_review(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         context: RequestContext,
         reviewer_note: str,
@@ -2135,7 +2134,7 @@ class RestaurantService:
                 """,
                 (start_date, end_date),
             ).fetchall()
-            latest_by_url: dict[str, sqlite3.Row] = {}
+            latest_by_url: dict[str, Any] = {}
             for row in rows:
                 latest_by_url.setdefault(str(row["source_url"]), row)
             documents = list(latest_by_url.values())
@@ -2246,7 +2245,7 @@ class RestaurantService:
                 """,
                 (start_date, end_date),
             ).fetchall()
-            latest_by_url: dict[str, sqlite3.Row] = {}
+            latest_by_url: dict[str, Any] = {}
             for row in rows:
                 latest_by_url.setdefault(str(row["source_url"]), row)
             documents = list(latest_by_url.values())
@@ -2560,13 +2559,13 @@ class RestaurantService:
                 WHERE cpd.published_at >= ?
                   AND cpd.published_at <= ?
                   {plan_clause}
-                GROUP BY cpd.id
+                GROUP BY cpd.id, rd.id
                 ORDER BY cpd.plan_id DESC, cpd.id DESC
                 """,
                 params,
             ).fetchall()
 
-        latest_by_url: dict[str, sqlite3.Row] = {}
+        latest_by_url: dict[str, Any] = {}
         for row in rows:
             latest_by_url.setdefault(str(row["source_url"]), row)
         documents = []
@@ -2973,7 +2972,7 @@ class RestaurantService:
 
     def _collection_progress(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         plan_id: int | None,
     ) -> dict[str, Any]:
         if not plan_id:
@@ -3046,7 +3045,7 @@ class RestaurantService:
     def _collection_progress_item(
         self,
         label: str,
-        row: sqlite3.Row | dict[str, int],
+        row: Any | dict[str, int],
     ) -> dict[str, Any]:
         total = int(row["total_count"] or 0)
         pending = int(row["pending_count"] or 0)
@@ -3094,7 +3093,7 @@ class RestaurantService:
             "자치경찰위원회": "부산광역시 자치경찰위원회",
         }.get(label, label)
 
-    def _latest_food_verification(self, conn: sqlite3.Connection, candidate_id: int) -> sqlite3.Row | None:
+    def _latest_food_verification(self, conn: Any, candidate_id: int) -> Any | None:
         return conn.execute(
             """
             SELECT *
@@ -3116,10 +3115,10 @@ class RestaurantService:
 
     def _food_verification_by_id(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         verification_id: int,
-    ) -> sqlite3.Row | None:
+    ) -> Any | None:
         verification = conn.execute(
             """
             SELECT *
@@ -3136,7 +3135,7 @@ class RestaurantService:
             raise AppError(400, "selected provider candidate is not approvable")
         return verification
 
-    def _provider_candidates(self, conn: sqlite3.Connection, candidate_id: int) -> list[dict[str, Any]]:
+    def _provider_candidates(self, conn: Any, candidate_id: int) -> list[dict[str, Any]]:
         return [
             dict(row)
             for row in conn.execute(
@@ -3177,9 +3176,9 @@ class RestaurantService:
 
     def _restaurant_from_provider_verification(
         self,
-        conn: sqlite3.Connection,
-        candidate: sqlite3.Row,
-        verification: sqlite3.Row,
+        conn: Any,
+        candidate: Any,
+        verification: Any,
     ) -> int:
         address = verification["provider_address"] or verification["provider_road_address"] or "주소 미확인"
         road_address = verification["provider_road_address"] or verification["provider_address"] or ""
@@ -3247,7 +3246,7 @@ class RestaurantService:
         )
         return int(cur.lastrowid)
 
-    def _create_manual_restaurant_without_provider(self, conn: sqlite3.Connection, candidate: sqlite3.Row) -> int:
+    def _create_manual_restaurant_without_provider(self, conn: Any, candidate: Any) -> int:
         place_name = candidate_effective_place_name(candidate)
         address = candidate_effective_address(candidate)
         normalized_address = candidate_effective_normalized_address(candidate)
@@ -3274,17 +3273,17 @@ class RestaurantService:
         )
         return int(cur.lastrowid)
 
-    def _batch_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _batch_payload(self, row: Any) -> dict[str, Any]:
         payload = dict(row)
         payload["summary"] = safe_json_loads(payload.pop("summary_json"), {})
         return payload
 
-    def _collection_plan_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _collection_plan_payload(self, row: Any) -> dict[str, Any]:
         payload = dict(row)
         payload["summary"] = safe_json_loads(payload.pop("summary_json"), {})
         return payload
 
-    def _collection_document_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _collection_document_payload(self, row: Any) -> dict[str, Any]:
         payload = dict(row)
         metadata = safe_json_loads(payload.pop("metadata_json"), {})
         diagnostics = metadata.get("attachment_diagnostics") or []
@@ -3297,7 +3296,7 @@ class RestaurantService:
         payload["parse_failure_type"] = payload["failure_type"] if payload.get("parse_error_message") else ""
         return payload
 
-    def _source_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _source_payload(self, row: Any) -> dict[str, Any]:
         payload = dict(row)
         config = safe_json_loads(payload.pop("config_json"), {})
         return {
@@ -3349,7 +3348,7 @@ class RestaurantService:
             "naver_map_url": naver_map_url(query),
         }
 
-    def _load_review_task(self, conn: sqlite3.Connection, review_id: int) -> sqlite3.Row:
+    def _load_review_task(self, conn: Any, review_id: int) -> Any:
         task = conn.execute("SELECT * FROM manual_review_tasks WHERE id = ?", (review_id,)).fetchone()
         if task is None:
             raise AppError(404, "review task not found")
@@ -3359,8 +3358,8 @@ class RestaurantService:
 
     def _resolve_task(
         self,
-        conn: sqlite3.Connection,
-        task: sqlite3.Row,
+        conn: Any,
+        task: Any,
         status: str,
         context: RequestContext,
         after: dict[str, Any],
@@ -3431,7 +3430,7 @@ class RestaurantService:
 
     def _audit(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         actor_type: str,
         action: str,
         target_type: str,

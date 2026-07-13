@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from app.config import load_settings
+from app.database import Database, postgres_schema_statements
+from app.db_compat import postgres_sql
+from database.migrations.m0001_app_compatible import expected_schema_signature
+from scripts.db_transfer import fingerprint, require_sqlite_copy, transfer, transfer_succeeded
+
+
+class DatabaseCompatibilityTests(unittest.TestCase):
+    def test_postgres_sql_translation(self) -> None:
+        translated = postgres_sql(
+            "INSERT OR IGNORE INTO items (name) VALUES (?)"
+        )
+        self.assertEqual(
+            translated,
+            "INSERT INTO items (name) VALUES (%s) ON CONFLICT DO NOTHING",
+        )
+        self.assertIn(
+            "CURRENT_TIMESTAMP - INTERVAL '1 hour'",
+            postgres_sql("SELECT datetime('now', '-1 hour')"),
+        )
+        self.assertIn(
+            "config_json::jsonb ->> 'priority'",
+            postgres_sql("SELECT json_extract(config_json, '$.priority')"),
+        )
+        self.assertEqual(
+            postgres_sql("SELECT 1 WHERE address LIKE '%부산%' LIMIT ?"),
+            "SELECT 1 WHERE address LIKE '%%부산%%' LIMIT %s",
+        )
+
+    def test_postgres_schema_has_every_application_table_without_extensions(self) -> None:
+        ddl = "\n".join(postgres_schema_statements())
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Database(Path(tmp) / "schema.db")
+            database.initialize()
+            with database.session() as conn:
+                sqlite_tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+        for table in sqlite_tables - {"sqlite_sequence"}:
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table}", ddl)
+        self.assertNotIn("CREATE EXTENSION", ddl)
+        self.assertNotIn("AUTOINCREMENT", ddl)
+        self.assertNotIn("PRAGMA", ddl)
+        self.assertNotRegex(ddl, r"\bREAL\b")
+        self.assertIn("DOUBLE PRECISION", ddl)
+        signature = expected_schema_signature(postgres_schema_statements())
+        self.assertEqual(signature["restaurants"]["id"], "bigint")
+        self.assertEqual(signature["restaurants"]["longitude"], "double precision")
+        self.assertEqual(
+            signature["app_schema_migrations"]["applied_at"],
+            "timestamp with time zone",
+        )
+
+    def test_production_requires_postgres(self) -> None:
+        with patch.dict(os.environ, {"APP_ENV": "production", "DATABASE_URL": ""}, clear=True):
+            with self.assertRaisesRegex(ValueError, "requires a PostgreSQL"):
+                load_settings()
+
+    def test_migration_rejects_default_live_sqlite_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "var" / "public_restaurant.db"
+            path.parent.mkdir()
+            path.touch()
+            with self.assertRaisesRegex(ValueError, "backup copy"):
+                require_sqlite_copy(path)
+
+    def test_transfer_result_fails_closed(self) -> None:
+        self.assertTrue(transfer_succeeded({"status": "dry_run", "errors": []}))
+        self.assertTrue(transfer_succeeded({"status": "applied", "errors": []}))
+        self.assertFalse(transfer_succeeded({"status": "schema_mismatch", "errors": []}))
+        self.assertFalse(
+            transfer_succeeded({"status": "completed_with_errors", "errors": [{"row": 1}]})
+        )
+
+    def test_transfer_streams_small_batches_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Database(Path(tmp) / "source-copy.db")
+            target = Database(Path(tmp) / "rollback-target.db")
+            source.initialize()
+            target.initialize()
+            with source.session() as conn:
+                conn.execute("INSERT INTO users (display_name) VALUES (?)", ("fixture-user",))
+
+            first = transfer(source, target, apply=True, batch_size=3)
+            second = transfer(source, target, apply=True, batch_size=2)
+
+            self.assertTrue(transfer_succeeded(first))
+            self.assertTrue(transfer_succeeded(second))
+            self.assertEqual(first["tables"]["institutions"]["source"], source.count("institutions"))
+            self.assertEqual(target.count("users"), 1)
+            self.assertEqual(fingerprint(source), fingerprint(target))
+
+
+if __name__ == "__main__":
+    unittest.main()

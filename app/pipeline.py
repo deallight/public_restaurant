@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import re
 import time
 from dataclasses import dataclass
@@ -107,7 +106,7 @@ class ExpenseAdapter(Protocol):
 
 
 class LoggedNaverClient:
-    def __init__(self, conn: sqlite3.Connection, client: NaverClient):
+    def __init__(self, conn: Any, client: NaverClient):
         self.conn = conn
         self.client = client
 
@@ -141,7 +140,7 @@ class LoggedNaverClient:
 
 
 class CachedPermitClient:
-    def __init__(self, conn: sqlite3.Connection, client: PermitClient):
+    def __init__(self, conn: Any, client: PermitClient):
         self.conn = conn
         self.client = client
 
@@ -258,7 +257,7 @@ class NoPermitClient:
 
 
 def existing_success_verification_decision(
-    conn: sqlite3.Connection,
+    conn: Any,
     candidate_id: int,
     row: NormalizedExpenseRow,
 ) -> VerificationDecision | None:
@@ -309,7 +308,7 @@ def existing_success_verification_decision(
 
 
 def existing_provider_evidence_decision(
-    conn: sqlite3.Connection,
+    conn: Any,
     candidate_id: int,
     row: NormalizedExpenseRow,
 ) -> VerificationDecision | None:
@@ -700,10 +699,10 @@ class DailyPipeline:
         self.verify_new_rows = verify_new_rows
         self.verification_progress_callback = verification_progress_callback
 
-    def _active_verifier(self, conn: sqlite3.Connection) -> VerifierAgent:
+    def _active_verifier(self, conn: Any) -> VerifierAgent:
         return self.verifier or self._build_verifier(self.settings, conn)
 
-    def _build_verifier(self, settings: Settings | None, conn: sqlite3.Connection | None = None) -> VerifierAgent:
+    def _build_verifier(self, settings: Settings | None, conn: Any | None = None) -> VerifierAgent:
         if not settings:
             return VerifierAgent()
         naver_client = None
@@ -728,7 +727,7 @@ class DailyPipeline:
     def _build_advisory_permit_client(
         self,
         settings: Settings | None,
-        conn: sqlite3.Connection | None = None,
+        conn: Any | None = None,
     ) -> PermitClient | None:
         if not settings or not settings.data_go_kr_service_key:
             return None
@@ -740,7 +739,7 @@ class DailyPipeline:
 
     def _annotate_advisory_permit(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         row: NormalizedExpenseRow,
         decision: VerificationDecision,
     ) -> str:
@@ -1915,7 +1914,7 @@ class DailyPipeline:
                 )
                 raise
 
-    def _verification_pending_count(self, conn: sqlite3.Connection, initial_only: bool) -> int:
+    def _verification_pending_count(self, conn: Any, initial_only: bool) -> int:
         if initial_only:
             return int(
                 conn.execute(
@@ -1943,7 +1942,7 @@ class DailyPipeline:
 
     def _refresh_collection_plan_counts(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         plan_id: int,
         extra_summary: dict[str, Any] | None = None,
     ) -> None:
@@ -2014,14 +2013,14 @@ class DailyPipeline:
             ),
         )
 
-    def _create_batch(self, conn: sqlite3.Connection, job_name: str | None = None) -> int:
+    def _create_batch(self, conn: Any, job_name: str | None = None) -> int:
         cur = conn.execute(
             "INSERT INTO batch_jobs (job_name, status, started_at) VALUES (?, ?, ?)",
             (job_name or f"daily_{self.adapter.source_key}", "running", utc_now()),
         )
         return int(cur.lastrowid)
 
-    def _load_source(self, conn: sqlite3.Connection) -> sqlite3.Row:
+    def _load_source(self, conn: Any) -> Any:
         source = conn.execute(
             """
             SELECT sr.*, i.region_id
@@ -2037,10 +2036,10 @@ class DailyPipeline:
 
     def _existing_document_for_target(
         self,
-        conn: sqlite3.Connection,
-        source: sqlite3.Row,
+        conn: Any,
+        source: Any,
         target: CollectionTarget,
-    ) -> sqlite3.Row | None:
+    ) -> Any | None:
         return conn.execute(
             """
             SELECT
@@ -2059,7 +2058,7 @@ class DailyPipeline:
         ).fetchone()
 
     def _upsert_document(
-        self, conn: sqlite3.Connection, source: sqlite3.Row, document: SourceDocument
+        self, conn: Any, source: Any, document: SourceDocument
     ) -> tuple[int, bool]:
         content_hash = stable_hash(document.content)
         existing = conn.execute(
@@ -2100,7 +2099,7 @@ class DailyPipeline:
         )
         return int(cur.lastrowid), True
 
-    def _source_document_from_raw_row(self, row: sqlite3.Row) -> SourceDocument:
+    def _source_document_from_raw_row(self, row: Any) -> SourceDocument:
         metadata = safe_json_loads(row["raw_metadata_json"], {})
         attachments: list[SourceAttachment] = []
         for item in metadata.get("attachments") or []:
@@ -2138,7 +2137,7 @@ class DailyPipeline:
 
     def _mark_document_parsed(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         raw_document_id: int,
         parse_status: str,
         rows_seen: int,
@@ -2167,7 +2166,7 @@ class DailyPipeline:
 
     def _mark_document_parse_failed(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         raw_document_id: int,
         parse_status: str,
         error_message: str,
@@ -2197,8 +2196,8 @@ class DailyPipeline:
 
     def _upsert_expense(
         self,
-        conn: sqlite3.Connection,
-        source: sqlite3.Row,
+        conn: Any,
+        source: Any,
         raw_document_id: int,
         raw_row: RawExpenseRow,
         normalized: NormalizedExpenseRow,
@@ -2243,8 +2242,8 @@ class DailyPipeline:
 
     def _upsert_candidate(
         self,
-        conn: sqlite3.Connection,
-        source: sqlite3.Row,
+        conn: Any,
+        source: Any,
         expense_id: int,
         raw_row: RawExpenseRow,
         normalized: NormalizedExpenseRow,
@@ -2278,7 +2277,7 @@ class DailyPipeline:
         )
         return int(cur.lastrowid)
 
-    def _candidate_is_resolved(self, conn: sqlite3.Connection, candidate_id: int) -> bool:
+    def _candidate_is_resolved(self, conn: Any, candidate_id: int) -> bool:
         row = conn.execute(
             """
             SELECT status, manual_review_status
@@ -2294,7 +2293,7 @@ class DailyPipeline:
             and row["manual_review_status"] == "pending"
         )
 
-    def _defer_candidate_verification(self, conn: sqlite3.Connection, candidate_id: int) -> None:
+    def _defer_candidate_verification(self, conn: Any, candidate_id: int) -> None:
         conn.execute(
             """
             UPDATE restaurant_candidates
@@ -2323,8 +2322,8 @@ class DailyPipeline:
 
     def _persist_decision(
         self,
-        conn: sqlite3.Connection,
-        source: sqlite3.Row,
+        conn: Any,
+        source: Any,
         expense_id: int,
         candidate_id: int,
         decision: VerificationDecision,
@@ -2427,7 +2426,7 @@ class DailyPipeline:
 
     def _upsert_candidate_evidence_list(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         decision: VerificationDecision,
         verification_status: str,
@@ -2467,7 +2466,7 @@ class DailyPipeline:
 
     def _resolve_manual_task(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         status: str,
         reason: str | None = None,
@@ -2486,7 +2485,7 @@ class DailyPipeline:
 
     def _upsert_verification(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         candidate_id: int,
         decision: VerificationDecision,
         verification_status: str,
@@ -2593,7 +2592,7 @@ class DailyPipeline:
 
     def _upsert_restaurant(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         region_id: int,
         verification_id: int,
         candidate: PlaceCandidate,
@@ -2649,7 +2648,7 @@ class DailyPipeline:
         return restaurant_id
 
     def _link_expense(
-        self, conn: sqlite3.Connection, restaurant_id: int, expense_id: int, candidate_id: int
+        self, conn: Any, restaurant_id: int, expense_id: int, candidate_id: int
     ) -> None:
         row = conn.execute(
             "SELECT used_date, amount FROM expense_records WHERE id = ?", (expense_id,)
@@ -2672,7 +2671,7 @@ class DailyPipeline:
 
     def _insert_dlq(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         batch_id: int,
         stage: str,
         payload: dict[str, Any],
@@ -2688,7 +2687,7 @@ class DailyPipeline:
 
     def _finish_batch(
         self,
-        conn: sqlite3.Connection,
+        conn: Any,
         batch_id: int,
         status: str,
         summary: dict[str, Any],
@@ -2759,7 +2758,7 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _insert_api_call_log(
-    conn: sqlite3.Connection,
+    conn: Any,
     provider: str,
     endpoint: str,
     request_hash: str,
