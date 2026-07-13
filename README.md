@@ -2,7 +2,7 @@
 
 부산 지역 공공기관의 업무추진비 공개 문서를 수집해, 실제 음식점 방문 내역을 검증하고 지도·검색·랭킹으로 보여주는 서비스 MVP입니다. 흩어진 문서형 공공데이터를 바로 지도에 올리지 않고 `수집 -> 파싱 -> 후보 추출 -> 검증 -> 수동검토 -> 공개` 흐름으로 처리해 데이터 신뢰도를 높이는 데 초점을 둡니다.
 
-현재 저장소는 외부 패키지 설치 없이 실행 가능한 Python 표준 라이브러리 기반 웹앱과 SQLite 개발 DB를 포함합니다. 운영 DB 설계는 PostgreSQL/PostGIS/pg_trgm 기준으로 `database/`에 분리되어 있습니다.
+현재 저장소는 Python 표준 라이브러리 기반 웹앱과 PostgreSQL 기본 개발·운영 백엔드를 포함합니다. `DATABASE_URL`로 백엔드를 선택하며 `APP_ENV=production`에서는 PostgreSQL만 허용합니다. SQLite는 기존 데이터 이관, 롤백, 호환성 회귀 테스트를 위해 유지합니다.
 
 ## 현재 구현 범위
 
@@ -20,8 +20,8 @@
 이 프로젝트는 프레임워크보다 데이터 흐름 검증에 집중한 MVP입니다.
 
 - 웹 서버: Python 표준 라이브러리 `http.server`의 `ThreadingHTTPServer`
-- 로컬 DB: SQLite, 기본 경로 `var/public_restaurant.db`
-- 운영 DB 설계: PostgreSQL + PostGIS + pg_trgm
+- 기본 개발·운영 DB: PostgreSQL 16 이상, `psycopg` 3 기반 공통 연결 어댑터
+- SQLite: 기존 DB 이관, 롤백, 호환성 회귀 테스트용. `DATABASE_URL`이 없을 때만 `APP_DB_PATH`를 사용
 - 프론트엔드: 서버 렌더링 HTML 문자열과 정적 JavaScript/CSS
 - 지도: `NAVER_MAP_KEY` 또는 `NAVER_MAPS_CLIENT_ID`가 있으면 네이버 지도 JS API 사용, 없으면 로컬 fallback 지도 사용
 - 외부 연동: Naver Search Local, NCP Maps Geocoding, Naver Login, Google OAuth, 공공데이터포털 인허가 API
@@ -37,16 +37,47 @@
 - `app/integrations.py`: 네이버, NCP Maps, 공공데이터포털, OAuth 연동 클라이언트
 - `app/xlsx_parser.py`: 업무추진비 첨부 표 파싱
 - `app/source_catalog.py`: 현재/예정 수집 대상 기관 카탈로그
-- `database/`: 운영용 PostgreSQL 스키마, 확장 테이블, 뷰, 검증 SQL
+- `database/`: PostgreSQL 차이 분석, 마이그레이션, 이관·롤백 runbook과 기존 설계 후보 SQL
 
-## 빠른 실행
+## 빠른 실행: Mac PostgreSQL 개발 환경
 
-Python 3.10 이상을 권장합니다. 기본 실행에는 별도 패키지 설치가 필요하지 않습니다.
+Python 3.10 이상과 PostgreSQL 16 이상을 권장합니다. 기본 개발 DB는 Mac 로컬의 `public_restaurant_dev` PostgreSQL입니다. 정상 앱 시작은 DDL을 자동 실행하지 않습니다.
+
+최초 한 번, 프로젝트 가상환경과 PostgreSQL 드라이버를 준비합니다.
 
 ```bash
-python3 -m scripts.init_db
-python3 -m scripts.run_daily
-python3 -m app.server --host 127.0.0.1 --port 8000
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Mac 로컬 클러스터는 `/Users/deallight/develop/server_pc/.postgres`에 두고, 개발 DB는 `public_restaurant_dev`를 사용합니다. `.env`에는 아래 설정을 둡니다. `.env`는 Git에 포함하지 않습니다.
+
+```text
+APP_ENV=development
+DATABASE_URL=postgresql:///public_restaurant_dev?host=/Users/deallight/develop/server_pc/.postgres/socket
+```
+
+새 개발 DB에 스키마를 적용할 때만 명시적으로 실행합니다.
+
+```bash
+.venv/bin/python -m scripts.init_db --apply
+.venv/bin/python -m scripts.check_db_schema
+```
+
+평소 개발 서버 실행은 다음 명령을 사용합니다.
+
+```bash
+.venv/bin/python -m app.server --host 127.0.0.1 --port 8000
+```
+
+`source .venv/bin/activate`로 가상환경을 활성화했다면 마지막 명령은 `python3 -m app.server --host 127.0.0.1 --port 8000`으로 실행해도 됩니다.
+
+Mac을 재시작한 뒤 PostgreSQL이 실행 중이지 않다면 다음으로 개발 클러스터를 시작합니다.
+
+```bash
+pg_ctl -D /Users/deallight/develop/server_pc/.postgres/data \
+  -o "-p 5432 -k /Users/deallight/develop/server_pc/.postgres/socket -h 127.0.0.1" \
+  -l /Users/deallight/develop/server_pc/.postgres/postgres.log start
 ```
 
 브라우저에서 다음 주소를 엽니다.
@@ -73,7 +104,9 @@ curl http://127.0.0.1:8000/api/map/restaurants
 | 변수 | 용도 |
 | --- | --- |
 | `APP_HOST`, `APP_PORT` | 서버 바인딩 주소와 포트 |
-| `APP_DB_PATH` | SQLite DB 경로 |
+| `APP_ENV` | `development` 또는 `production`; production은 PostgreSQL을 강제 |
+| `DATABASE_URL` | 기본 개발·운영 DB URL. Mac 개발은 Unix socket URL을, N150 운영은 secret 환경의 `postgresql://...` URL을 사용 |
+| `APP_DB_PATH` | `DATABASE_URL`이 없을 때만 쓰는 SQLite 호환성·롤백 DB 경로 |
 | `NAVER_MAP_KEY` | 네이버 지도 JS API Client ID. `NAVER_MAPS_CLIENT_ID`로도 대체 가능 |
 | `NAVER_MAPS_CLIENT_ID`, `NAVER_MAPS_CLIENT_SECRET` | NCP Maps Geocoding |
 | `NAVER_SEARCH_CLIENT_ID`, `NAVER_SEARCH_CLIENT_SECRET` | Naver Search Local API |
@@ -224,7 +257,7 @@ raw_documents
 - `dead_letter_queue`: 파싱/검증 실패 항목
 - `restaurant_reviews`, `review_reports`: 사용자 리뷰와 신고
 
-SQLite 스키마는 `app/schema.py`, PostgreSQL 운영 스키마는 `database/postgres_schema.sql`과 `database/postgres_app_extensions.sql`을 기준으로 합니다.
+SQLite 스키마와 PostgreSQL 호환 기준은 `app/schema.py`입니다. PostgreSQL 0001은 `database/migrations/m0001_app_compatible.py`가 생성하며, 기존 `database/postgres_*.sql`은 설계 후보로만 유지합니다. 차이 분석은 `database/POSTGRESQL_GAP_ANALYSIS.md`, 실행·이관·롤백 절차는 `database/POSTGRESQL_RUNBOOK.md`를 따릅니다.
 
 ## 테스트
 
@@ -232,6 +265,13 @@ SQLite 스키마는 `app/schema.py`, PostgreSQL 운영 스키마는 `database/po
 
 ```bash
 python3 -m unittest discover -s tests
+```
+
+격리된 PostgreSQL 테스트 DB를 준비한 경우 전체 계약을 함께 검증합니다. 안전을 위해 DB 이름에 `test`가 포함되지 않으면 통합 테스트가 실행되지 않습니다.
+
+```bash
+TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_test' \
+  .venv/bin/python -m unittest discover -s tests
 ```
 
 외부 API는 테스트에서 실제 호출하지 않고 fake client로 대체합니다. 주요 검증 범위는 다음과 같습니다.
@@ -243,6 +283,27 @@ python3 -m unittest discover -s tests
 - 공개 지도, 검색, 랭킹, 리뷰 제한
 - 관리자 화면과 운영 API 라우팅
 - 설정 로딩과 `.env` 처리
+- SQLite/PostgreSQL SQL 변환 및 운영 PostgreSQL 강제
+- PostgreSQL fixture 파이프라인, 지도·검색·랭킹·상세·리뷰·관리자 수동검토 계약
+
+## PostgreSQL 이관과 검증
+
+원본 SQLite 운영 파일에는 이관 도구가 직접 접근하지 않습니다. 쓰기를 중지하고 `.backup`으로 만든 복사본만 사용합니다. 명령의 기본 동작은 dry-run이며 행 값이나 접속 비밀을 출력하지 않습니다.
+
+```bash
+sqlite3 var/public_restaurant.db '.backup /secure-backup/public_restaurant-cutover.db'
+
+python3 -m scripts.migrate_sqlite_to_postgres \
+  --source-copy /secure-backup/public_restaurant-cutover.db --batch-size 500
+python3 -m scripts.migrate_sqlite_to_postgres \
+  --source-copy /secure-backup/public_restaurant-cutover.db --apply --batch-size 500
+python3 -m scripts.compare_databases \
+  --sqlite-copy /secure-backup/public_restaurant-cutover.db
+```
+
+이관은 메모리 사용량이 테이블 크기에 비례하지 않도록 배치 스트리밍합니다. 비교기는 스키마, 핵심 테이블 레코드 수·SHA-256 지문, 공개 지도·검색·랭킹·상세, 관리자 후보·수집·검증·문서·로그 응답을 비교합니다. 스키마 불일치나 이관 행 오류는 실패 종료 코드로 처리합니다. 운영 앱도 시작할 때 0001의 필수 테이블·컬럼·PostgreSQL 타입을 확인합니다. 반대 방향 롤백 파일은 `scripts.export_postgres_to_sqlite`로 새 경로에만 생성합니다.
+
+PostGIS는 현재 숫자 위경도 bounds 검색에 필요하지 않습니다. `pg_trgm`은 대규모 검색 성능용 선택 기능이며 `database/migrations/0002_optional_pg_trgm.sql`로 분리되어 있습니다.
 
 ## 운영 주의
 
@@ -257,6 +318,6 @@ python3 -m unittest discover -s tests
 - 부산시 본청 외 산하기관, 지방공기업, 출자·출연기관, 교육청, 경찰·검찰, 법원·선관위, 중앙부처 부산 지방청, 부산권 국가공공기관으로 수집 대상 확대
 - HWP/PDF/구형 XLS 첨부 parser 추가
 - 관리자 인증과 역할 기반 권한 분리
-- Postgres/PostGIS 전환 후 공간 검색, 반경 필터, 지역별 랭킹 고도화
+- 선택적 PostGIS 도입 후 공간 검색, 반경 필터, 지역별 랭킹 고도화
 - 지도 품질 이슈 자동 탐지와 재검증 워크플로 강화
 - 추천/큐레이션 화면과 사용자 피드백 기반 별칭·검증 품질 개선

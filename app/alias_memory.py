@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import sqlite3
-from typing import Iterable
+from typing import Any, Iterable
 
 from .utils import normalize_text
 from .agents import (
@@ -15,7 +14,7 @@ from .agents import (
 
 
 def remember_aliases(
-    conn: sqlite3.Connection,
+    conn: Any,
     restaurant_id: int,
     alias_texts: Iterable[str],
     source: str,
@@ -31,13 +30,17 @@ def remember_aliases(
                 ON CONFLICT(restaurant_id, normalized_alias) DO UPDATE SET
                   alias_text = excluded.alias_text,
                   source = excluded.source,
-                  confidence = MAX(alias_memory.confidence, excluded.confidence)
+                  confidence = CASE
+                    WHEN alias_memory.confidence >= excluded.confidence
+                    THEN alias_memory.confidence
+                    ELSE excluded.confidence
+                  END
                 """,
                 (restaurant_id, alias_text, normalized_alias, source, confidence),
             )
 
 
-def alias_memory_decision(conn: sqlite3.Connection, row) -> VerificationDecision | None:
+def alias_memory_decision(conn: Any, row) -> VerificationDecision | None:
     aliases = alias_keys_for_place(row.normalized_place_name) + alias_keys_for_place(row.place_name)
     for value in [row.normalized_place_name, row.place_name]:
         normalized = normalize_text(value)

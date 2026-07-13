@@ -42,6 +42,8 @@ def load_dotenv(
 @dataclass(frozen=True)
 class Settings:
     db_path: Path
+    database_url: str = ""
+    app_env: str = "development"
     host: str = "127.0.0.1"
     port: int = 8000
     naver_map_key: str = ""
@@ -63,8 +65,16 @@ class Settings:
 def load_settings() -> Settings:
     load_dotenv()
     db_path = Path(os.getenv("APP_DB_PATH", BASE_DIR / "var" / "public_restaurant.db"))
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
+    if database_url and not database_url.startswith(("postgresql://", "postgres://", "sqlite:///")):
+        raise ValueError("DATABASE_URL must use postgresql:// or sqlite:///")
+    if app_env == "production" and not database_url.startswith(("postgresql://", "postgres://")):
+        raise ValueError("APP_ENV=production requires a PostgreSQL DATABASE_URL")
     return Settings(
         db_path=db_path,
+        database_url=database_url,
+        app_env=app_env,
         host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
         naver_map_key=os.getenv("NAVER_MAP_KEY", "") or os.getenv("NAVER_MAPS_CLIENT_ID", ""),

@@ -3,8 +3,16 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Iterable
+from typing import Any, Iterator, Iterable
 
+from database.migrations.m0001_app_compatible import (
+    DESCRIPTION,
+    VERSION,
+    expected_schema_signature,
+    statements,
+)
+
+from .db_compat import connect_postgres
 from .schema import SQLITE_SCHEMA
 from .source_catalog import SourceCatalogEntry, iter_source_catalog
 from .utils import safe_json_dumps, utc_now
@@ -41,9 +49,17 @@ SQLITE_TABLES = [
 
 class Database:
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        value = str(path)
+        self.database_url = value if value.startswith(("postgresql://", "postgres://")) else ""
+        if value.startswith("sqlite:///"):
+            value = value.removeprefix("sqlite:///")
+        self.path = Path(value) if not self.database_url else None
+        self.backend = "postgresql" if self.database_url else "sqlite"
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self) -> Any:
+        if self.database_url:
+            return connect_postgres(self.database_url)
+        assert self.path is not None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
@@ -51,7 +67,7 @@ class Database:
         return conn
 
     @contextmanager
-    def session(self) -> Iterator[sqlite3.Connection]:
+    def session(self) -> Iterator[Any]:
         conn = self.connect()
         try:
             yield conn
@@ -63,9 +79,81 @@ class Database:
             conn.close()
 
     def initialize(self) -> None:
+        if self.backend == "postgresql":
+            self._initialize_postgres()
+            return
         with self.session() as conn:
             conn.executescript(SQLITE_SCHEMA)
             self._migrate_schema(conn)
+            self.seed_core(conn)
+
+    def prepare(self) -> None:
+        """Prepare a runtime connection without applying PostgreSQL DDL."""
+        if self.backend == "postgresql":
+            self.verify_schema()
+        else:
+            self.initialize()
+
+    def schema_issues(self, require_migration: bool = True) -> list[str]:
+        if self.backend == "sqlite":
+            return []
+        with self.session() as conn:
+            actual_rows = conn.execute(
+                """
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                """
+            ).fetchall()
+        actual = {
+            (str(item["table_name"]), str(item["column_name"])): str(item["data_type"])
+            for item in actual_rows
+        }
+        issues: list[str] = []
+        for table_name, columns in expected_schema_signature(postgres_schema_statements()).items():
+            for column_name, expected_type in columns.items():
+                actual_type = actual.get((table_name, column_name))
+                if actual_type != expected_type:
+                    issues.append(
+                        f"{table_name}.{column_name}: expected {expected_type}, got {actual_type or 'missing'}"
+                    )
+        if require_migration and ("app_schema_migrations", "version") in actual:
+            with self.session() as conn:
+                migration = conn.execute(
+                    "SELECT version FROM app_schema_migrations WHERE version = ?", (VERSION,)
+                ).fetchone()
+            if migration is None:
+                issues.insert(0, f"app_schema_migrations: version {VERSION} is missing")
+        elif require_migration:
+            issues.insert(0, "app_schema_migrations: migration table is missing")
+        return issues
+
+    def verify_schema(self) -> None:
+        if self.backend == "sqlite":
+            return
+        try:
+            issues = self.schema_issues(require_migration=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "PostgreSQL schema is not initialized; run scripts.init_db --apply after approval"
+            ) from exc
+        if issues:
+            preview = "; ".join(issues[:5])
+            raise RuntimeError(f"PostgreSQL schema is incompatible with migration 0001: {preview}")
+
+    def _initialize_postgres(self) -> None:
+        with self.session() as conn:
+            for statement in postgres_schema_statements():
+                conn.execute(statement)
+            conn.execute(
+                """
+                INSERT INTO app_schema_migrations (version, description)
+                VALUES (?, ?)
+                ON CONFLICT(version) DO NOTHING
+                """,
+                (VERSION, DESCRIPTION),
+            )
+            self._backfill_parse_status(conn)
             self.seed_core(conn)
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
@@ -192,6 +280,8 @@ class Database:
         This is intentionally explicit and is used by tests/local reset scripts only.
         Production PostgreSQL rollback should use reviewed SQL migrations/backups.
         """
+        if self.backend != "sqlite":
+            raise RuntimeError("rollback_schema is restricted to local SQLite databases")
         with self.session() as conn:
             conn.execute("PRAGMA foreign_keys = OFF")
             for table in SQLITE_TABLES:
@@ -310,3 +400,13 @@ class Database:
                 (job_name, "running", utc_now()),
             )
             return int(cur.lastrowid)
+
+
+def postgres_schema_statements() -> list[str]:
+    """Build PostgreSQL DDL from the authoritative application schema.
+
+    The checked-in SQLite schema remains the compatibility specification. This
+    conversion deliberately keeps JSON and timestamps as text because the
+    existing API serializes and parses those values as strings.
+    """
+    return statements(SQLITE_SCHEMA, SQLITE_TABLES)

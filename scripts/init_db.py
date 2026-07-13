@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -10,9 +11,19 @@ from app.database import Database
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Initialize the configured database schema.")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="required before applying PostgreSQL DDL; SQLite remains automatic",
+    )
+    args = parser.parse_args()
     settings = load_settings()
-    Database(settings.db_path).initialize()
-    print(f"Initialized {settings.db_path}")
+    database = Database(settings.database_url or settings.db_path)
+    if database.backend == "postgresql" and not args.apply:
+        raise SystemExit("PostgreSQL DDL not applied: review the migration and rerun with --apply")
+    database.initialize()
+    print(f"Initialized {database.backend} database")
 
 
 if __name__ == "__main__":

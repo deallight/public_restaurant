@@ -17,6 +17,8 @@ def main() -> None:
 
     runtime_settings = settings.__class__(
         db_path=Path(args.db),
+        database_url=settings.database_url,
+        app_env=settings.app_env,
         host=args.host,
         port=args.port,
         naver_map_key=settings.naver_map_key,
