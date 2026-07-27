@@ -9,6 +9,7 @@ const state = {
   filters: {
     category: "",
     minVisitCount: "",
+    savedOnly: new URLSearchParams(window.location.search).get("saved_only") === "1",
   },
 };
 
@@ -303,6 +304,17 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function formatVisitDateTime(value) {
+  const text = String(value || "").trim();
+  if (!text) return "-";
+  const matched = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2}))?/,
+  );
+  if (!matched) return text;
+  const [, year, month, day, hour, minute] = matched;
+  return `${year}.${month}.${day}${hour && minute ? ` ${hour}:${minute}` : ""}`;
+}
+
 function naverSearchAddress(address) {
   const cleaned = String(address || "")
     .replace(/\s*(?:지하|지상)?\s*\d+\s*층(?:\s*\d+\s*호)?/g, " ")
@@ -333,7 +345,11 @@ function naverSearchUrl(restaurant) {
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const payload = await response.json();
@@ -362,6 +378,7 @@ async function loadRestaurants(options = {}) {
   }
   if (state.filters.category) params.set("category", state.filters.category);
   if (state.filters.minVisitCount) params.set("min_visit_count", state.filters.minVisitCount);
+  if (state.filters.savedOnly) params.set("saved_only", "1");
   const payload = await fetchJson(`/api/map/restaurants?${params.toString()}`);
   state.restaurants = payload.restaurants;
   if (options.focus === "results" && state.restaurants.length === 1) {
@@ -372,6 +389,8 @@ async function loadRestaurants(options = {}) {
     const panel = document.querySelector("#detail-panel");
     panel.hidden = true;
     panel.innerHTML = "";
+    panel.classList.remove("detail-expanded");
+    panel.closest(".map-stage")?.classList.remove("detail-open", "detail-expanded");
   }
   renderRanking();
   await renderMap({ focus: options.focus, regionFocus });
@@ -410,8 +429,9 @@ function updateFilterIndex() {
     const filter = button.dataset.filter;
     const value = button.dataset.value || "";
     const selected = (
-      (filter === "category" && state.filters.category === value)
+      (filter === "category" && !state.filters.savedOnly && state.filters.category === value)
       || (filter === "min_visit_count" && state.filters.minVisitCount === value)
+      || (filter === "saved" && state.filters.savedOnly)
     );
     button.classList.toggle("active", selected);
     button.setAttribute("aria-pressed", selected ? "true" : "false");
@@ -724,6 +744,24 @@ async function selectRestaurant(id) {
   state.selectedId = id;
   renderRanking();
   const restaurant = await fetchJson(`/api/restaurants/${id}`);
+  const visits = Array.isArray(restaurant.visits) ? restaurant.visits : [];
+  const restaurantImages = (
+    Array.isArray(restaurant.restaurant_images)
+      ? restaurant.restaurant_images
+      : (restaurant.restaurant_image ? [restaurant.restaurant_image] : [])
+  ).filter((image) => image?.thumbnail_url && image?.source_url).slice(0, 4);
+  const hasRestaurantImages = restaurantImages.length > 0;
+  const adminRestaurantImageCount = restaurantImages.filter((image) => image.is_admin_image).length;
+  const searchedRestaurantImageCount = restaurantImages.length - adminRestaurantImageCount;
+  const aiSummary = restaurant.ai_summary || {};
+  const aiSummaryText = String(aiSummary.text || "").trim();
+  const currentReviewCount = Number(aiSummary.current_review_count || restaurant.review_count || 0);
+  const summarizedReviewCount = Number(aiSummary.summarized_review_count || 0);
+  const aiSummaryMessage = aiSummaryText || (
+    currentReviewCount < 5
+      ? `공개 리뷰가 5개 모이면 첫 AI 요약이 제공됩니다. 현재 ${currentReviewCount}개입니다.`
+      : "AI 요약을 준비하고 있습니다. 생성 또는 재시도 후에는 최소 1시간 동안 같은 요약을 사용합니다."
+  );
   if (window.naver?.maps && state.map) {
     try {
       renderNaverMap();
@@ -739,43 +777,245 @@ async function selectRestaurant(id) {
     renderFallbackMap();
   }
   const panel = document.querySelector("#detail-panel");
+  const stage = panel.closest(".map-stage");
   panel.hidden = false;
+  panel.classList.remove("detail-expanded");
+  stage?.classList.remove("detail-expanded");
+  stage?.classList.add("detail-open");
   panel.innerHTML = `
     <button type="button" class="panel-close" aria-label="닫기">×</button>
-    <h2>${escapeHtml(restaurant.name)}</h2>
-    <p class="detail-address">${escapeHtml(restaurant.road_address || restaurant.address)}</p>
-    <div class="detail-stats">
-      <span>${restaurant.category_label}</span>
-      <span>${restaurant.visit_count}회</span>
-      <span>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}점</span>
-    </div>
-    <a class="naver-map-link" href="${escapeHtml(naverSearchUrl(restaurant))}" target="_blank" rel="noopener">
-      네이버 지도에서 보기
-    </a>
-    <form id="review-form" class="review-form">
-      <select name="rating" aria-label="별점">
-        <option value="5">5점</option>
-        <option value="4">4점</option>
-        <option value="3">3점</option>
-        <option value="2">2점</option>
-        <option value="1">1점</option>
-      </select>
-      <input name="reviewer_label" placeholder="닉네임" maxlength="40">
-      <textarea name="body" placeholder="리뷰" rows="3"></textarea>
-      <button type="submit">등록</button>
-    </form>
-    <div class="reviews">
-      ${restaurant.reviews.map((review) => `
-        <article>
-          <div><b>${review.rating}점</b><span>${escapeHtml(review.reviewer_label)}</span></div>
-          <p>${escapeHtml(review.body)}</p>
-          <button type="button" data-review="${review.id}" class="report-button">신고</button>
-        </article>
-      `).join("") || "<p class=\"empty\">등록된 리뷰가 없습니다.</p>"}
-    </div>
+    <section class="detail-summary">
+      <h2>
+        <button
+          type="button"
+          class="detail-expand-toggle"
+          aria-expanded="false"
+          aria-controls="visit-history ai-review-summary restaurant-photo detail-review-entry visit-reviews"
+        >
+          <span>${escapeHtml(restaurant.name)}</span>
+          <small class="detail-expand-label">방문 정보 펼치기</small>
+        </button>
+      </h2>
+      <p class="detail-address">${escapeHtml(restaurant.road_address || restaurant.address)}</p>
+      <div class="detail-stats">
+        <span>${restaurant.category_label}</span>
+        <span>${restaurant.visit_count}회</span>
+        <span>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}점</span>
+      </div>
+      <div class="detail-primary-actions">
+        <a class="naver-map-link" href="${escapeHtml(naverSearchUrl(restaurant))}" target="_blank" rel="noopener">
+          네이버 지도에서 보기
+        </a>
+        <button
+          type="button"
+          class="save-restaurant-button${restaurant.is_saved ? " is-saved" : ""}"
+          aria-pressed="${restaurant.is_saved ? "true" : "false"}"
+        >
+          <span aria-hidden="true">${restaurant.is_saved ? "♥" : "♡"}</span>
+          ${restaurant.is_saved ? "저장됨" : "관심 가게 저장"}
+        </button>
+      </div>
+    </section>
+    <section id="visit-history" class="visit-history" hidden>
+      <div class="visit-history-head">
+        <h3>방문 기록</h3>
+        <span>${visits.length}건</span>
+      </div>
+      <div class="visit-table-scroll">
+        <table class="visit-table">
+          <thead>
+            <tr>
+              <th scope="col">방문일시</th>
+              <th scope="col">방문 기관</th>
+              <th scope="col">방문 사유</th>
+            </tr>
+          </thead>
+          <tbody id="visit-table-body"></tbody>
+        </table>
+      </div>
+      <nav class="visit-pagination" aria-label="방문 기록 페이지" hidden>
+        <button type="button" data-visit-page="previous">이전</button>
+        <span class="visit-page-status" aria-live="polite"></span>
+        <button type="button" data-visit-page="next">다음</button>
+      </nav>
+    </section>
+    <section id="ai-review-summary" class="ai-summary-card" hidden>
+      <div class="ai-summary-head">
+        <div>
+          <span class="ai-summary-kicker">AI SUMMARY</span>
+          <h3>AI 방문 요약</h3>
+        </div>
+        ${aiSummaryText ? `
+          <span class="ai-summary-count">리뷰 ${summarizedReviewCount}개 시점</span>
+        ` : `
+          <span class="ai-summary-count">${Math.min(currentReviewCount, 5)} / 5</span>
+        `}
+      </div>
+      <p class="ai-summary-text">${escapeHtml(aiSummaryMessage)}</p>
+      <div class="ai-summary-meta">
+        <span>공개 방문 리뷰를 바탕으로 작성된 AI 요약입니다.</span>
+        ${aiSummary.last_generated_at ? `
+          <time datetime="${escapeHtml(aiSummary.last_generated_at)}">
+            ${escapeHtml(formatVisitDateTime(aiSummary.last_generated_at))} 갱신
+          </time>
+        ` : ""}
+        ${aiSummary.refresh_pending ? `
+          <span class="ai-summary-pending">새 리뷰 반영 대기</span>
+        ` : ""}
+      </div>
+    </section>
+    <section id="restaurant-photo" class="restaurant-photo-card">
+      <div class="restaurant-photo-head">
+        <h3>음식점 사진</h3>
+        <span>${adminRestaurantImageCount ? "관리자 등록 사진 우선" : "네이버 이미지 검색 결과"}</span>
+      </div>
+      ${hasRestaurantImages ? `
+        <div class="restaurant-photo-grid" data-image-count="${restaurantImages.length}">
+          ${restaurantImages.map((image, index) => `
+            <article class="restaurant-photo-item">
+              <a
+                class="restaurant-photo-link"
+                href="${escapeHtml(image.source_url)}"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="${escapeHtml(restaurant.name)} 사진 ${index + 1} 원본 보기"
+              >
+                <img
+                  class="restaurant-photo-image"
+                  src="${escapeHtml(image.thumbnail_url)}"
+                  alt="${escapeHtml(image.title || `${restaurant.name} 사진 ${index + 1}`)}"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                >
+                ${image.is_admin_image ? `
+                  <span class="restaurant-photo-badge admin">관리자 등록</span>
+                ` : image.is_naver_place_image ? `
+                  <span class="restaurant-photo-badge">플레이스 이미지</span>
+                ` : ""}
+              </a>
+            </article>
+          `).join("")}
+        </div>
+        <div class="restaurant-photo-meta">
+          <span>${adminRestaurantImageCount ? `등록 ${adminRestaurantImageCount}장${searchedRestaurantImageCount ? ` · 검색 ${searchedRestaurantImageCount}장` : ""}` : `검색 결과 ${searchedRestaurantImageCount}장`}</span>
+          <span>${adminRestaurantImageCount ? "관리자 사진 다음에 검색 사진을 표시합니다." : "사진을 누르면 원본을 확인할 수 있습니다."}</span>
+        </div>
+        <p class="restaurant-photo-empty" hidden>
+          사진을 불러오지 못했습니다.
+        </p>
+      ` : `
+        <p class="restaurant-photo-empty">
+          가게명과 일치하는 네이버 이미지 검색 결과가 없습니다.
+        </p>
+      `}
+    </section>
+    <section id="detail-review-entry" class="detail-review-entry" hidden>
+      <h3>리뷰 남기기</h3>
+      <form id="review-form" class="review-form">
+        <select name="rating" aria-label="별점">
+          <option value="5">5점</option>
+          <option value="4">4점</option>
+          <option value="3">3점</option>
+          <option value="2">2점</option>
+          <option value="1">1점</option>
+        </select>
+        <input
+          name="reviewer_label"
+          placeholder="${window.IS_SIGNED_IN ? "로그인 이름으로 등록" : "닉네임"}"
+          maxlength="40"
+          ${window.IS_SIGNED_IN ? "disabled" : ""}
+        >
+        <textarea name="body" placeholder="리뷰" rows="3"></textarea>
+        <button type="submit">등록</button>
+      </form>
+    </section>
+    <section id="visit-reviews" class="reviews" hidden>
+      <h3>방문 리뷰</h3>
+      <div class="review-list">
+        ${restaurant.reviews.map((review) => `
+          <article>
+            <div><b>${review.rating}점</b><span>${escapeHtml(review.reviewer_label)}</span></div>
+            <p>${escapeHtml(review.body)}</p>
+            <button type="button" data-review="${review.id}" class="report-button">신고</button>
+          </article>
+        `).join("") || "<p class=\"empty\">등록된 리뷰가 없습니다.</p>"}
+      </div>
+    </section>
   `;
+  const expandToggle = panel.querySelector(".detail-expand-toggle");
+  const visitHistory = panel.querySelector("#visit-history");
+  const aiReviewSummary = panel.querySelector("#ai-review-summary");
+  const detailReviewEntry = panel.querySelector("#detail-review-entry");
+  const visitReviews = panel.querySelector("#visit-reviews");
+  const visitTableBody = panel.querySelector("#visit-table-body");
+  const visitPagination = panel.querySelector(".visit-pagination");
+  const visitPageStatus = panel.querySelector(".visit-page-status");
+  const visitPageSize = 5;
+  const visitPageCount = Math.max(1, Math.ceil(visits.length / visitPageSize));
+  let visitPage = 1;
+  const renderVisitPage = () => {
+    const start = (visitPage - 1) * visitPageSize;
+    const pageVisits = visits.slice(start, start + visitPageSize);
+    visitTableBody.innerHTML = pageVisits.map((visit) => `
+      <tr>
+        <td>${escapeHtml(formatVisitDateTime(visit.visited_at))}</td>
+        <td>${escapeHtml(visit.institution_name || "-")}</td>
+        <td>${escapeHtml(visit.purpose || "-")}</td>
+      </tr>
+    `).join("") || `
+      <tr>
+        <td colspan="3" class="visit-empty">공개된 방문 기록이 없습니다.</td>
+      </tr>
+    `;
+    const isPaginated = visits.length > visitPageSize;
+    visitHistory.classList.toggle("is-paginated", isPaginated);
+    visitPagination.hidden = !isPaginated;
+    visitPageStatus.textContent = `${visitPage} / ${visitPageCount}`;
+    panel.querySelector('[data-visit-page="previous"]').disabled = visitPage === 1;
+    panel.querySelector('[data-visit-page="next"]').disabled = visitPage === visitPageCount;
+  };
+  renderVisitPage();
+  const restaurantPhotoItems = [...panel.querySelectorAll(".restaurant-photo-item")];
+  const updateRestaurantPhotoFallback = () => {
+    if (!restaurantPhotoItems.length) return;
+    const hasVisiblePhoto = restaurantPhotoItems.some((item) => !item.hidden);
+    panel.querySelector(".restaurant-photo-grid").hidden = !hasVisiblePhoto;
+    panel.querySelector(".restaurant-photo-meta").hidden = !hasVisiblePhoto;
+    panel.querySelector(".restaurant-photo-empty").hidden = hasVisiblePhoto;
+  };
+  restaurantPhotoItems.forEach((item) => {
+    item.querySelector(".restaurant-photo-image").addEventListener("error", () => {
+      item.hidden = true;
+      updateRestaurantPhotoFallback();
+    });
+  });
+  panel.querySelector('[data-visit-page="previous"]').addEventListener("click", () => {
+    if (visitPage <= 1) return;
+    visitPage -= 1;
+    renderVisitPage();
+  });
+  panel.querySelector('[data-visit-page="next"]').addEventListener("click", () => {
+    if (visitPage >= visitPageCount) return;
+    visitPage += 1;
+    renderVisitPage();
+  });
+  expandToggle.addEventListener("click", () => {
+    const expanded = expandToggle.getAttribute("aria-expanded") !== "true";
+    expandToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    panel.classList.toggle("detail-expanded", expanded);
+    stage?.classList.toggle("detail-expanded", expanded);
+    visitHistory.hidden = !expanded;
+    aiReviewSummary.hidden = !expanded;
+    detailReviewEntry.hidden = !expanded;
+    visitReviews.hidden = !expanded;
+    panel.querySelector(".detail-expand-label").textContent = expanded
+      ? "간단히 보기"
+      : "방문 정보 펼치기";
+  });
   panel.querySelector(".panel-close").addEventListener("click", () => {
     panel.hidden = true;
+    panel.classList.remove("detail-expanded");
+    stage?.classList.remove("detail-open", "detail-expanded");
     state.selectedId = null;
     renderRanking();
     if (window.naver?.maps && state.map) {
@@ -795,6 +1035,22 @@ async function selectRestaurant(id) {
     });
     await loadRestaurants();
     await selectRestaurant(id);
+  });
+  panel.querySelector(".save-restaurant-button").addEventListener("click", async (event) => {
+    if (!window.IS_SIGNED_IN) {
+      const returnTo = `/?restaurant_id=${id}`;
+      window.location.href = `/login?return_to=${encodeURIComponent(returnTo)}`;
+      return;
+    }
+    const button = event.currentTarget;
+    const isSaved = button.getAttribute("aria-pressed") === "true";
+    const result = await fetchJson(
+      `/api/restaurants/${id}/${isSaved ? "unsave" : "save"}`,
+      { method: "POST", body: "{}" },
+    );
+    button.classList.toggle("is-saved", result.is_saved);
+    button.setAttribute("aria-pressed", result.is_saved ? "true" : "false");
+    button.innerHTML = `<span aria-hidden="true">${result.is_saved ? "♥" : "♡"}</span> ${result.is_saved ? "저장됨" : "관심 가게 저장"}`;
   });
   panel.querySelectorAll(".report-button").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -826,17 +1082,35 @@ document.querySelectorAll("[data-filter]").forEach((button) => {
   button.addEventListener("click", () => {
     if (button.dataset.filter === "category") {
       state.filters.category = button.dataset.value || "";
+      state.filters.savedOnly = false;
     }
     if (button.dataset.filter === "min_visit_count") {
       state.filters.minVisitCount = button.dataset.value || "";
       button.closest("details")?.removeAttribute("open");
+    }
+    if (button.dataset.filter === "saved") {
+      if (!window.IS_SIGNED_IN) {
+        window.location.href = "/login?return_to=/?saved_only=1";
+        return;
+      }
+      state.filters.savedOnly = !state.filters.savedOnly;
+      state.filters.category = "";
     }
     updateFilterIndex();
     loadRestaurants().catch((error) => console.error(error));
   });
 });
 
+if (state.filters.savedOnly && !window.IS_SIGNED_IN) {
+  window.location.replace("/login?return_to=/?saved_only=1");
+}
+
 updateFilterIndex();
-loadRestaurants().catch((error) => {
-  document.querySelector("#ranking-list").innerHTML = `<li class="empty">${escapeHtml(error.message)}</li>`;
-});
+loadRestaurants()
+  .then(async () => {
+    const requestedId = Number(new URLSearchParams(window.location.search).get("restaurant_id"));
+    if (requestedId > 0) await selectRestaurant(requestedId);
+  })
+  .catch((error) => {
+    document.querySelector("#ranking-list").innerHTML = `<li class="empty">${escapeHtml(error.message)}</li>`;
+  });

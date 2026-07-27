@@ -342,6 +342,13 @@ CREATE TABLE IF NOT EXISTS account_merge_requests (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_saved_restaurants (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, restaurant_id)
+);
+
 CREATE TABLE IF NOT EXISTS restaurant_reviews (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   restaurant_id INTEGER NOT NULL REFERENCES restaurants(id),
@@ -353,6 +360,34 @@ CREATE TABLE IF NOT EXISTS restaurant_reviews (
   status TEXT NOT NULL DEFAULT 'visible',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS restaurant_ai_summaries (
+  restaurant_id INTEGER PRIMARY KEY REFERENCES restaurants(id),
+  summary_text TEXT NOT NULL DEFAULT '',
+  summarized_review_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'idle',
+  provider TEXT,
+  model TEXT,
+  last_generated_at TEXT,
+  last_attempted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (summarized_review_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS restaurant_admin_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  storage_key TEXT NOT NULL UNIQUE,
+  original_filename TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  alt_text TEXT NOT NULL DEFAULT '',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (sort_order >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS review_reports (
@@ -380,6 +415,10 @@ CREATE TABLE IF NOT EXISTS review_moderation_logs (
 CREATE INDEX IF NOT EXISTS idx_restaurants_category ON restaurants (major_category);
 CREATE INDEX IF NOT EXISTS idx_restaurants_region ON restaurants (region_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_restaurant ON restaurant_reviews (restaurant_id, status);
+CREATE INDEX IF NOT EXISTS idx_user_saved_restaurants_created
+  ON user_saved_restaurants (user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_restaurant_admin_images_order
+  ON restaurant_admin_images (restaurant_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports (status);
 CREATE INDEX IF NOT EXISTS idx_expense_records_date ON expense_records (used_date);
 CREATE INDEX IF NOT EXISTS idx_candidates_status ON restaurant_candidates (status);

@@ -266,6 +266,73 @@ async function loadSources() {
   }).join("");
 }
 
+function apiLastCallLabel(value) {
+  if (!value) return "아직 호출 기록 없음";
+  const normalized = String(value).replace(" ", "T");
+  const parsed = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return `최근 호출 ${parsed.toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })}`;
+}
+
+function renderApiUsage(payload) {
+  document.querySelector("#api-connected-count").textContent =
+    `${Number(payload.connected_count || 0)}/${Number(payload.integration_count || 0)}`;
+  document.querySelector("#api-usage-notice").textContent = payload.notice || "";
+  const grid = document.querySelector("#api-usage-grid");
+  grid.innerHTML = (payload.integrations || []).map((item) => {
+    const usage = item.usage || {};
+    const used = Number(usage.used || 0);
+    const limit = Number(usage.limit || 0);
+    const percent = limit ? Math.min(100, Math.max(0, Number(usage.percentage || 0))) : 0;
+    const usageText = limit
+      ? `${used.toLocaleString("ko-KR")} / ${limit.toLocaleString("ko-KR")}회`
+      : `${used.toLocaleString("ko-KR")}회 사용`;
+    const stateLabel = item.state_label || "상태 미확인";
+    const stateReason = item.state_reason || "상세 사유 없음";
+    return `
+      <article class="api-usage-card ${escapeHtml(item.state || "disconnected")}">
+        <header>
+          <div>
+            <strong>${escapeHtml(item.name)}</strong>
+            <small>${escapeHtml(item.description)}</small>
+          </div>
+          <span
+            class="api-state ${escapeHtml(item.state || "disconnected")}"
+            tabindex="0"
+            aria-label="${escapeHtml(`${stateLabel}: ${stateReason}`)}"
+            data-tooltip="${escapeHtml(stateReason)}"
+          >
+            <i aria-hidden="true"></i>${escapeHtml(stateLabel)}
+          </span>
+        </header>
+        <div class="api-usage-numbers">
+          <div>
+            <span>${escapeHtml(usage.period_label || "현재")} 무료 사용량</span>
+            <strong>${usageText}</strong>
+          </div>
+          <strong>${percent.toFixed(1)}%</strong>
+        </div>
+        <div
+          class="api-usage-track"
+          role="progressbar"
+          aria-label="${escapeHtml(item.name)} 무료 사용량"
+          aria-valuemin="0"
+          aria-valuemax="${limit}"
+          aria-valuenow="${used}"
+        ><i style="width:${percent}%"></i></div>
+        <footer>
+          <span>${escapeHtml(usage.scope || "서버 기록 기준")}</span>
+          <span>${escapeHtml(apiLastCallLabel(item.last_call))}</span>
+        </footer>
+      </article>
+    `;
+  }).join("") || '<p class="empty">표시할 API가 없습니다.</p>';
+}
+
+async function loadApiUsage() {
+  renderApiUsage(await fetchJson("/ops/api-usage"));
+}
+
 function renderStoredCollectionPlan(plan) {
   if (!plan) return;
   document.querySelector("#collection-plan-status").innerHTML = `
@@ -436,6 +503,10 @@ document.querySelector("#verify-pending")?.addEventListener("click", (event) => 
   }));
 });
 
-Promise.all([loadDashboard(), loadSources(), loadCurrentPlan()]).catch((error) => {
+Promise.all([loadDashboard(), loadSources(), loadApiUsage()]).catch((error) => {
   document.querySelector("#priority-chart").innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
+  const apiGrid = document.querySelector("#api-usage-grid");
+  if (apiGrid && !apiGrid.querySelector(".api-usage-card")) {
+    apiGrid.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
+  }
 });

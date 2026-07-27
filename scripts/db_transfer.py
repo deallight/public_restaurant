@@ -18,6 +18,7 @@ CORE_TABLES = [
     "restaurants",
     "restaurant_expense_links",
     "manual_review_tasks",
+    "user_saved_restaurants",
     "restaurant_reviews",
 ]
 
@@ -49,6 +50,17 @@ def table_columns(conn: Any, table: str, backend: str) -> list[str]:
             (table,),
         )
     ]
+
+
+def transfer_key_columns(table: str, columns: Iterable[str]) -> list[str]:
+    available = set(columns)
+    if "id" in available:
+        return ["id"]
+    if table == "user_saved_restaurants":
+        return ["user_id", "restaurant_id"]
+    if "restaurant_id" in available:
+        return ["restaurant_id"]
+    raise ValueError(f"no transfer key configured for {table}")
 
 
 def schema_diff(source: Database, target: Database) -> dict[str, dict[str, list[str]]]:
@@ -85,17 +97,24 @@ def transfer(
             target_columns = set(table_columns(target_conn, table, target.backend))
             source_columns = table_columns(source_conn, table, source.backend)
             columns = [column for column in source_columns if column in target_columns]
-            source_cursor = source_conn.execute(f"SELECT * FROM {table} ORDER BY id")
+            key_columns = transfer_key_columns(table, columns)
+            order_by = ", ".join(key_columns)
+            source_cursor = source_conn.execute(
+                f"SELECT * FROM {table} ORDER BY {order_by}"
+            )
             source_count = 0
             written = 0
             names = ", ".join(columns)
             placeholders = ", ".join("?" for _ in columns)
             updates = ", ".join(
-                f"{column} = excluded.{column}" for column in columns if column != "id"
+                f"{column} = excluded.{column}"
+                for column in columns
+                if column not in key_columns
             )
+            conflict_target = ", ".join(key_columns)
             sql = (
                 f"INSERT INTO {table} ({names}) VALUES ({placeholders}) "
-                f"ON CONFLICT(id) DO UPDATE SET {updates}"
+                f"ON CONFLICT({conflict_target}) DO UPDATE SET {updates}"
             )
             while True:
                 rows = source_cursor.fetchmany(safe_batch_size)
@@ -120,7 +139,7 @@ def transfer(
                                 "error_type": type(exc).__name__,
                             }
                         )
-            if apply and target.backend == "postgresql":
+            if apply and target.backend == "postgresql" and key_columns == ["id"]:
                 target_conn.execute(
                     f"""
                     SELECT setval(
@@ -144,7 +163,9 @@ def fingerprint(database: Database, tables: Iterable[str] = CORE_TABLES) -> dict
         for table in tables:
             digest = hashlib.sha256()
             count = 0
-            for row in conn.execute(f"SELECT * FROM {table} ORDER BY id"):
+            columns = table_columns(conn, table, database.backend)
+            order_by = ", ".join(transfer_key_columns(table, columns))
+            for row in conn.execute(f"SELECT * FROM {table} ORDER BY {order_by}"):
                 canonical = json.dumps(dict(row), ensure_ascii=False, sort_keys=True, default=str)
                 digest.update(canonical.encode("utf-8"))
                 digest.update(b"\n")
