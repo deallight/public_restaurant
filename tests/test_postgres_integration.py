@@ -128,11 +128,11 @@ class PostgresIntegrationTests(unittest.TestCase):
         app = PublicRestaurantApplication(settings)
         with app.database.session() as conn:
             admin_user = conn.execute(
-                "INSERT INTO users (display_name, role) VALUES (?, ?) RETURNING id",
+                "INSERT INTO users (display_name, role) VALUES (?, ?)",
                 ("PostgreSQL admin test user", "admin"),
-            ).fetchone()
+            )
         admin_headers = {
-            "Cookie": f"{SESSION_COOKIE}={app.issue_session(int(admin_user['id']))}"
+            "Cookie": f"{SESSION_COOKIE}={app.issue_session(int(admin_user.lastrowid))}"
         }
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
