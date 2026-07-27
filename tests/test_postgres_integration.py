@@ -49,6 +49,10 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(service.search("광안리")[0]["name"], "광안리커피")
         detail = service.get_restaurant(int(restaurants[0]["id"]))
         self.assertIn("reviews", detail)
+        self.assertIn("visits", detail)
+        self.assertIn("ai_summary", detail)
+        self.assertEqual(detail["ai_summary"]["next_summary_review_count"], 5)
+        self.assertNotIn("department_name", detail["visits"][0])
         review = service.add_review(
             int(restaurants[0]["id"]), 5, "통합 테스트 리뷰", "테스터", RequestContext(ip="127.0.0.2")
         )

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import re
+import secrets
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import quote
 
 from .alias_memory import remember_aliases
@@ -102,17 +106,43 @@ def naver_map_url(query: str, appname: str = "public_restaurant") -> str:
 
 
 class RestaurantService:
+    AI_SUMMARY_INITIAL_REVIEW_COUNT = 5
+    AI_SUMMARY_REVIEW_INCREMENT = 10
+    AI_SUMMARY_COOLDOWN_SECONDS = 60 * 60
+    AI_SUMMARY_MAX_SOURCE_REVIEWS = 100
+    ADMIN_IMAGE_LIMIT = 4
+    ADMIN_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
     def __init__(
         self,
         database: Database,
         review_rate_limit_per_hour: int = 3,
         geocoding_client: Any | None = None,
         naver_client: Any | None = None,
+        ai_summary_client: Any | None = None,
+        restaurant_image_client: Any | None = None,
+        restaurant_image_upload_dir: str | Path | None = None,
+        ai_summary_now: Callable[[], datetime] | None = None,
+        ai_summary_cooldown_seconds: int = AI_SUMMARY_COOLDOWN_SECONDS,
     ):
         self.database = database
         self.review_rate_limit_per_hour = review_rate_limit_per_hour
         self.geocoding_client = geocoding_client
         self.naver_client = naver_client
+        self.ai_summary_client = ai_summary_client
+        self.restaurant_image_client = restaurant_image_client
+        if restaurant_image_upload_dir is None:
+            if database.path is not None:
+                restaurant_image_upload_dir = database.path.parent / "restaurant_images"
+            else:
+                restaurant_image_upload_dir = Path.cwd() / "var" / "restaurant_images"
+        self.restaurant_image_upload_dir = Path(restaurant_image_upload_dir).resolve()
+        self.ai_summary_now = ai_summary_now or (lambda: datetime.now(timezone.utc))
+        self.ai_summary_cooldown_seconds = max(
+            self.AI_SUMMARY_COOLDOWN_SECONDS,
+            int(ai_summary_cooldown_seconds),
+        )
+        self._ai_summary_lock = threading.Lock()
 
     def _add_effective_candidate_values(self, payload: dict[str, Any]) -> None:
         payload["effective_place_name"] = candidate_effective_place_name(payload)
@@ -129,6 +159,8 @@ class RestaurantService:
         search_mode: str = "",
         region: str = "",
         bounds: str = "",
+        user_id: int | None = None,
+        saved_only: bool | str = False,
     ) -> list[dict[str, Any]]:
         try:
             min_visit_count_value = int(min_visit_count or 0)
@@ -138,6 +170,20 @@ class RestaurantService:
             raise AppError(400, "visit count filter must use units of 10")
         clauses = ["r.map_exposure_status = 'visible'", "r.verification_status = 'success'"]
         params: list[Any] = []
+        saved_only_value = str(saved_only).strip().lower() in {"1", "true", "yes", "on"}
+        if saved_only_value:
+            if user_id is None:
+                raise AppError(401, "login required")
+            clauses.append(
+                """
+                EXISTS (
+                  SELECT 1
+                  FROM user_saved_restaurants saved
+                  WHERE saved.user_id = ? AND saved.restaurant_id = r.id
+                )
+                """
+            )
+            params.append(user_id)
         if q:
             normalized = f"%{normalize_text(q)}%"
             if search_mode == "address":
@@ -210,26 +256,49 @@ class RestaurantService:
         with self.database.session() as conn:
             return [self._restaurant_payload(dict(row)) for row in conn.execute(sql, params)]
 
-    def get_restaurant(self, restaurant_id: int) -> dict[str, Any]:
+    def get_restaurant(self, restaurant_id: int, user_id: int | None = None) -> dict[str, Any]:
+        try:
+            self.maybe_refresh_ai_summary(restaurant_id)
+        except Exception:
+            # The detail and review features must remain available if an
+            # optional AI provider or its cache cannot be refreshed.
+            pass
         with self.database.session() as conn:
             row = conn.execute(
                 """
+                WITH expense_stats AS (
+                  SELECT
+                    restaurant_id,
+                    COUNT(*) AS visit_count,
+                    COALESCE(SUM(amount), 0) AS total_amount
+                  FROM restaurant_expense_links
+                  WHERE restaurant_id = ?
+                  GROUP BY restaurant_id
+                ),
+                review_stats AS (
+                  SELECT
+                    restaurant_id,
+                    COALESCE(AVG(rating), 0) AS average_rating,
+                    COUNT(*) AS review_count
+                  FROM restaurant_reviews
+                  WHERE restaurant_id = ? AND status = 'visible'
+                  GROUP BY restaurant_id
+                )
                 SELECT
                   r.*,
                   rg.sido,
                   rg.sigungu,
-                  COUNT(rel.id) AS visit_count,
-                  COALESCE(SUM(rel.amount), 0) AS total_amount,
-                  COALESCE(AVG(CASE WHEN rv.status = 'visible' THEN rv.rating END), 0) AS average_rating,
-                  COUNT(CASE WHEN rv.status = 'visible' THEN rv.id END) AS review_count
+                  COALESCE(es.visit_count, 0) AS visit_count,
+                  COALESCE(es.total_amount, 0) AS total_amount,
+                  COALESCE(rs.average_rating, 0) AS average_rating,
+                  COALESCE(rs.review_count, 0) AS review_count
                 FROM restaurants r
                 LEFT JOIN regions rg ON rg.id = r.region_id
-                LEFT JOIN restaurant_expense_links rel ON rel.restaurant_id = r.id
-                LEFT JOIN restaurant_reviews rv ON rv.restaurant_id = r.id
+                LEFT JOIN expense_stats es ON es.restaurant_id = r.id
+                LEFT JOIN review_stats rs ON rs.restaurant_id = r.id
                 WHERE r.id = ?
-                GROUP BY r.id, rg.id
                 """,
-                (restaurant_id,),
+                (restaurant_id, restaurant_id, restaurant_id),
             ).fetchone()
             if row is None:
                 raise AppError(404, "restaurant not found")
@@ -246,9 +315,693 @@ class RestaurantService:
                     (restaurant_id,),
                 )
             ]
+            visible_review_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM restaurant_reviews
+                    WHERE restaurant_id = ? AND status = 'visible'
+                    """,
+                    (restaurant_id,),
+                ).fetchone()["c"]
+            )
+            visits = [
+                dict(visit)
+                for visit in conn.execute(
+                    """
+                    SELECT
+                      COALESCE(
+                        NULLIF(TRIM(er.used_at), ''),
+                        NULLIF(TRIM(rel.used_date), ''),
+                        NULLIF(TRIM(er.used_date), '')
+                      ) AS visited_at,
+                      i.name AS institution_name,
+                      er.purpose
+                    FROM restaurant_expense_links rel
+                    JOIN expense_records er ON er.id = rel.expense_record_id
+                    JOIN institutions i ON i.id = er.institution_id
+                    WHERE rel.restaurant_id = ?
+                    ORDER BY visited_at DESC, rel.id DESC
+                    """,
+                    (restaurant_id,),
+                )
+            ]
+            ai_summary = conn.execute(
+                """
+                SELECT summary_text, summarized_review_count, status,
+                       last_generated_at, last_attempted_at
+                FROM restaurant_ai_summaries
+                WHERE restaurant_id = ?
+                """,
+                (restaurant_id,),
+            ).fetchone()
             payload = self._restaurant_payload(dict(row))
+            payload["review_count"] = visible_review_count
             payload["reviews"] = reviews
-            return payload
+            payload["visits"] = visits
+            payload["ai_summary"] = self._ai_summary_payload(
+                row_to_dict(ai_summary),
+                visible_review_count,
+            )
+            payload["is_saved"] = bool(
+                user_id is not None
+                and conn.execute(
+                    """
+                    SELECT 1
+                    FROM user_saved_restaurants
+                    WHERE user_id = ? AND restaurant_id = ?
+                    """,
+                    (user_id, restaurant_id),
+                ).fetchone()
+            )
+        restaurant_images = self._restaurant_images_payload(payload)
+        payload["restaurant_images"] = restaurant_images
+        payload["restaurant_image"] = restaurant_images[0] if restaurant_images else None
+        return payload
+
+    def _restaurant_images_payload(self, restaurant: dict[str, Any]) -> list[dict[str, Any]]:
+        restaurant_id = int(restaurant.get("id") or 0)
+        name = str(restaurant.get("name") or "")
+        payloads = self._admin_restaurant_images_payload(restaurant_id, name)
+        if len(payloads) >= self.ADMIN_IMAGE_LIMIT or self.restaurant_image_client is None:
+            return payloads[: self.ADMIN_IMAGE_LIMIT]
+        started = time.perf_counter()
+        request_hash = stable_hash("naver_image_search", restaurant_id, name)
+        try:
+            address = str(restaurant.get("road_address") or restaurant.get("address") or "")
+            search_many = getattr(
+                self.restaurant_image_client,
+                "search_restaurant_images",
+                None,
+            )
+            if callable(search_many):
+                images = search_many(
+                    name,
+                    address,
+                    limit=self.ADMIN_IMAGE_LIMIT - len(payloads),
+                )
+            else:
+                single_image = self.restaurant_image_client.search_restaurant_image(name, address)
+                images = [single_image] if single_image else []
+            self._record_api_call(
+                provider="naver_image_search",
+                endpoint="restaurant_image_search",
+                request_hash=request_hash,
+                success=True,
+                status_code=200,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except Exception as exc:
+            self._record_api_call(
+                provider="naver_image_search",
+                endpoint="restaurant_image_search",
+                request_hash=request_hash,
+                success=False,
+                status_code=None,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error_message=str(exc)[:500],
+            )
+            # An optional external image must never prevent restaurant details
+            # and reviews from loading.
+            return payloads
+        if not isinstance(images, list):
+            return payloads
+        known_urls = {str(item.get("source_url") or "") for item in payloads}
+        for image in images:
+            if len(payloads) >= self.ADMIN_IMAGE_LIMIT:
+                break
+            if not isinstance(image, dict):
+                continue
+            thumbnail_url = str(image.get("thumbnail_url") or "").strip()
+            source_url = str(image.get("source_url") or "").strip()
+            if not thumbnail_url or not source_url or source_url in known_urls:
+                continue
+            known_urls.add(source_url)
+            payloads.append(
+                {
+                    "thumbnail_url": thumbnail_url,
+                    "source_url": source_url,
+                    "title": str(
+                        image.get("title") or restaurant.get("name") or ""
+                    ).strip(),
+                    "provider": "naver_image_search",
+                    "provider_label": "네이버 이미지 검색",
+                    "is_naver_place_image": bool(image.get("is_naver_place_image")),
+                    "is_admin_image": False,
+                }
+            )
+        return payloads
+
+    def _admin_restaurant_images_payload(
+        self,
+        restaurant_id: int,
+        restaurant_name: str,
+    ) -> list[dict[str, Any]]:
+        if restaurant_id <= 0:
+            return []
+        with self.database.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, storage_key, original_filename, content_type,
+                       alt_text, sort_order, created_at, updated_at
+                FROM restaurant_admin_images
+                WHERE restaurant_id = ?
+                ORDER BY sort_order ASC, id ASC
+                LIMIT ?
+                """,
+                (restaurant_id, self.ADMIN_IMAGE_LIMIT),
+            ).fetchall()
+        return [self._admin_image_payload(dict(row), restaurant_name) for row in rows]
+
+    def _admin_image_payload(
+        self,
+        image: dict[str, Any],
+        restaurant_name: str,
+    ) -> dict[str, Any]:
+        storage_key = str(image.get("storage_key") or "")
+        media_url = f"/media/restaurant-images/{quote(storage_key, safe='/')}"
+        return {
+            "id": int(image["id"]),
+            "thumbnail_url": media_url,
+            "source_url": media_url,
+            "title": str(image.get("alt_text") or restaurant_name or "음식점 사진"),
+            "alt_text": str(image.get("alt_text") or ""),
+            "original_filename": str(image.get("original_filename") or ""),
+            "content_type": str(image.get("content_type") or ""),
+            "sort_order": int(image.get("sort_order") or 0),
+            "provider": "admin_upload",
+            "provider_label": "관리자 등록",
+            "is_naver_place_image": False,
+            "is_admin_image": True,
+            "created_at": image.get("created_at"),
+            "updated_at": image.get("updated_at"),
+        }
+
+    def admin_restaurants_for_images(
+        self,
+        q: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(int(limit), 100))
+        clauses = ["1 = 1"]
+        params: list[Any] = []
+        search_text = str(q or "").strip()
+        if search_text:
+            clauses.append(
+                """
+                (
+                  r.canonical_name LIKE ?
+                  OR r.address LIKE ?
+                  OR COALESCE(r.road_address, '') LIKE ?
+                  OR r.normalized_name LIKE ?
+                )
+                """
+            )
+            wildcard = f"%{search_text}%"
+            params.extend([wildcard, wildcard, wildcard, f"%{normalize_text(search_text)}%"])
+        params.append(safe_limit)
+        with self.database.session() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                  r.id,
+                  r.canonical_name AS name,
+                  r.address,
+                  r.road_address,
+                  r.map_exposure_status,
+                  COUNT(rai.id) AS admin_image_count
+                FROM restaurants r
+                LEFT JOIN restaurant_admin_images rai ON rai.restaurant_id = r.id
+                WHERE {' AND '.join(clauses)}
+                GROUP BY r.id, r.canonical_name, r.address, r.road_address,
+                         r.map_exposure_status
+                ORDER BY admin_image_count DESC, r.canonical_name ASC, r.id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        restaurants = []
+        for row in rows:
+            item = dict(row)
+            query = naver_map_query(
+                str(item["name"]),
+                str(item.get("road_address") or item.get("address") or ""),
+            )
+            item["admin_image_count"] = int(item.get("admin_image_count") or 0)
+            item["naver_map_url"] = naver_map_url(query)
+            restaurants.append(item)
+        return {"restaurants": restaurants, "limit": safe_limit, "q": search_text}
+
+    def admin_restaurant_images(self, restaurant_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            restaurant = conn.execute(
+                """
+                SELECT id, canonical_name AS name, address, road_address,
+                       map_exposure_status
+                FROM restaurants
+                WHERE id = ?
+                """,
+                (restaurant_id,),
+            ).fetchone()
+        if restaurant is None:
+            raise AppError(404, "restaurant not found")
+        payload = dict(restaurant)
+        payload["images"] = self._admin_restaurant_images_payload(
+            restaurant_id,
+            str(payload["name"]),
+        )
+        payload["image_limit"] = self.ADMIN_IMAGE_LIMIT
+        payload["naver_map_url"] = naver_map_url(
+            naver_map_query(
+                str(payload["name"]),
+                str(payload.get("road_address") or payload.get("address") or ""),
+            )
+        )
+        return payload
+
+    def save_admin_restaurant_image(
+        self,
+        restaurant_id: int,
+        filename: str,
+        image_bytes: bytes,
+        context: RequestContext,
+        alt_text: str = "",
+        sort_order: int | None = None,
+        image_id: int | None = None,
+    ) -> dict[str, Any]:
+        content_type, extension = self._validated_admin_image(image_bytes)
+        safe_alt_text = self._validated_admin_image_alt_text(alt_text)
+        original_filename = Path(str(filename or "image")).name[:255] or f"image.{extension}"
+        previous_storage_key = ""
+        with self.database.session() as conn:
+            restaurant = conn.execute(
+                "SELECT id, canonical_name FROM restaurants WHERE id = ?",
+                (restaurant_id,),
+            ).fetchone()
+            if restaurant is None:
+                raise AppError(404, "restaurant not found")
+            existing = None
+            if image_id is not None:
+                existing = conn.execute(
+                    """
+                    SELECT id, storage_key, sort_order
+                    FROM restaurant_admin_images
+                    WHERE id = ? AND restaurant_id = ?
+                    """,
+                    (image_id, restaurant_id),
+                ).fetchone()
+                if existing is None:
+                    raise AppError(404, "restaurant image not found")
+                previous_storage_key = str(existing["storage_key"])
+            else:
+                count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS c FROM restaurant_admin_images WHERE restaurant_id = ?",
+                        (restaurant_id,),
+                    ).fetchone()["c"]
+                )
+                if count >= self.ADMIN_IMAGE_LIMIT:
+                    raise AppError(409, f"restaurant images are limited to {self.ADMIN_IMAGE_LIMIT}")
+            if sort_order is None:
+                if existing is not None:
+                    resolved_sort_order = int(existing["sort_order"])
+                else:
+                    resolved_sort_order = int(
+                        conn.execute(
+                            """
+                            SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order
+                            FROM restaurant_admin_images
+                            WHERE restaurant_id = ?
+                            """,
+                            (restaurant_id,),
+                        ).fetchone()["next_order"]
+                    )
+            else:
+                resolved_sort_order = max(0, min(int(sort_order), 999))
+
+        storage_key = f"restaurant-{restaurant_id}/{secrets.token_hex(16)}.{extension}"
+        target_path = self._admin_image_file_path(storage_key)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = target_path.with_suffix(f"{target_path.suffix}.upload")
+        temporary_path.write_bytes(image_bytes)
+        temporary_path.replace(target_path)
+        now = utc_now()
+        try:
+            with self.database.session() as conn:
+                if image_id is None:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO restaurant_admin_images
+                          (restaurant_id, storage_key, original_filename, content_type,
+                           alt_text, sort_order, created_by, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            restaurant_id,
+                            storage_key,
+                            original_filename,
+                            content_type,
+                            safe_alt_text,
+                            resolved_sort_order,
+                            context.actor_id,
+                            now,
+                            now,
+                        ),
+                    )
+                    saved_image_id = int(cursor.lastrowid)
+                else:
+                    conn.execute(
+                        """
+                        UPDATE restaurant_admin_images
+                        SET storage_key = ?, original_filename = ?, content_type = ?,
+                            alt_text = ?, sort_order = ?, updated_at = ?
+                        WHERE id = ? AND restaurant_id = ?
+                        """,
+                        (
+                            storage_key,
+                            original_filename,
+                            content_type,
+                            safe_alt_text,
+                            resolved_sort_order,
+                            now,
+                            image_id,
+                            restaurant_id,
+                        ),
+                    )
+                    saved_image_id = image_id
+        except Exception:
+            target_path.unlink(missing_ok=True)
+            raise
+        if previous_storage_key and previous_storage_key != storage_key:
+            self._admin_image_file_path(previous_storage_key).unlink(missing_ok=True)
+        return self.admin_restaurant_images(restaurant_id)
+
+    def update_admin_restaurant_image(
+        self,
+        restaurant_id: int,
+        image_id: int,
+        alt_text: str,
+        sort_order: int,
+    ) -> dict[str, Any]:
+        safe_alt_text = self._validated_admin_image_alt_text(alt_text)
+        safe_sort_order = max(0, min(int(sort_order), 999))
+        with self.database.session() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM restaurant_admin_images
+                WHERE id = ? AND restaurant_id = ?
+                """,
+                (image_id, restaurant_id),
+            ).fetchone()
+            if existing is None:
+                raise AppError(404, "restaurant image not found")
+            conn.execute(
+                """
+                UPDATE restaurant_admin_images
+                SET alt_text = ?, sort_order = ?, updated_at = ?
+                WHERE id = ? AND restaurant_id = ?
+                """,
+                (safe_alt_text, safe_sort_order, utc_now(), image_id, restaurant_id),
+            )
+        return self.admin_restaurant_images(restaurant_id)
+
+    def delete_admin_restaurant_image(
+        self,
+        restaurant_id: int,
+        image_id: int,
+    ) -> dict[str, Any]:
+        with self.database.session() as conn:
+            image = conn.execute(
+                """
+                SELECT storage_key FROM restaurant_admin_images
+                WHERE id = ? AND restaurant_id = ?
+                """,
+                (image_id, restaurant_id),
+            ).fetchone()
+            if image is None:
+                raise AppError(404, "restaurant image not found")
+            conn.execute(
+                "DELETE FROM restaurant_admin_images WHERE id = ? AND restaurant_id = ?",
+                (image_id, restaurant_id),
+            )
+        self._admin_image_file_path(str(image["storage_key"])).unlink(missing_ok=True)
+        return self.admin_restaurant_images(restaurant_id)
+
+    def _admin_image_file_path(self, storage_key: str) -> Path:
+        root = self.restaurant_image_upload_dir
+        path = (root / storage_key).resolve()
+        if root != path and root not in path.parents:
+            raise AppError(400, "invalid restaurant image path")
+        return path
+
+    def _validated_admin_image_alt_text(self, value: str) -> str:
+        alt_text = str(value or "").strip()
+        if len(alt_text) > 120:
+            raise AppError(400, "image description must be 120 characters or fewer")
+        return alt_text
+
+    def _validated_admin_image(self, image_bytes: bytes) -> tuple[str, str]:
+        if not image_bytes:
+            raise AppError(400, "image file is empty")
+        if len(image_bytes) > self.ADMIN_IMAGE_MAX_BYTES:
+            raise AppError(413, "image file must be 8 MB or smaller")
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png", "png"
+        if image_bytes.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg", "jpg"
+        if (
+            len(image_bytes) >= 12
+            and image_bytes[:4] == b"RIFF"
+            and image_bytes[8:12] == b"WEBP"
+        ):
+            return "image/webp", "webp"
+        raise AppError(400, "only PNG, JPEG, and WebP images are supported")
+
+    def maybe_refresh_ai_summary(self, restaurant_id: int) -> dict[str, Any]:
+        if self.ai_summary_client is None:
+            return {"status": "skipped", "reason": "not_configured"}
+        with self._ai_summary_lock:
+            now = self._ai_summary_current_time()
+            with self.database.session() as conn:
+                restaurant = conn.execute(
+                    "SELECT canonical_name FROM restaurants WHERE id = ?",
+                    (restaurant_id,),
+                ).fetchone()
+                if restaurant is None:
+                    return {"status": "skipped", "reason": "restaurant_missing"}
+                review_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM restaurant_reviews
+                        WHERE restaurant_id = ? AND status = 'visible'
+                        """,
+                        (restaurant_id,),
+                    ).fetchone()["c"]
+                )
+                cached = conn.execute(
+                    """
+                    SELECT summary_text, summarized_review_count,
+                           last_generated_at, last_attempted_at
+                    FROM restaurant_ai_summaries
+                    WHERE restaurant_id = ?
+                    """,
+                    (restaurant_id,),
+                ).fetchone()
+                if not self._ai_summary_is_due(row_to_dict(cached), review_count, now):
+                    return {"status": "skipped", "reason": "threshold_or_cooldown"}
+                reviews = [
+                    dict(review)
+                    for review in conn.execute(
+                        """
+                        SELECT rating, body
+                        FROM restaurant_reviews
+                        WHERE restaurant_id = ? AND status = 'visible'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (restaurant_id, self.AI_SUMMARY_MAX_SOURCE_REVIEWS),
+                    )
+                ]
+                attempted_at = now.isoformat(timespec="seconds")
+                provider = str(getattr(self.ai_summary_client, "provider", "ai"))
+                model = str(getattr(self.ai_summary_client, "model", ""))
+                conn.execute(
+                    """
+                    INSERT INTO restaurant_ai_summaries
+                      (restaurant_id, status, provider, model,
+                       last_attempted_at, updated_at)
+                    VALUES (?, 'pending', ?, ?, ?, ?)
+                    ON CONFLICT(restaurant_id) DO UPDATE SET
+                      status = 'pending',
+                      provider = excluded.provider,
+                      model = excluded.model,
+                      last_attempted_at = excluded.last_attempted_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (restaurant_id, provider, model, attempted_at, attempted_at),
+                )
+                restaurant_name = str(restaurant["canonical_name"])
+            started = time.perf_counter()
+            request_hash = stable_hash("groq", restaurant_id, review_count, attempted_at)
+            try:
+                summary_text = str(
+                    self.ai_summary_client.summarize(restaurant_name, reviews)
+                ).strip()
+                if not summary_text:
+                    raise IntegrationError("AI summary was empty")
+                self._record_api_call(
+                    provider="groq",
+                    endpoint="review_summary",
+                    request_hash=request_hash,
+                    success=True,
+                    status_code=200,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                )
+            except Exception as exc:
+                self._record_api_call(
+                    provider="groq",
+                    endpoint="review_summary",
+                    request_hash=request_hash,
+                    success=False,
+                    status_code=None,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error_message=str(exc)[:500],
+                )
+                with self.database.session() as conn:
+                    conn.execute(
+                        """
+                        UPDATE restaurant_ai_summaries
+                        SET status = 'error', updated_at = ?
+                        WHERE restaurant_id = ?
+                        """,
+                        (attempted_at, restaurant_id),
+                    )
+                return {"status": "error", "review_count": review_count}
+            generated_at = self._ai_summary_current_time().isoformat(timespec="seconds")
+            with self.database.session() as conn:
+                conn.execute(
+                    """
+                    UPDATE restaurant_ai_summaries
+                    SET summary_text = ?,
+                        summarized_review_count = ?,
+                        status = 'ready',
+                        last_generated_at = ?,
+                        updated_at = ?
+                    WHERE restaurant_id = ?
+                    """,
+                    (
+                        summary_text[:600],
+                        review_count,
+                        generated_at,
+                        generated_at,
+                        restaurant_id,
+                    ),
+                )
+            return {
+                "status": "ready",
+                "review_count": review_count,
+                "summary_text": summary_text[:600],
+            }
+
+    def _record_api_call(
+        self,
+        provider: str,
+        endpoint: str,
+        request_hash: str,
+        success: bool,
+        status_code: int | None,
+        duration_ms: int,
+        error_message: str | None = None,
+    ) -> None:
+        with self.database.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_call_logs
+                  (provider, endpoint, request_hash, status_code, duration_ms, success, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider,
+                    endpoint,
+                    request_hash,
+                    status_code,
+                    max(0, duration_ms),
+                    1 if success else 0,
+                    error_message,
+                ),
+            )
+
+    def _ai_summary_current_time(self) -> datetime:
+        value = self.ai_summary_now()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _ai_summary_is_due(
+        self,
+        cached: dict[str, Any] | None,
+        review_count: int,
+        now: datetime,
+    ) -> bool:
+        summarized_count = int((cached or {}).get("summarized_review_count") or 0)
+        summary_text = str((cached or {}).get("summary_text") or "").strip()
+        required_count = (
+            self.AI_SUMMARY_INITIAL_REVIEW_COUNT
+            if not summary_text or summarized_count <= 0
+            else summarized_count + self.AI_SUMMARY_REVIEW_INCREMENT
+        )
+        if review_count < required_count:
+            return False
+        cooldown_starts = [
+            timestamp
+            for timestamp in (
+                self._parse_ai_summary_timestamp((cached or {}).get("last_attempted_at")),
+                self._parse_ai_summary_timestamp((cached or {}).get("last_generated_at")),
+            )
+            if timestamp is not None
+        ]
+        if not cooldown_starts:
+            return True
+        return now >= max(cooldown_starts) + timedelta(
+            seconds=self.ai_summary_cooldown_seconds
+        )
+
+    def _ai_summary_payload(
+        self,
+        cached: dict[str, Any] | None,
+        current_review_count: int,
+    ) -> dict[str, Any]:
+        summary_text = str((cached or {}).get("summary_text") or "").strip()
+        summarized_count = int((cached or {}).get("summarized_review_count") or 0)
+        next_review_count = (
+            self.AI_SUMMARY_INITIAL_REVIEW_COUNT
+            if not summary_text or summarized_count <= 0
+            else summarized_count + self.AI_SUMMARY_REVIEW_INCREMENT
+        )
+        return {
+            "text": summary_text,
+            "status": "ready" if summary_text else "waiting",
+            "summarized_review_count": summarized_count,
+            "current_review_count": current_review_count,
+            "next_summary_review_count": next_review_count,
+            "refresh_pending": bool(
+                summary_text and current_review_count >= next_review_count
+            ),
+            "last_generated_at": (cached or {}).get("last_generated_at"),
+        }
+
+    def _parse_ai_summary_timestamp(self, value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def rankings(self, category: str = "", region: str = "", period: str = "all") -> list[dict[str, Any]]:
         clauses = ["r.map_exposure_status = 'visible'", "r.verification_status = 'success'"]
@@ -356,7 +1109,11 @@ class RestaurantService:
                 after=review,
                 reason_codes=["USER_REVIEW"],
             )
-            return review
+        try:
+            self.maybe_refresh_ai_summary(restaurant_id)
+        except Exception:
+            pass
+        return review
 
     def report_review(
         self,
@@ -388,6 +1145,139 @@ class RestaurantService:
                 reason_codes=["REVIEW_REPORT"],
             )
             return report
+
+    def save_restaurant(self, user_id: int, restaurant_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            if conn.execute(
+                "SELECT id FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone() is None:
+                raise AppError(401, "login required")
+            if conn.execute(
+                "SELECT id FROM restaurants WHERE id = ?",
+                (restaurant_id,),
+            ).fetchone() is None:
+                raise AppError(404, "restaurant not found")
+            conn.execute(
+                """
+                INSERT INTO user_saved_restaurants (user_id, restaurant_id)
+                VALUES (?, ?)
+                ON CONFLICT(user_id, restaurant_id) DO NOTHING
+                """,
+                (user_id, restaurant_id),
+            )
+        return {"restaurant_id": restaurant_id, "is_saved": True}
+
+    def unsave_restaurant(self, user_id: int, restaurant_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            conn.execute(
+                """
+                DELETE FROM user_saved_restaurants
+                WHERE user_id = ? AND restaurant_id = ?
+                """,
+                (user_id, restaurant_id),
+            )
+        return {"restaurant_id": restaurant_id, "is_saved": False}
+
+    def delete_own_review(self, user_id: int, review_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            review = conn.execute(
+                "SELECT * FROM restaurant_reviews WHERE id = ? AND user_id = ?",
+                (review_id, user_id),
+            ).fetchone()
+            if review is None:
+                raise AppError(404, "review not found")
+            conn.execute(
+                """
+                UPDATE restaurant_reviews
+                SET status = 'deleted', updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (utc_now(), review_id, user_id),
+            )
+            self._audit(
+                conn,
+                "user",
+                "review_delete",
+                "restaurant_review",
+                review_id,
+                before=dict(review),
+                after={"status": "deleted"},
+                reason_codes=["USER_REVIEW_DELETE"],
+            )
+        return {"review_id": review_id, "status": "deleted"}
+
+    def my_page(self, user_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            user = conn.execute(
+                """
+                SELECT id, display_name, role, status
+                FROM users
+                WHERE id = ? AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                raise AppError(401, "login required")
+            reviews = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT rv.id, rv.restaurant_id, rv.rating, rv.body, rv.status,
+                           rv.created_at, rv.updated_at, r.canonical_name AS restaurant_name,
+                           COALESCE(NULLIF(r.road_address, ''), r.address) AS address
+                    FROM restaurant_reviews rv
+                    JOIN restaurants r ON r.id = rv.restaurant_id
+                    WHERE rv.user_id = ? AND rv.status <> 'deleted'
+                    ORDER BY rv.created_at DESC, rv.id DESC
+                    """,
+                    (user_id,),
+                )
+            ]
+            saved_restaurants = [
+                self._restaurant_payload(dict(row)) | {"saved_at": row["saved_at"]}
+                for row in conn.execute(
+                    """
+                    WITH expense_stats AS (
+                      SELECT restaurant_id, COUNT(*) AS visit_count,
+                             COALESCE(SUM(amount), 0) AS total_amount
+                      FROM restaurant_expense_links
+                      GROUP BY restaurant_id
+                    ),
+                    review_stats AS (
+                      SELECT restaurant_id, COALESCE(AVG(rating), 0) AS average_rating,
+                             COUNT(*) AS review_count
+                      FROM restaurant_reviews
+                      WHERE status = 'visible'
+                      GROUP BY restaurant_id
+                    )
+                    SELECT r.id, r.canonical_name AS name, r.major_category,
+                           r.address, r.road_address, r.longitude, r.latitude,
+                           rg.sido, rg.sigungu, s.created_at AS saved_at,
+                           COALESCE(es.visit_count, 0) AS visit_count,
+                           COALESCE(es.total_amount, 0) AS total_amount,
+                           COALESCE(rs.average_rating, 0) AS average_rating,
+                           COALESCE(rs.review_count, 0) AS review_count
+                    FROM user_saved_restaurants s
+                    JOIN restaurants r ON r.id = s.restaurant_id
+                    LEFT JOIN regions rg ON rg.id = r.region_id
+                    LEFT JOIN expense_stats es ON es.restaurant_id = r.id
+                    LEFT JOIN review_stats rs ON rs.restaurant_id = r.id
+                    WHERE s.user_id = ?
+                    ORDER BY s.created_at DESC, r.id DESC
+                    """,
+                    (user_id,),
+                )
+            ]
+        return {
+            "user": dict(user),
+            "reviews": reviews,
+            "saved_restaurants": saved_restaurants,
+            "counts": {
+                "reviews": len(reviews),
+                "saved_restaurants": len(saved_restaurants),
+            },
+        }
 
     def admin_review_queue(self, limit: int = 50) -> list[dict[str, Any]]:
         capped_limit = max(1, min(limit, 100))
@@ -1887,26 +2777,127 @@ class RestaurantService:
             "latest_batches": latest_batches,
         }
 
+    def api_usage_metrics(self, day: str, month: str) -> dict[str, dict[str, Any]]:
+        """Return application-recorded API work counts for the admin dashboard."""
+        with self.database.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  provider,
+                  SUM(CASE WHEN SUBSTR(called_at, 1, 10) = ? THEN 1 ELSE 0 END) AS day_count,
+                  SUM(CASE WHEN SUBSTR(called_at, 1, 7) = ? THEN 1 ELSE 0 END) AS month_count,
+                  MAX(called_at) AS last_called_at
+                FROM api_call_logs
+                GROUP BY provider
+                """,
+                (day, month),
+            ).fetchall()
+            latest_rows = conn.execute(
+                """
+                SELECT provider, success, status_code, error_message, called_at
+                FROM api_call_logs
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            ai_attempts = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN SUBSTR(last_attempted_at, 1, 10) = ? THEN 1 ELSE 0 END) AS day_count,
+                  SUM(CASE WHEN SUBSTR(last_attempted_at, 1, 7) = ? THEN 1 ELSE 0 END) AS month_count,
+                  MAX(last_attempted_at) AS last_called_at
+                FROM restaurant_ai_summaries
+                WHERE provider = 'groq' AND last_attempted_at IS NOT NULL
+                """,
+                (day, month),
+            ).fetchone()
+
+        metrics = {
+            str(row["provider"]): {
+                "day_count": int(row["day_count"] or 0),
+                "month_count": int(row["month_count"] or 0),
+                "last_called_at": row["last_called_at"],
+                "last_success": None,
+                "last_status_code": None,
+                "last_error": None,
+            }
+            for row in rows
+        }
+        for row in latest_rows:
+            provider = str(row["provider"])
+            metric = metrics.setdefault(
+                provider,
+                {
+                    "day_count": 0,
+                    "month_count": 0,
+                    "last_called_at": row["called_at"],
+                    "last_success": None,
+                    "last_status_code": None,
+                    "last_error": None,
+                },
+            )
+            if metric["last_success"] is None:
+                metric["last_success"] = bool(row["success"])
+                metric["last_status_code"] = row["status_code"]
+                metric["last_error"] = row["error_message"]
+
+        groq_attempts = {
+            "day_count": int(ai_attempts["day_count"] or 0),
+            "month_count": int(ai_attempts["month_count"] or 0),
+            "last_called_at": ai_attempts["last_called_at"],
+        }
+        if groq_attempts["last_called_at"]:
+            groq_metric = metrics.setdefault(
+                "groq",
+                {
+                    "day_count": 0,
+                    "month_count": 0,
+                    "last_called_at": None,
+                    "last_success": None,
+                    "last_status_code": None,
+                    "last_error": None,
+                },
+            )
+            # Existing AI cache rows predate api_call_logs. max() avoids double
+            # counting new calls that are represented in both places.
+            groq_metric["day_count"] = max(groq_metric["day_count"], groq_attempts["day_count"])
+            groq_metric["month_count"] = max(groq_metric["month_count"], groq_attempts["month_count"])
+            groq_metric["last_called_at"] = max(
+                str(groq_metric["last_called_at"] or ""),
+                str(groq_attempts["last_called_at"] or ""),
+            ) or None
+        return metrics
+
     def upsert_oauth_account(self, provider: str, provider_subject: str, display_name: str) -> dict[str, Any]:
         if provider not in {"google", "naver"}:
             raise AppError(400, "unsupported provider")
         if not provider_subject:
             raise AppError(400, "provider subject is required")
+        normalized_display_name = display_name.strip()[:40] or f"{provider} 사용자"
         with self.database.session() as conn:
             account = conn.execute(
                 "SELECT * FROM oauth_accounts WHERE provider = ? AND provider_subject = ?",
                 (provider, provider_subject),
             ).fetchone()
             if account:
+                now = utc_now()
                 conn.execute(
-                    "UPDATE oauth_accounts SET last_login_at = ? WHERE id = ?",
-                    (utc_now(), account["id"]),
+                    "UPDATE oauth_accounts SET display_name = ?, last_login_at = ? WHERE id = ?",
+                    (normalized_display_name, now, account["id"]),
+                )
+                conn.execute(
+                    "UPDATE users SET display_name = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+                    (normalized_display_name, now, account["user_id"]),
                 )
                 user = conn.execute("SELECT * FROM users WHERE id = ?", (account["user_id"],)).fetchone()
-                return {"user": dict(user), "oauth_account": dict(account), "created": False}
+                if user is None or user["status"] != "active":
+                    raise AppError(403, "user account is not active")
+                refreshed_account = conn.execute(
+                    "SELECT * FROM oauth_accounts WHERE id = ?", (account["id"],)
+                ).fetchone()
+                return {"user": dict(user), "oauth_account": dict(refreshed_account), "created": False}
             cur_user = conn.execute(
                 "INSERT INTO users (display_name) VALUES (?)",
-                (display_name.strip()[:40] or f"{provider} 사용자",),
+                (normalized_display_name,),
             )
             user_id = int(cur_user.lastrowid)
             cur_account = conn.execute(
@@ -1915,7 +2906,7 @@ class RestaurantService:
                   (user_id, provider, provider_subject, display_name, last_login_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (user_id, provider, provider_subject, display_name, utc_now()),
+                (user_id, provider, provider_subject, normalized_display_name, utc_now()),
             )
             self._audit(
                 conn,
@@ -1933,6 +2924,18 @@ class RestaurantService:
                 ),
                 "created": True,
             }
+
+    def get_active_user(self, user_id: int) -> dict[str, Any] | None:
+        with self.database.session() as conn:
+            user = conn.execute(
+                """
+                SELECT id, display_name, role, status
+                FROM users
+                WHERE id = ? AND status = 'active'
+                """,
+                (user_id,),
+            ).fetchone()
+        return dict(user) if user is not None else None
 
     def request_account_merge(
         self, source_user_id: int, target_user_id: int, reason: str, context: RequestContext
@@ -1965,6 +2968,20 @@ class RestaurantService:
                 raise AppError(404, "user not found")
             conn.execute("UPDATE oauth_accounts SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
             conn.execute("UPDATE restaurant_reviews SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
+            conn.execute(
+                """
+                DELETE FROM user_saved_restaurants
+                WHERE user_id = ?
+                  AND restaurant_id IN (
+                    SELECT restaurant_id FROM user_saved_restaurants WHERE user_id = ?
+                  )
+                """,
+                (user_id, target_user_id),
+            )
+            conn.execute(
+                "UPDATE user_saved_restaurants SET user_id = ? WHERE user_id = ?",
+                (target_user_id, user_id),
+            )
             conn.execute("UPDATE users SET status = 'merged', updated_at = ? WHERE id = ?", (utc_now(), user_id))
             conn.execute(
                 """

@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .agents import NormalizedExpenseRow, PermitSnapshot, PlaceCandidate, category_from_text, similarity
@@ -52,6 +52,33 @@ def _post_form_json(
         body = exc.read().decode("utf-8", errors="replace")
         raise IntegrationError(f"HTTP {exc.code}: {body[:300]}") from exc
     except URLError as exc:
+        raise IntegrationError(str(exc)) from exc
+
+
+def _post_json(
+    url: str,
+    data: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: int = 12,
+) -> dict[str, Any]:
+    request = Request(
+        url,
+        data=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "public-restaurant/1.0",
+            **(headers or {}),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise IntegrationError(f"HTTP {exc.code}: {body[:300]}") from exc
+    except (URLError, json.JSONDecodeError) as exc:
         raise IntegrationError(str(exc)) from exc
 
 
@@ -234,6 +261,109 @@ class NaverSearchLocalClient:
                 )
         places.sort(key=lambda place: _place_rank(row, place), reverse=True)
         return places[:10]
+
+
+def _safe_http_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return candidate
+
+
+@dataclass(frozen=True)
+class NaverImageSearchClient:
+    client_id: str
+    client_secret: str
+    api_hub: bool = False
+
+    @property
+    def endpoint(self) -> str:
+        if self.api_hub:
+            return "https://naverapihub.apigw.ntruss.com/search/v1/image"
+        return "https://openapi.naver.com/v1/search/image.json"
+
+    @property
+    def headers(self) -> dict[str, str]:
+        if self.api_hub:
+            return {
+                "X-NCP-APIGW-API-KEY-ID": self.client_id,
+                "X-NCP-APIGW-API-KEY": self.client_secret,
+                "Accept": "application/json",
+            }
+        return {
+            "X-Naver-Client-Id": self.client_id,
+            "X-Naver-Client-Secret": self.client_secret,
+            "Accept": "application/json",
+        }
+
+    def search_restaurant_images(
+        self,
+        name: str,
+        address: str = "",
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        if not self.client_id or not self.client_secret:
+            raise IntegrationError("Naver Image Search credentials are missing")
+        restaurant_name = str(name or "").strip()
+        normalized_name = normalize_text(restaurant_name).replace(" ", "")
+        if not normalized_name:
+            return []
+        image_limit = max(1, min(int(limit), 10))
+        clean_address = strip_address_detail(address or "")
+        query = " ".join(value for value in [restaurant_name, clean_address, "음식점"] if value)
+        params = urlencode(
+            {
+                "query": query,
+                "display": max(10, image_limit * 5),
+                "start": 1,
+                "sort": "sim",
+            }
+        )
+        payload = _get_json(
+            f"{self.endpoint}?{params}",
+            headers=self.headers,
+            timeout=4,
+        )
+        candidates: list[tuple[int, int, dict[str, Any]]] = []
+        seen_urls: set[str] = set()
+        for result_index, item in enumerate(payload.get("items", [])):
+            title = _strip_html(item.get("title", ""))
+            normalized_title = normalize_text(title).replace(" ", "")
+            if normalized_name not in normalized_title:
+                continue
+            thumbnail_url = _safe_http_url(item.get("thumbnail"))
+            source_url = _safe_http_url(item.get("link"))
+            if not thumbnail_url and not source_url:
+                continue
+            deduplication_url = source_url or thumbnail_url
+            if deduplication_url in seen_urls:
+                continue
+            seen_urls.add(deduplication_url)
+            source_host = (urlparse(source_url).hostname or "").lower()
+            is_naver_place_image = source_host == "ldb-phinf.pstatic.net"
+            candidates.append(
+                (
+                    0 if is_naver_place_image else 1,
+                    result_index,
+                    {
+                        "thumbnail_url": thumbnail_url or source_url,
+                        "source_url": source_url or thumbnail_url,
+                        "title": title or restaurant_name,
+                        "provider": "naver_image_search",
+                        "is_naver_place_image": is_naver_place_image,
+                    },
+                )
+            )
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        return [candidate[2] for candidate in candidates[:image_limit]]
+
+    def search_restaurant_image(self, name: str, address: str = "") -> dict[str, Any] | None:
+        images = self.search_restaurant_images(name, address, limit=1)
+        return images[0] if images else None
 
 
 @dataclass(frozen=True)
@@ -423,6 +553,59 @@ class GoogleOAuthClient:
             subject=subject,
             display_name=profile.get("name") or "Google 사용자",
         )
+
+
+@dataclass(frozen=True)
+class GroqReviewSummaryClient:
+    api_key: str
+    model: str = "llama-3.3-70b-versatile"
+    endpoint: str = "https://api.groq.com/openai/v1/chat/completions"
+    provider: str = "groq"
+
+    def summarize(self, restaurant_name: str, reviews: list[dict[str, Any]]) -> str:
+        if not self.api_key:
+            raise IntegrationError("Groq API key is missing")
+        review_lines = [
+            f"- 별점 {int(review.get('rating') or 0)}점: {str(review.get('body') or '').strip()}"
+            for review in reviews
+            if str(review.get("body") or "").strip()
+        ]
+        payload = _post_json(
+            self.endpoint,
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "당신은 음식점의 공개 방문 리뷰를 요약하는 도우미입니다. "
+                            "리뷰에 명시된 사실만 사용하고 메뉴, 가격, 서비스 등을 추측하지 마세요. "
+                            "반복되는 장점과 주의점을 균형 있게 담아 한국어 2~3문장, 220자 이내로 작성하세요. "
+                            "리뷰 근거가 부족하면 부족하다고 명확히 말하세요."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"가게명: {restaurant_name}\n"
+                            f"공개 리뷰 수: {len(review_lines)}\n"
+                            "공개 리뷰:\n"
+                            + "\n".join(review_lines)
+                        ),
+                    },
+                ],
+                "temperature": 0.2,
+                "max_completion_tokens": 220,
+            },
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+        choices = payload.get("choices") or []
+        if not choices:
+            raise IntegrationError("Groq response did not contain a summary")
+        content = str((choices[0].get("message") or {}).get("content") or "").strip()
+        if not content:
+            raise IntegrationError("Groq response summary was empty")
+        return content[:600]
 
 
 class GeocodingNaverClient:

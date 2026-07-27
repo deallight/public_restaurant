@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import secrets
+from datetime import datetime, timezone
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
+from .auth import SESSION_MAX_AGE_SECONDS, SessionCodec
 from .config import Settings
 from .database import Database
 from .integrations import (
     GeocodingNaverClient,
     GoogleOAuthClient,
+    GroqReviewSummaryClient,
     IntegrationError,
+    NaverImageSearchClient,
     NaverLoginClient,
     NaverMapsGeocodingClient,
     NaverSearchLocalClient,
@@ -31,14 +39,22 @@ from .views import (
     admin_documents_index,
     admin_index,
     admin_review_index,
+    admin_restaurant_images_index,
     admin_workflow_index,
     map_issues_index,
     ops_logs_index,
     public_index,
+    login_index,
+    mypage_index,
 )
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+SESSION_COOKIE = "public_restaurant_session"
+OAUTH_STATE_COOKIE = "public_restaurant_oauth_state"
+OAUTH_RETURN_COOKIE = "public_restaurant_oauth_return"
+OAUTH_PROVIDER_COOKIE = "public_restaurant_oauth_provider"
+OAUTH_COOKIE_MAX_AGE_SECONDS = 10 * 60
 
 
 class PublicRestaurantApplication:
@@ -61,13 +77,49 @@ class PublicRestaurantApplication:
                 ),
                 geocoding_client,
             )
+        ai_summary_client = None
+        if settings.groq_api_key:
+            ai_summary_client = GroqReviewSummaryClient(
+                settings.groq_api_key,
+                settings.groq_model,
+            )
+        restaurant_image_client = None
+        if settings.naver_api_hub_client_id and settings.naver_api_hub_client_secret:
+            restaurant_image_client = NaverImageSearchClient(
+                settings.naver_api_hub_client_id,
+                settings.naver_api_hub_client_secret,
+                api_hub=True,
+            )
+        elif settings.naver_search_client_id and settings.naver_search_client_secret:
+            restaurant_image_client = NaverImageSearchClient(
+                settings.naver_search_client_id,
+                settings.naver_search_client_secret,
+            )
         self.service = RestaurantService(
             self.database,
             review_rate_limit_per_hour=settings.review_rate_limit_per_hour,
             geocoding_client=geocoding_client,
             naver_client=naver_client,
+            ai_summary_client=ai_summary_client,
+            restaurant_image_client=restaurant_image_client,
+            restaurant_image_upload_dir=(
+                settings.restaurant_image_upload_dir
+                or settings.db_path.parent / "restaurant_images"
+            ),
         )
         self.verification_progress = VerificationProgressStore()
+        self.session_codec = SessionCodec(
+            settings.session_secret
+            or settings.naver_login_client_secret
+            or settings.google_client_secret
+        )
+
+    def issue_session(self, user_id: int) -> str:
+        return self.session_codec.issue(user_id)
+
+    def session_user(self, token: str) -> dict | None:
+        user_id = self.session_codec.verify(token)
+        return self.service.get_active_user(user_id) if user_id is not None else None
 
     def run_daily(self) -> dict:
         return DailyPipeline(self.database, settings=self.settings).run()
@@ -212,6 +264,17 @@ class PublicRestaurantApplication:
                     "NAVER_SEARCH_CLIENT_SECRET": self.settings.naver_search_client_secret,
                 }
             ),
+            "naver_image_search": self._missing_env(
+                {
+                    "NAVER_API_HUB_CLIENT_ID": self.settings.naver_api_hub_client_id,
+                    "NAVER_API_HUB_CLIENT_SECRET": self.settings.naver_api_hub_client_secret,
+                }
+            )
+            if not (
+                self.settings.naver_search_client_id
+                and self.settings.naver_search_client_secret
+            )
+            else [],
             "naver_maps_geocoding": self._missing_env(
                 {
                     "NAVER_MAPS_CLIENT_ID": self.settings.naver_maps_client_id,
@@ -226,6 +289,16 @@ class PublicRestaurantApplication:
                 "naver_search": bool(
                     self.settings.naver_search_client_id and self.settings.naver_search_client_secret
                 ),
+                "naver_image_search": bool(
+                    (
+                        self.settings.naver_api_hub_client_id
+                        and self.settings.naver_api_hub_client_secret
+                    )
+                    or (
+                        self.settings.naver_search_client_id
+                        and self.settings.naver_search_client_secret
+                    )
+                ),
                 "naver_maps_geocoding": bool(
                     self.settings.naver_maps_client_id and self.settings.naver_maps_client_secret
                 ),
@@ -233,6 +306,154 @@ class PublicRestaurantApplication:
             },
             "missing_env": missing_env,
             "overview": self.service.verification_overview(),
+        }
+
+    def api_usage_status(self) -> dict:
+        now = datetime.now(timezone.utc)
+        day = now.date().isoformat()
+        month = day[:7]
+        metrics = self.service.api_usage_metrics(day=day, month=month)
+
+        def integration(
+            *,
+            key: str,
+            name: str,
+            description: str,
+            configured: bool,
+            provider_keys: tuple[str, ...],
+            quota: int,
+            period: str,
+            usage_scope: str,
+        ) -> dict:
+            provider_metrics = [metrics.get(provider, {}) for provider in provider_keys]
+            count_key = "month_count" if period == "month" else "day_count"
+            used = sum(int(metric.get(count_key) or 0) for metric in provider_metrics)
+            latest = max(
+                provider_metrics,
+                key=lambda metric: str(metric.get("last_called_at") or ""),
+                default={},
+            )
+            last_success = latest.get("last_success")
+            last_error = str(latest.get("last_error") or "").lower()
+            last_status_code = latest.get("last_status_code")
+            if not configured:
+                state = "disconnected"
+                state_label = "미연동"
+                state_reason = "API 인증 정보가 설정되지 않았습니다."
+            elif last_success is False:
+                state = "warning"
+                state_label = "확인 필요"
+                if "timed out" in last_error or "timeout" in last_error:
+                    state_reason = "최근 호출 실패 · 응답 시간 초과"
+                elif last_status_code in {401, 403} or "credential" in last_error:
+                    state_reason = "최근 호출 실패 · 인증 정보 확인 필요"
+                elif last_status_code == 429 or "too many requests" in last_error:
+                    state_reason = "최근 호출 실패 · 사용량 한도 확인 필요"
+                else:
+                    state_reason = "최근 호출 실패"
+            elif last_success is True:
+                state = "healthy"
+                state_label = "정상"
+                state_reason = "최근 호출 성공"
+            else:
+                state = "connected"
+                state_label = "연동됨"
+                state_reason = "최근 호출 없음"
+            percentage = min(100, used / quota * 100) if quota else 0
+            return {
+                "key": key,
+                "name": name,
+                "description": description,
+                "configured": configured,
+                "state": state,
+                "state_label": state_label,
+                "state_reason": state_reason,
+                "usage": {
+                    "used": used,
+                    "limit": quota,
+                    "remaining": max(0, quota - used),
+                    "percentage": round(percentage, 2),
+                    "period": period,
+                    "period_label": "이번 달" if period == "month" else "오늘",
+                    "scope": usage_scope,
+                },
+                "last_call": latest.get("last_called_at"),
+                "last_success": last_success,
+            }
+
+        has_legacy_image = bool(
+            self.settings.naver_search_client_id
+            and self.settings.naver_search_client_secret
+            and not (
+                self.settings.naver_api_hub_client_id
+                and self.settings.naver_api_hub_client_secret
+            )
+        )
+        integrations = [
+            integration(
+                key="naver_place",
+                name="네이버 장소 검증",
+                description="지역 검색 및 주소 좌표 보정",
+                configured=bool(
+                    self.settings.naver_search_client_id
+                    and self.settings.naver_search_client_secret
+                ),
+                provider_keys=("naver", "naver_image_search") if has_legacy_image else ("naver",),
+                quota=self.settings.naver_search_daily_quota,
+                period="day",
+                usage_scope="서버에 기록된 검증 작업" + (" · 이미지 검색과 한도 공유" if has_legacy_image else ""),
+            ),
+            integration(
+                key="naver_image",
+                name="네이버 이미지 검색",
+                description="음식점 상세 이미지 보강",
+                configured=bool(
+                    (
+                        self.settings.naver_api_hub_client_id
+                        and self.settings.naver_api_hub_client_secret
+                    )
+                    or (
+                        self.settings.naver_search_client_id
+                        and self.settings.naver_search_client_secret
+                    )
+                ),
+                provider_keys=("naver_image_search",) if not has_legacy_image else ("naver", "naver_image_search"),
+                quota=(
+                    self.settings.naver_search_daily_quota
+                    if has_legacy_image
+                    else self.settings.naver_api_hub_monthly_quota
+                ),
+                period="day" if has_legacy_image else "month",
+                usage_scope="서버에 기록된 이미지 요청" + (" · 장소 검색과 한도 공유" if has_legacy_image else ""),
+            ),
+            integration(
+                key="data_go_kr",
+                name="공공데이터 인허가",
+                description="식품 영업 상태 교차 확인",
+                configured=bool(self.settings.data_go_kr_service_key),
+                provider_keys=("data_go_kr",),
+                quota=self.settings.data_go_kr_daily_quota,
+                period="day",
+                usage_scope="서버에 기록된 인허가 조회 작업",
+            ),
+            integration(
+                key="groq",
+                name="Groq 리뷰 요약",
+                description=self.settings.groq_model,
+                configured=bool(self.settings.groq_api_key),
+                provider_keys=("groq",),
+                quota=self.settings.groq_daily_quota,
+                period="day",
+                usage_scope="서버에 기록된 AI 요약 요청",
+            ),
+        ]
+        return {
+            "generated_at": now.isoformat(timespec="seconds"),
+            "timezone": "UTC",
+            "connected_count": sum(1 for item in integrations if item["configured"]),
+            "integration_count": len(integrations),
+            "integrations": integrations,
+            "notice": "사용량은 이 서버가 기록한 호출 기준이며 공급자 콘솔 집계와 차이가 날 수 있습니다.",
         }
 
     def _missing_env(self, values: dict[str, str]) -> list[str]:
@@ -252,7 +473,37 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 path = parsed.path
                 query = self._query(parsed.query)
                 if path == "/":
-                    self._html(public_index(app.settings.naver_map_key, app.settings.app_name))
+                    self._html(
+                        public_index(
+                            app.settings.naver_map_key,
+                            app.settings.app_name,
+                            current_user=self._current_user(),
+                        )
+                    )
+                elif path == "/login":
+                    return_to = self._safe_return_to(str(query.get("return_to", "/")))
+                    self._html(
+                        login_index(
+                            app_name=app.settings.app_name,
+                            error=str(query.get("error", "")),
+                            current_user=self._current_user(),
+                            naver_configured=self._provider_configured("naver"),
+                            return_to=return_to,
+                        )
+                    )
+                elif path == "/signup":
+                    self._redirect("/login", status=302)
+                elif path == "/mypage":
+                    current_user = self._current_user()
+                    if current_user is None:
+                        self._redirect("/login?return_to=/mypage", status=302)
+                    else:
+                        self._html(
+                            mypage_index(
+                                app.settings.app_name,
+                                app.service.my_page(int(current_user["id"])),
+                            )
+                        )
                 elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
                 elif path == "/admin/collection":
@@ -267,6 +518,20 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(map_issues_index())
                 elif path == "/admin/logs":
                     self._html(ops_logs_index())
+                elif path == "/admin/photos":
+                    self._html(admin_restaurant_images_index())
+                elif path == "/admin/photos/restaurants":
+                    self._json(
+                        app.service.admin_restaurants_for_images(
+                            q=str(query.get("q", "")),
+                            limit=int(query.get("limit", "50") or "50"),
+                        )
+                    )
+                elif path.startswith("/admin/photos/restaurants/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4:
+                        raise AppError(404, "not found")
+                    self._json(app.service.admin_restaurant_images(int(parts[3])))
                 elif path == "/admin/documents":
                     self._html(admin_documents_index())
                 elif path == "/admin/documents/data":
@@ -301,7 +566,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(admin_document_detail_index())
                 elif path.startswith("/static/"):
                     self._static(path.removeprefix("/static/"))
+                elif path.startswith("/media/restaurant-images/"):
+                    self._restaurant_image_media(
+                        unquote(path.removeprefix("/media/restaurant-images/"))
+                    )
                 elif path == "/api/map/restaurants":
+                    current_user = self._current_user()
                     self._json(
                         {
                             "restaurants": app.service.list_map_restaurants(
@@ -311,12 +581,20 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                                 search_mode=query.get("search_mode", ""),
                                 region=query.get("region", ""),
                                 bounds=query.get("bounds", ""),
+                                user_id=int(current_user["id"]) if current_user else None,
+                                saved_only=query.get("saved_only", ""),
                             )
                         }
                     )
                 elif path.startswith("/api/restaurants/"):
                     restaurant_id = self._path_int(path, "/api/restaurants/")
-                    self._json(app.service.get_restaurant(restaurant_id))
+                    current_user = self._current_user()
+                    self._json(
+                        app.service.get_restaurant(
+                            restaurant_id,
+                            user_id=int(current_user["id"]) if current_user else None,
+                        )
+                    )
                 elif path == "/api/rankings":
                     self._json(
                         {
@@ -339,10 +617,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     )
                 elif path.startswith("/auth/") and path.endswith("/start"):
                     provider = path.split("/")[2]
-                    self._auth_start(provider)
+                    self._auth_start(provider, query)
                 elif path.startswith("/auth/callback/"):
                     provider = path.removeprefix("/auth/callback/")
                     self._auth_callback(provider, query)
+                elif path == "/auth/session":
+                    self._json({"user": self._current_user()})
                 elif path.startswith("/ops/batches/"):
                     batch_id = self._path_int(path, "/ops/batches/")
                     self._json(app.service.batch(batch_id))
@@ -350,6 +630,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._json(app.service.source_registry())
                 elif path == "/ops/verification-status":
                     self._json(app.verification_status())
+                elif path == "/ops/api-usage":
+                    self._json(app.api_usage_status())
                 elif path == "/ops/verification-progress":
                     self._json(app.verification_progress.snapshot())
                 elif path == "/ops/logs":
@@ -503,13 +785,83 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         ),
                         status=201,
                     )
+                elif path.startswith("/admin/photos/restaurants/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) == 5 and parts[4] == "images":
+                        restaurant_id = int(parts[3])
+                        image = payload.get("image")
+                        if not isinstance(image, dict) or not isinstance(image.get("content"), bytes):
+                            raise AppError(400, "image file is required")
+                        self._json(
+                            app.service.save_admin_restaurant_image(
+                                restaurant_id=restaurant_id,
+                                filename=str(image.get("filename") or "image"),
+                                image_bytes=image["content"],
+                                context=context,
+                                alt_text=str(payload.get("alt_text", "")),
+                                sort_order=(
+                                    int(payload["sort_order"])
+                                    if str(payload.get("sort_order", "")).strip()
+                                    else None
+                                ),
+                                image_id=(
+                                    int(payload["image_id"])
+                                    if str(payload.get("image_id", "")).strip()
+                                    else None
+                                ),
+                            ),
+                            status=201,
+                        )
+                    elif len(parts) == 6 and parts[4] == "images":
+                        self._json(
+                            app.service.update_admin_restaurant_image(
+                                restaurant_id=int(parts[3]),
+                                image_id=int(parts[5]),
+                                alt_text=str(payload.get("alt_text", "")),
+                                sort_order=int(payload.get("sort_order", 0) or 0),
+                            )
+                        )
+                    elif len(parts) == 7 and parts[4] == "images" and parts[6] == "delete":
+                        self._json(
+                            app.service.delete_admin_restaurant_image(
+                                restaurant_id=int(parts[3]),
+                                image_id=int(parts[5]),
+                            )
+                        )
+                    else:
+                        raise AppError(404, "not found")
+                elif path.startswith("/api/restaurants/") and path.endswith("/save"):
+                    restaurant_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    result = app.service.save_restaurant(int(current_user["id"]), restaurant_id)
+                    if self._wants_json():
+                        self._json(result, status=201)
+                    else:
+                        self._redirect(
+                            self._safe_return_to(str(payload.get("return_to", "/mypage")))
+                        )
+                elif path.startswith("/api/restaurants/") and path.endswith("/unsave"):
+                    restaurant_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    result = app.service.unsave_restaurant(int(current_user["id"]), restaurant_id)
+                    if self._wants_json():
+                        self._json(result)
+                    else:
+                        self._redirect(
+                            self._safe_return_to(str(payload.get("return_to", "/mypage")))
+                        )
                 elif path.startswith("/api/restaurants/") and path.endswith("/reviews"):
                     restaurant_id = int(path.split("/")[3])
+                    current_user = self._current_user()
                     review = app.service.add_review(
                         restaurant_id=restaurant_id,
                         rating=int(payload.get("rating", 0)),
                         body=str(payload.get("body", "")),
-                        reviewer_label=str(payload.get("reviewer_label", "방문자")),
+                        reviewer_label=(
+                            str(current_user["display_name"])
+                            if current_user
+                            else str(payload.get("reviewer_label", "방문자"))
+                        ),
                         context=context,
                     )
                     self._json(review, status=201)
@@ -521,6 +873,16 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         context=context,
                     )
                     self._json(report, status=201)
+                elif path.startswith("/api/reviews/") and path.endswith("/delete"):
+                    review_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    result = app.service.delete_own_review(int(current_user["id"]), review_id)
+                    if self._wants_json():
+                        self._json(result)
+                    else:
+                        self._redirect(
+                            self._safe_return_to(str(payload.get("return_to", "/mypage")))
+                        )
                 elif path.startswith("/review/") and path.endswith("/candidate"):
                     review_id = int(path.split("/")[2])
                     self._json(
@@ -594,7 +956,17 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                     )
                 elif path == "/auth/logout":
-                    self._json({"result": "logged_out"})
+                    expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
+                    if self._wants_json():
+                        self._json(
+                            {"result": "logged_out"},
+                            cookies=[expired_session],
+                        )
+                    else:
+                        self._redirect(
+                            self._safe_return_to(str(payload.get("return_to", "/"))),
+                            cookies=[expired_session],
+                        )
                 elif path.startswith("/admin/accounts/") and path.endswith("/merge"):
                     user_id = int(path.split("/")[3])
                     target_user_id = int(payload.get("target_user_id", 0))
@@ -608,13 +980,41 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             except Exception as exc:  # pragma: no cover - server guard
                 self._error(500, str(exc))
 
-        def _auth_start(self, provider: str) -> None:
+        def _provider_configured(self, provider: str) -> bool:
+            if provider == "naver":
+                return bool(
+                    app.settings.naver_login_client_id
+                    and app.settings.naver_login_client_secret
+                    and app.settings.naver_login_redirect_uri
+                )
+            if provider == "google":
+                return bool(
+                    app.settings.google_client_id
+                    and app.settings.google_client_secret
+                    and app.settings.google_redirect_uri
+                )
+            return False
+
+        def _auth_start(self, provider: str, query: dict[str, str]) -> None:
             if provider not in {"google", "naver"}:
                 raise AppError(404, "unsupported provider")
-            configured = False
+            return_to = self._safe_return_to(query.get("return_to", "/"))
+            if not self._provider_configured(provider):
+                if self._wants_json():
+                    self._json(
+                        {
+                            "provider": provider,
+                            "configured": False,
+                            "error": "provider credentials are missing",
+                        },
+                        status=503,
+                    )
+                else:
+                    self._redirect("/login?error=not_configured")
+                return
+
             state = secrets.token_urlsafe(16)
-            if provider == "naver" and app.settings.naver_login_client_id:
-                configured = True
+            if provider == "naver":
                 params = urlencode(
                     {
                         "response_type": "code",
@@ -623,9 +1023,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         "state": state,
                     }
                 )
-                callback = f"https://nid.naver.com/oauth2.0/authorize?{params}"
-            elif provider == "google" and app.settings.google_client_id:
-                configured = True
+                authorization_url = f"https://nid.naver.com/oauth2.0/authorize?{params}"
+            else:
                 params = urlencode(
                     {
                         "response_type": "code",
@@ -636,54 +1035,123 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         "access_type": "online",
                     }
                 )
-                callback = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+                authorization_url = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+
+            callback_path = f"/auth/callback/{provider}"
+            cookies = [
+                self._set_cookie(
+                    OAUTH_STATE_COOKIE,
+                    state,
+                    max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
+                    path=callback_path,
+                ),
+                self._set_cookie(
+                    OAUTH_RETURN_COOKIE,
+                    quote(return_to, safe=""),
+                    max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
+                    path=callback_path,
+                ),
+                self._set_cookie(
+                    OAUTH_PROVIDER_COOKIE,
+                    provider,
+                    max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
+                    path=callback_path,
+                ),
+            ]
+            if self._wants_json():
+                self._json(
+                    {
+                        "provider": provider,
+                        "configured": True,
+                        "authorization_url": authorization_url,
+                    },
+                    cookies=cookies,
+                )
             else:
-                callback = f"/auth/callback/{provider}?sub=demo-{provider}&name={quote(provider + ' 사용자')}"
-            self._json(
-                {
-                    "provider": provider,
-                    "configured": configured,
-                    "authorization_url": callback,
-                    "note": "Live OAuth start URL generated." if configured else "Set provider credentials to enable live OAuth.",
-                }
-            )
+                self._redirect(authorization_url, cookies=cookies, status=302)
 
         def _auth_callback(self, provider: str, query: dict[str, str]) -> None:
-            if query.get("code"):
-                try:
-                    if provider == "naver":
-                        if not app.settings.naver_login_client_id or not app.settings.naver_login_client_secret:
-                            raise AppError(400, "Naver Login credentials are missing")
-                        profile = NaverLoginClient(
-                            app.settings.naver_login_client_id,
-                            app.settings.naver_login_client_secret,
-                            app.settings.naver_login_redirect_uri,
-                        ).exchange_code(query["code"], query.get("state", ""))
-                    elif provider == "google":
-                        if not app.settings.google_client_id or not app.settings.google_client_secret:
-                            raise AppError(400, "Google OAuth credentials are missing")
-                        profile = GoogleOAuthClient(
-                            app.settings.google_client_id,
-                            app.settings.google_client_secret,
-                            app.settings.google_redirect_uri,
-                        ).exchange_code(query["code"])
-                    else:
-                        raise AppError(404, "unsupported provider")
-                except IntegrationError as exc:
-                    raise AppError(502, str(exc)) from exc
-                account = app.service.upsert_oauth_account(
-                    provider=profile.provider,
-                    provider_subject=profile.subject,
-                    display_name=profile.display_name,
-                )
-                self._json(account)
+            if provider not in {"google", "naver"}:
+                raise AppError(404, "unsupported provider")
+            callback_path = f"/auth/callback/{provider}"
+            oauth_cookies = self._oauth_expired_cookies(callback_path)
+            cookies = self._cookies()
+            stored_state = cookies.get(OAUTH_STATE_COOKIE, "")
+            returned_state = query.get("state", "")
+            stored_provider = cookies.get(OAUTH_PROVIDER_COOKIE, "")
+            if (
+                not stored_state
+                or not returned_state
+                or stored_provider != provider
+                or not hmac.compare_digest(stored_state, returned_state)
+            ):
+                self._auth_failure("expired", oauth_cookies, status=401)
                 return
+
+            if query.get("error"):
+                self._auth_failure("cancelled", oauth_cookies, status=400)
+                return
+            if not query.get("code"):
+                self._auth_failure("provider_error", oauth_cookies, status=400)
+                return
+
+            try:
+                if provider == "naver":
+                    profile = NaverLoginClient(
+                        app.settings.naver_login_client_id,
+                        app.settings.naver_login_client_secret,
+                        app.settings.naver_login_redirect_uri,
+                    ).exchange_code(query["code"], returned_state)
+                else:
+                    profile = GoogleOAuthClient(
+                        app.settings.google_client_id,
+                        app.settings.google_client_secret,
+                        app.settings.google_redirect_uri,
+                    ).exchange_code(query["code"])
+            except IntegrationError:
+                self._auth_failure("provider_error", oauth_cookies, status=502)
+                return
+
             account = app.service.upsert_oauth_account(
-                provider=provider,
-                provider_subject=query.get("sub") or query.get("code") or f"demo-{provider}",
-                display_name=query.get("name") or f"{provider} 사용자",
+                provider=profile.provider,
+                provider_subject=profile.subject,
+                display_name=profile.display_name,
             )
-            self._json(account)
+            session_cookie = self._set_cookie(
+                SESSION_COOKIE,
+                app.issue_session(int(account["user"]["id"])),
+                max_age=SESSION_MAX_AGE_SECONDS,
+                path="/",
+            )
+            response_cookies = [*oauth_cookies, session_cookie]
+            if self._wants_json():
+                self._json(account, cookies=response_cookies)
+                return
+            return_to = self._safe_return_to(
+                unquote(cookies.get(OAUTH_RETURN_COOKIE, "/"))
+            )
+            self._redirect(return_to, cookies=response_cookies)
+
+        def _auth_failure(
+            self,
+            error: str,
+            cookies: list[str],
+            status: int,
+        ) -> None:
+            if self._wants_json():
+                self._json({"error": error, "status": status}, status=status, cookies=cookies)
+            else:
+                self._redirect(f"/login?error={error}", cookies=cookies)
+
+        def _oauth_expired_cookies(self, callback_path: str) -> list[str]:
+            return [
+                self._expire_cookie(cookie_name, path=callback_path)
+                for cookie_name in (
+                    OAUTH_STATE_COOKIE,
+                    OAUTH_RETURN_COOKIE,
+                    OAUTH_PROVIDER_COOKIE,
+                )
+            ]
 
         def _static(self, relative_path: str) -> None:
             safe_path = (STATIC_DIR / relative_path).resolve()
@@ -697,6 +1165,20 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             self.end_headers()
             self.wfile.write(body)
 
+        def _restaurant_image_media(self, storage_key: str) -> None:
+            safe_path = app.service._admin_image_file_path(storage_key)
+            if not safe_path.exists() or not safe_path.is_file():
+                raise AppError(404, "restaurant image not found")
+            body = safe_path.read_bytes()
+            content_type = mimetypes.guess_type(str(safe_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _query(self, raw_query: str) -> dict[str, str]:
             return {key: values[-1] for key, values in parse_qs(raw_query).items()}
 
@@ -704,18 +1186,122 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length == 0:
                 return {}
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.startswith("multipart/form-data"):
+                max_length = app.service.ADMIN_IMAGE_MAX_BYTES + (1024 * 1024)
+                if length > max_length:
+                    raise AppError(413, "image upload request is too large")
+                return self._multipart_payload(length, content_type)
             raw = self.rfile.read(length).decode("utf-8")
-            if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
+            if content_type.startswith("application/x-www-form-urlencoded"):
                 return {key: values[-1] for key, values in parse_qs(raw).items()}
             return json.loads(raw or "{}")
 
+        def _multipart_payload(self, length: int, content_type: str) -> dict:
+            raw = self.rfile.read(length)
+            message = BytesParser(policy=policy.default).parsebytes(
+                b"Content-Type: "
+                + content_type.encode("ascii", errors="ignore")
+                + b"\r\nMIME-Version: 1.0\r\n\r\n"
+                + raw
+            )
+            if not message.is_multipart():
+                raise AppError(400, "invalid multipart request")
+            payload: dict[str, object] = {}
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                field_name = part.get_param("name", header="content-disposition")
+                if not field_name:
+                    continue
+                content = part.get_payload(decode=True) or b""
+                filename = part.get_filename()
+                if filename is not None:
+                    payload[str(field_name)] = {
+                        "filename": filename,
+                        "content_type": part.get_content_type(),
+                        "content": content,
+                    }
+                else:
+                    charset = part.get_content_charset() or "utf-8"
+                    payload[str(field_name)] = content.decode(charset, errors="replace")
+            return payload
+
         def _context(self, payload: dict) -> RequestContext:
-            user_id = payload.get("user_id")
+            current_user = self._current_user()
+            user_id = int(current_user["id"]) if current_user else None
             return RequestContext(
                 ip=self.client_address[0],
-                user_id=int(user_id) if user_id else None,
-                actor_id=str(payload.get("actor_id", "local-admin")),
+                user_id=user_id,
+                actor_id=f"user:{user_id}" if user_id else str(payload.get("actor_id", "local-admin")),
             )
+
+        def _cookies(self) -> dict[str, str]:
+            raw_cookie = self.headers.get("Cookie", "")
+            if not raw_cookie:
+                return {}
+            parsed = SimpleCookie()
+            try:
+                parsed.load(raw_cookie)
+            except Exception:
+                return {}
+            return {key: morsel.value for key, morsel in parsed.items()}
+
+        def _current_user(self) -> dict | None:
+            token = self._cookies().get(SESSION_COOKIE, "")
+            return app.session_user(token)
+
+        def _authenticated_user(self) -> dict:
+            current_user = self._current_user()
+            if current_user is None:
+                raise AppError(401, "login required")
+            return current_user
+
+        def _safe_return_to(self, value: str) -> str:
+            value = (value or "/").strip()
+            parsed = urlparse(value)
+            if (
+                not value.startswith("/")
+                or value.startswith("//")
+                or parsed.scheme
+                or parsed.netloc
+                or "\\" in value
+                or "\r" in value
+                or "\n" in value
+            ):
+                return "/"
+            return value
+
+        def _secure_cookies(self) -> bool:
+            return app.settings.app_env == "production"
+
+        def _set_cookie(self, name: str, value: str, max_age: int, path: str) -> str:
+            cookie = SimpleCookie()
+            cookie[name] = value
+            morsel = cookie[name]
+            morsel["path"] = path
+            morsel["max-age"] = str(max_age)
+            morsel["httponly"] = True
+            morsel["samesite"] = "Lax"
+            if self._secure_cookies():
+                morsel["secure"] = True
+            return morsel.OutputString()
+
+        def _expire_cookie(self, name: str, path: str) -> str:
+            cookie = SimpleCookie()
+            cookie[name] = ""
+            morsel = cookie[name]
+            morsel["path"] = path
+            morsel["max-age"] = "0"
+            morsel["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+            morsel["httponly"] = True
+            morsel["samesite"] = "Lax"
+            if self._secure_cookies():
+                morsel["secure"] = True
+            return morsel.OutputString()
+
+        def _wants_json(self) -> bool:
+            return "application/json" in self.headers.get("Accept", "")
 
         def _path_int(self, path: str, prefix: str) -> int:
             tail = path.removeprefix(prefix).strip("/")
@@ -723,11 +1309,18 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 tail = tail.split("/", 1)[0]
             return int(tail)
 
-        def _json(self, payload: object, status: int = 200) -> None:
+        def _json(
+            self,
+            payload: object,
+            status: int = 200,
+            cookies: list[str] | None = None,
+        ) -> None:
             body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -736,9 +1329,24 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             body = payload.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _redirect(
+            self,
+            location: str,
+            cookies: list[str] | None = None,
+            status: int = 303,
+        ) -> None:
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _error(self, status: int, message: str) -> None:
             self._json({"error": message, "status": status}, status=status)

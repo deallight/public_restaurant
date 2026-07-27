@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.database import Database
@@ -11,7 +12,59 @@ from app.services import AppError, RequestContext, RestaurantService, naver_map_
 from app.source_catalog import iter_source_catalog
 
 
+class FakeReviewSummaryClient:
+    provider = "fake"
+    model = "fake-review-summary"
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    def summarize(self, restaurant_name: str, reviews: list[dict]) -> str:
+        self.calls.append(
+            {
+                "restaurant_name": restaurant_name,
+                "review_count": len(reviews),
+            }
+        )
+        if self.fail:
+            raise RuntimeError("temporary provider failure")
+        return f"{restaurant_name}의 공개 리뷰 {len(reviews)}개를 요약했습니다."
+
+
+class FakeRestaurantImageClient:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.calls: list[dict[str, str]] = []
+
+    def search_restaurant_images(
+        self,
+        name: str,
+        address: str,
+        limit: int = 4,
+    ) -> list[dict]:
+        self.calls.append({"name": name, "address": address})
+        if self.fail:
+            raise RuntimeError("temporary image provider failure")
+        return [
+            {
+                "thumbnail_url": f"https://search.pstatic.net/example-{index}.jpg",
+                "source_url": f"https://example.com/example-{index}.jpg",
+                "title": f"{name} 사진 {index}",
+                "provider": "naver_image_search",
+                "is_naver_place_image": index == 1,
+            }
+            for index in range(1, limit + 1)
+        ]
+
+
 class ServiceTests(unittest.TestCase):
+    PNG_1X1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        b"\x1f\x15\xc4\x89"
+    )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "test.db")
@@ -135,6 +188,22 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("서울테스트식당", [restaurant["name"] for restaurant in city_search])
         self.assertIn("서울이름부산식당", [restaurant["name"] for restaurant in default_seoul_search])
         self.assertEqual([restaurant["name"] for restaurant in outside_city_search], ["서울테스트식당"])
+        fixture_restaurant = next(
+            restaurant for restaurant in all_restaurants
+            if restaurant["name"] == "부산돼지국밥 시청점"
+        )
+        detail = self.service.get_restaurant(int(fixture_restaurant["id"]))
+        self.assertEqual(
+            detail["visits"],
+            [
+                {
+                    "visited_at": "2026-01-14",
+                    "institution_name": "부산광역시청",
+                    "purpose": "현안 업무 협의 간담",
+                }
+            ],
+        )
+        self.assertNotIn("department_name", detail["visits"][0])
         for restaurant in all_restaurants:
             self.assertIsNotNone(restaurant["latitude"])
             self.assertIsNotNone(restaurant["longitude"])
@@ -1002,6 +1071,224 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(report["status"], "open")
         self.assertEqual(len(self.service.review_reports()), 1)
 
+    def test_ai_summary_first_at_five_then_every_ten_reviews_after_one_hour(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        client = FakeReviewSummaryClient()
+        current_time = [datetime(2026, 7, 24, 1, 0, tzinfo=timezone.utc)]
+        service = RestaurantService(
+            self.db,
+            review_rate_limit_per_hour=100,
+            ai_summary_client=client,
+            ai_summary_now=lambda: current_time[0],
+        )
+
+        for index in range(4):
+            service.add_review(
+                restaurant_id,
+                5,
+                f"첫 요약 전 리뷰 {index}",
+                "테스터",
+                RequestContext(ip=f"203.0.113.{index + 1}"),
+            )
+        self.assertEqual(client.calls, [])
+
+        service.add_review(
+            restaurant_id,
+            4,
+            "다섯 번째 공개 리뷰",
+            "테스터",
+            RequestContext(ip="203.0.113.5"),
+        )
+        self.assertEqual([call["review_count"] for call in client.calls], [5])
+        first_detail = service.get_restaurant(restaurant_id)
+        self.assertEqual(first_detail["visit_count"], 1)
+        self.assertEqual(first_detail["ai_summary"]["summarized_review_count"], 5)
+        self.assertEqual(first_detail["ai_summary"]["next_summary_review_count"], 15)
+
+        for index in range(5, 15):
+            service.add_review(
+                restaurant_id,
+                4,
+                f"추가 공개 리뷰 {index}",
+                "테스터",
+                RequestContext(ip=f"198.51.100.{index + 1}"),
+            )
+        self.assertEqual(len(client.calls), 1)
+        pending_detail = service.get_restaurant(restaurant_id)
+        self.assertTrue(pending_detail["ai_summary"]["refresh_pending"])
+
+        current_time[0] += timedelta(hours=1)
+        refreshed_detail = service.get_restaurant(restaurant_id)
+        self.assertEqual([call["review_count"] for call in client.calls], [5, 15])
+        self.assertEqual(refreshed_detail["ai_summary"]["summarized_review_count"], 15)
+        self.assertFalse(refreshed_detail["ai_summary"]["refresh_pending"])
+
+        service.get_restaurant(restaurant_id)
+        self.assertEqual(len(client.calls), 2)
+        with self.db.session() as conn:
+            groq_logs = conn.execute(
+                "SELECT success FROM api_call_logs WHERE provider = 'groq' ORDER BY id"
+            ).fetchall()
+        self.assertEqual([int(row["success"]) for row in groq_logs], [1, 1])
+
+    def test_restaurant_detail_includes_optional_naver_image(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        client = FakeRestaurantImageClient()
+        service = RestaurantService(self.db, restaurant_image_client=client)
+
+        detail = service.get_restaurant(restaurant_id)
+
+        self.assertEqual(len(detail["restaurant_images"]), 4)
+        self.assertEqual(detail["restaurant_image"], detail["restaurant_images"][0])
+        self.assertEqual(
+            detail["restaurant_images"][0],
+            {
+                "thumbnail_url": "https://search.pstatic.net/example-1.jpg",
+                "source_url": "https://example.com/example-1.jpg",
+                "title": f"{detail['name']} 사진 1",
+                "provider": "naver_image_search",
+                "provider_label": "네이버 이미지 검색",
+                "is_naver_place_image": True,
+                "is_admin_image": False,
+            },
+        )
+        self.assertEqual(client.calls[0]["name"], detail["name"])
+        self.assertEqual(
+            client.calls[0]["address"],
+            detail["road_address"] or detail["address"],
+        )
+        with self.db.session() as conn:
+            image_log = conn.execute(
+                "SELECT success FROM api_call_logs WHERE provider = 'naver_image_search'"
+            ).fetchone()
+        self.assertEqual(int(image_log["success"]), 1)
+
+    def test_restaurant_detail_survives_image_provider_failure(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        service = RestaurantService(
+            self.db,
+            restaurant_image_client=FakeRestaurantImageClient(fail=True),
+        )
+
+        detail = service.get_restaurant(restaurant_id)
+
+        self.assertEqual(detail["restaurant_images"], [])
+        self.assertIsNone(detail["restaurant_image"])
+        self.assertEqual(detail["id"], restaurant_id)
+        with self.db.session() as conn:
+            image_log = conn.execute(
+                "SELECT success FROM api_call_logs WHERE provider = 'naver_image_search'"
+            ).fetchone()
+        self.assertEqual(int(image_log["success"]), 0)
+
+    def test_admin_image_upload_precedes_search_images_and_can_be_edited(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        client = FakeRestaurantImageClient()
+        service = RestaurantService(self.db, restaurant_image_client=client)
+
+        saved = service.save_admin_restaurant_image(
+            restaurant_id=restaurant_id,
+            filename="front.png",
+            image_bytes=self.PNG_1X1,
+            context=RequestContext(actor_id="local-admin"),
+            alt_text="매장 외관",
+            sort_order=1,
+        )
+
+        self.assertEqual(len(saved["images"]), 1)
+        admin_image = saved["images"][0]
+        self.assertEqual(admin_image["provider"], "admin_upload")
+        self.assertTrue(admin_image["is_admin_image"])
+        self.assertTrue(service._admin_image_file_path(
+            admin_image["source_url"].removeprefix("/media/restaurant-images/")
+        ).exists())
+
+        detail = service.get_restaurant(restaurant_id)
+        self.assertEqual(len(detail["restaurant_images"]), 4)
+        self.assertEqual(detail["restaurant_images"][0]["title"], "매장 외관")
+        self.assertEqual(detail["restaurant_images"][0]["provider"], "admin_upload")
+        self.assertEqual(len(client.calls), 1)
+
+        updated = service.update_admin_restaurant_image(
+            restaurant_id,
+            admin_image["id"],
+            alt_text="대표 출입구",
+            sort_order=2,
+        )
+        self.assertEqual(updated["images"][0]["alt_text"], "대표 출입구")
+        self.assertEqual(updated["images"][0]["sort_order"], 2)
+
+        removed = service.delete_admin_restaurant_image(
+            restaurant_id,
+            admin_image["id"],
+        )
+        self.assertEqual(removed["images"], [])
+
+    def test_admin_image_rejects_unsupported_file_content(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+
+        with self.assertRaisesRegex(AppError, "PNG, JPEG, and WebP"):
+            self.service.save_admin_restaurant_image(
+                restaurant_id=restaurant_id,
+                filename="not-an-image.txt",
+                image_bytes=b"not an image",
+                context=RequestContext(actor_id="local-admin"),
+            )
+
+    def test_ai_summary_failure_is_also_rate_limited_for_one_hour(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        client = FakeReviewSummaryClient(fail=True)
+        current_time = [datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)]
+        service = RestaurantService(
+            self.db,
+            review_rate_limit_per_hour=100,
+            ai_summary_client=client,
+            ai_summary_now=lambda: current_time[0],
+        )
+
+        for index in range(5):
+            service.add_review(
+                restaurant_id,
+                5,
+                f"실패 재시도 제한 리뷰 {index}",
+                "테스터",
+                RequestContext(ip=f"192.0.2.{index + 1}"),
+            )
+        self.assertEqual(len(client.calls), 1)
+
+        current_time[0] += timedelta(minutes=59, seconds=59)
+        service.get_restaurant(restaurant_id)
+        self.assertEqual(len(client.calls), 1)
+
+        current_time[0] += timedelta(seconds=1)
+        service.get_restaurant(restaurant_id)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(service.get_restaurant(restaurant_id)["ai_summary"]["text"], "")
+
+    def test_ai_summary_cooldown_starts_when_successful_generation_finishes(self) -> None:
+        service = RestaurantService(self.db, ai_summary_client=FakeReviewSummaryClient())
+        cached = {
+            "summary_text": "기존 요약",
+            "summarized_review_count": 5,
+            "last_attempted_at": "2026-07-24T01:00:00+00:00",
+            "last_generated_at": "2026-07-24T01:00:30+00:00",
+        }
+
+        self.assertFalse(
+            service._ai_summary_is_due(
+                cached,
+                15,
+                datetime(2026, 7, 24, 2, 0, 29, tzinfo=timezone.utc),
+            )
+        )
+        self.assertTrue(
+            service._ai_summary_is_due(
+                cached,
+                15,
+                datetime(2026, 7, 24, 2, 0, 30, tzinfo=timezone.utc),
+            )
+        )
+
     def test_sso_account_admin_merge(self) -> None:
         google = self.service.upsert_oauth_account("google", "google-sub-1", "사용자")
         naver = self.service.upsert_oauth_account("naver", "naver-sub-1", "사용자")
@@ -1025,6 +1312,60 @@ class ServiceTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(source["status"], "merged")
         self.assertEqual(accounts["c"], 2)
+
+    def test_my_page_manages_owned_reviews_and_saved_restaurants(self) -> None:
+        account = self.service.upsert_oauth_account("naver", "mypage-user", "마이페이지 사용자")
+        user_id = int(account["user"]["id"])
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        context = RequestContext(user_id=user_id, ip="203.0.113.31", actor_id=f"user:{user_id}")
+
+        saved = self.service.save_restaurant(user_id, restaurant_id)
+        review = self.service.add_review(
+            restaurant_id,
+            5,
+            "마이페이지에서 관리할 리뷰입니다.",
+            "마이페이지 사용자",
+            context,
+        )
+        page = self.service.my_page(user_id)
+
+        self.assertTrue(saved["is_saved"])
+        self.assertTrue(self.service.get_restaurant(restaurant_id, user_id=user_id)["is_saved"])
+        self.assertEqual(page["counts"], {"reviews": 1, "saved_restaurants": 1})
+        self.assertEqual(page["reviews"][0]["id"], review["id"])
+        self.assertEqual(page["saved_restaurants"][0]["id"], restaurant_id)
+
+        other = self.service.upsert_oauth_account("naver", "other-mypage-user", "다른 사용자")
+        with self.assertRaisesRegex(AppError, "review not found"):
+            self.service.delete_own_review(int(other["user"]["id"]), int(review["id"]))
+
+        self.service.delete_own_review(user_id, int(review["id"]))
+        self.service.unsave_restaurant(user_id, restaurant_id)
+        emptied = self.service.my_page(user_id)
+        self.assertEqual(emptied["counts"], {"reviews": 0, "saved_restaurants": 0})
+
+    def test_saved_restaurant_map_filter_is_scoped_to_logged_in_user(self) -> None:
+        first = self.service.upsert_oauth_account("naver", "saved-filter-one", "첫 사용자")
+        second = self.service.upsert_oauth_account("naver", "saved-filter-two", "둘째 사용자")
+        first_user_id = int(first["user"]["id"])
+        second_user_id = int(second["user"]["id"])
+        restaurants = self.service.list_map_restaurants()
+        saved_ids = [int(restaurants[0]["id"]), int(restaurants[1]["id"])]
+        for restaurant_id in saved_ids:
+            self.service.save_restaurant(first_user_id, restaurant_id)
+
+        filtered = self.service.list_map_restaurants(
+            user_id=first_user_id,
+            saved_only=True,
+        )
+
+        self.assertEqual({int(item["id"]) for item in filtered}, set(saved_ids))
+        self.assertEqual(
+            self.service.list_map_restaurants(user_id=second_user_id, saved_only="1"),
+            [],
+        )
+        with self.assertRaisesRegex(AppError, "login required"):
+            self.service.list_map_restaurants(saved_only=True)
 
 
 class FakeGeocodingClient:

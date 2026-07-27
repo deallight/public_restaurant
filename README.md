@@ -111,11 +111,26 @@ curl http://127.0.0.1:8000/api/map/restaurants
 | `NAVER_MAPS_CLIENT_ID`, `NAVER_MAPS_CLIENT_SECRET` | NCP Maps Geocoding |
 | `NAVER_SEARCH_CLIENT_ID`, `NAVER_SEARCH_CLIENT_SECRET` | Naver Search Local API |
 | `DATA_GO_KR_SERVICE_KEY` | 공공데이터포털 인허가 API 일반 인증키 |
+| `NAVER_SEARCH_DAILY_QUOTA` | 관리자 대시보드의 네이버 검색 일일 무료 한도 기준값 (기본 `25000`) |
+| `NAVER_API_HUB_MONTHLY_QUOTA` | 관리자 대시보드의 NAVER API HUB 월간 한도 기준값 (기본 `775000`) |
+| `DATA_GO_KR_DAILY_QUOTA` | 관리자 대시보드의 공공데이터포털 일일 한도 기준값 (기본 `10000`) |
+| `GROQ_DAILY_QUOTA` | 관리자 대시보드의 Groq 일일 요청 한도 기준값 (기본 `1000`) |
 | `NAVER_LOGIN_CLIENT_ID`, `NAVER_LOGIN_CLIENT_SECRET`, `NAVER_LOGIN_REDIRECT_URI` | 네이버 로그인 |
+| `APP_SESSION_SECRET` | 로그인 세션 서명 전용 비밀값(선택, 미설정 시 로그인 provider secret에서 별도 키 파생) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | 구글 OAuth |
 | `REVIEW_RATE_LIMIT_PER_HOUR` | 같은 음식점에 대한 사용자/IP 기준 시간당 리뷰 제한 |
 
 실서비스 검증은 네이버 Search, NCP Maps Geocoding, 공공데이터포털 인허가 API 키가 있을 때 활성화됩니다. 키가 없으면 테스트/로컬 fixture 중심으로 동작하며, 지도는 fallback 화면을 사용합니다.
+
+### 네이버 로그인 설정
+
+네이버 Developers 애플리케이션의 Callback URL과 `NAVER_LOGIN_REDIRECT_URI`는 정확히 같아야 합니다. 로컬 기본값은 `http://127.0.0.1:8000/auth/callback/naver`이며, 운영 환경에서는 실제 HTTPS 도메인의 같은 경로를 등록합니다.
+
+발급받은 `NAVER_LOGIN_CLIENT_ID`, `NAVER_LOGIN_CLIENT_SECRET`은 코드나 저장소에 넣지 않고 실행 환경의 secret으로 주입합니다. `APP_SESSION_SECRET`도 별도 secret으로 설정하는 것을 권장하며, 생략하면 로그인 provider secret에서 용도가 분리된 세션 서명 키를 파생합니다.
+
+서버를 시작한 뒤 `http://127.0.0.1:8000/login`에서 확인합니다.
+
+별도 회원가입 화면은 없습니다. 네이버 인증 후 등록된 회원 정보가 있으면 기존 계정으로 로그인하고, 없으면 회원 계정을 자동 생성한 뒤 바로 로그인합니다.
 
 ## 데이터 파이프라인
 
@@ -183,19 +198,25 @@ curl -X POST http://127.0.0.1:8000/ops/verify-collected \
 
 공개 API:
 
-- `GET /api/map/restaurants?q=&category=&region=&bounds=`
+- `GET /api/map/restaurants?q=&category=&region=&bounds=&saved_only=` (`saved_only=1`은 로그인 필요)
 - `GET /api/restaurants/{id}`
 - `GET /api/rankings?category=&region=&period=`
 - `GET /api/search?q=&category=&bounds=`
 - `POST /api/restaurants/{id}/reviews`
 - `POST /api/reviews/{id}/report`
+- `POST /api/restaurants/{id}/save`
+- `POST /api/restaurants/{id}/unsave`
+- `POST /api/reviews/{id}/delete`
 
 인증 API:
 
+- `GET /login`
+- `GET /mypage`
 - `GET /auth/google/start`
 - `GET /auth/naver/start`
 - `GET /auth/callback/google`
 - `GET /auth/callback/naver`
+- `GET /auth/session`
 - `POST /auth/logout`
 
 운영 API:
@@ -217,6 +238,12 @@ curl -X POST http://127.0.0.1:8000/ops/verify-collected \
 
 관리자 API:
 
+- `GET /admin/photos`: 음식점 사진 관리 화면
+- `GET /admin/photos/restaurants`
+- `GET /admin/photos/restaurants/{restaurant_id}`
+- `POST /admin/photos/restaurants/{restaurant_id}/images`: 사진 추가 또는 교체
+- `POST /admin/photos/restaurants/{restaurant_id}/images/{image_id}`: 설명·순서 수정
+- `POST /admin/photos/restaurants/{restaurant_id}/images/{image_id}/delete`
 - `GET /review`
 - `POST /review/{id}/candidate`
 - `POST /review/{id}/approve-new`
@@ -256,6 +283,13 @@ raw_documents
 - `decision_audit_logs`: 승인·병합·반려 등 결정 감사 로그
 - `dead_letter_queue`: 파싱/검증 실패 항목
 - `restaurant_reviews`, `review_reports`: 사용자 리뷰와 신고
+- `user_saved_restaurants`: 로그인 사용자가 저장한 관심 가게
+- `restaurant_admin_images`: 관리자 등록 음식점 사진의 파일 정보와 노출 순서
+
+관리자 사진 파일은 기본적으로 `var/restaurant_images`에 저장되며
+`RESTAURANT_IMAGE_UPLOAD_DIR`로 변경할 수 있습니다. PNG, JPEG, WebP 형식을
+가게당 최대 4장, 파일당 최대 8MB까지 등록할 수 있습니다. 상세 화면에서는
+관리자 사진을 먼저 사용하고 남은 자리만 네이버 이미지 검색 결과로 채웁니다.
 
 SQLite 스키마와 PostgreSQL 호환 기준은 `app/schema.py`입니다. PostgreSQL 0001은 `database/migrations/m0001_app_compatible.py`가 생성하며, 기존 `database/postgres_*.sql`은 설계 후보로만 유지합니다. 차이 분석은 `database/POSTGRESQL_GAP_ANALYSIS.md`, 실행·이관·롤백 절차는 `database/POSTGRESQL_RUNBOOK.md`를 따릅니다.
 

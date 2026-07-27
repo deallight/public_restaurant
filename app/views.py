@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import html
 from datetime import date
+from urllib.parse import quote
 
 
-def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
+def public_index(
+    naver_map_key: str,
+    app_name: str = "공기밥",
+    current_user: dict | None = None,
+) -> str:
     escaped_key = html.escape(naver_map_key)
     escaped_app_name = html.escape(app_name)
     category_filters = [
@@ -24,6 +29,18 @@ def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
         f' aria-pressed="false">{count}회 이상</button>'
         for count in range(10, 110, 10)
     )
+    if current_user:
+        display_name = html.escape(str(current_user.get("display_name", "사용자")))
+        account_markup = f"""<div class="account-actions signed-in">
+            <a class="account-name" href="/mypage"><i aria-hidden="true"></i>{display_name}님의 마이페이지</a>
+            <form action="/auth/logout" method="post">
+              <button class="account-logout" type="submit">로그아웃</button>
+            </form>
+          </div>"""
+    else:
+        account_markup = """<div class="account-actions">
+            <a class="account-login" href="/login">로그인</a>
+          </div>"""
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -33,6 +50,7 @@ def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
   <link rel="stylesheet" href="/static/styles.css">
   <script>
     window.NAVER_MAP_KEY = "{escaped_key}";
+    window.IS_SIGNED_IN = {"true" if current_user else "false"};
   </script>
 </head>
 <body>
@@ -52,10 +70,14 @@ def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
               </div>
             </details>
           </form>
+          {account_markup}
         </div>
         <div id="filter-index" class="filter-index" aria-label="필터 선택">
           <div class="filter-index-group" role="group" aria-label="카테고리">
 {category_buttons}
+            <button type="button" class="saved-filter" data-filter="saved" data-value="1" aria-pressed="false">
+              <span aria-hidden="true">♥</span> 관심 가게
+            </button>
           </div>
         </div>
       </div>
@@ -67,10 +89,236 @@ def public_index(naver_map_key: str, app_name: str = "공기밥") -> str:
         </div>
         <ol id="ranking-list" class="ranking-list"></ol>
       </aside>
-      <aside id="detail-panel" class="detail-panel" hidden></aside>
+      <aside
+        id="detail-panel"
+        class="detail-panel"
+        aria-label="선택한 음식점 상세 정보"
+        aria-live="polite"
+        hidden
+      ></aside>
     </section>
   </main>
   <script src="/static/app.js"></script>
+</body>
+</html>"""
+
+
+def login_index(
+    app_name: str = "공기밥",
+    error: str = "",
+    current_user: dict | None = None,
+    naver_configured: bool = True,
+    return_to: str = "/",
+) -> str:
+    escaped_app_name = html.escape(app_name)
+    error_messages = {
+        "cancelled": "네이버 로그인이 취소되었습니다. 원할 때 다시 시도해 주세요.",
+        "expired": "로그인 요청이 만료되었어요. 네이버 로그인을 다시 시작해 주세요.",
+        "not_configured": "네이버 로그인 설정이 아직 완료되지 않았습니다.",
+        "provider_error": "네이버 로그인 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+    }
+    error_message = error_messages.get(error, "")
+    alert_markup = (
+        f'<div class="auth-alert" role="alert">{html.escape(error_message)}</div>'
+        if error_message
+        else ""
+    )
+    if current_user:
+        raw_display_name = str(current_user.get("display_name", "사용자"))
+        display_name = html.escape(raw_display_name)
+        display_initial = html.escape(raw_display_name[:1] or "사")
+        signed_in_markup = f"""<div class="auth-current-user">
+              <span class="auth-avatar" aria-hidden="true">{display_initial}</span>
+              <div><strong>{display_name}님</strong><span>이미 로그인되어 있습니다.</span></div>
+            </div>
+            <a class="auth-primary-link" href="{html.escape(return_to)}">계속하기</a>
+            <form class="auth-logout-form" action="/auth/logout" method="post">
+              <button type="submit">로그아웃</button>
+            </form>"""
+        action_markup = signed_in_markup
+    elif naver_configured:
+        encoded_return_to = quote(return_to, safe="/")
+        action_markup = f"""<a class="naver-sso-button" href="/auth/naver/start?return_to={encoded_return_to}">
+              <span class="naver-mark" aria-hidden="true">N</span>
+              <span>네이버로 계속하기</span>
+            </a>
+            <p class="auth-provider-note">네이버 인증 한 번으로 바로 시작할 수 있습니다.</p>"""
+    else:
+        action_markup = """<span class="naver-sso-button is-disabled" aria-disabled="true">
+              <span class="naver-mark" aria-hidden="true">N</span>
+              <span>네이버 로그인 준비 중</span>
+            </span>
+            <p class="auth-provider-note">서버에 네이버 로그인 환경변수를 설정하면 바로 사용할 수 있습니다.</p>"""
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#063b3a">
+  <title>로그인 | {escaped_app_name}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="auth-story" aria-labelledby="auth-story-title">
+      <a class="auth-brand" href="/" aria-label="{escaped_app_name} 홈">
+        <span class="auth-brand-mark" aria-hidden="true">공</span>
+        <span>{escaped_app_name}</span>
+      </a>
+      <div class="auth-story-copy">
+        <span class="auth-story-label">BUSAN PUBLIC DINING GUIDE</span>
+        <h1 id="auth-story-title">공공기관의 발자취로<br>부산의 한 끼를 발견하세요.</h1>
+        <p>흩어진 업무추진비 기록을 모아, 실제 방문이 쌓인 부산 맛집을 한눈에 보여드립니다.</p>
+      </div>
+      <div class="auth-story-stats" aria-label="서비스 특징">
+        <div><strong>공공데이터</strong><span>근거가 보이는 맛집</span></div>
+        <div><strong>부산 전역</strong><span>지도에서 바로 탐색</span></div>
+        <div><strong>한 번의 인증</strong><span>비밀번호 없는 시작</span></div>
+      </div>
+    </section>
+
+    <section class="auth-panel" aria-labelledby="auth-title">
+      <div class="auth-card">
+        <a class="auth-back" href="/">← 지도로 돌아가기</a>
+        <div class="auth-heading">
+          <span>START WITH NAVER</span>
+          <h2 id="auth-title">부산의 맛집을 더 가깝게</h2>
+          <p>공공기관의 실제 방문 기록을 바탕으로, 부산 곳곳의 맛집을 지도에서 발견하고 방문 경험을 나눠보세요.</p>
+        </div>
+        {alert_markup}
+        <div class="auth-actions">
+          {action_markup}
+        </div>
+        <div class="auth-assurance">
+          <div><span aria-hidden="true">✓</span><p><strong>비밀번호를 저장하지 않아요</strong>네이버에서 안전하게 인증합니다.</p></div>
+          <div><span aria-hidden="true">✓</span><p><strong>최소 정보만 사용해요</strong>회원 식별값과 표시 이름만 저장합니다.</p></div>
+        </div>
+        <p class="auth-footnote">등록된 계정이 없으면 인증 과정에서 자동으로 만들어집니다.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def mypage_index(app_name: str, data: dict) -> str:
+    user = data["user"]
+    reviews = data["reviews"]
+    saved_restaurants = data["saved_restaurants"]
+    display_name = html.escape(str(user.get("display_name", "사용자")))
+    initial = html.escape(str(user.get("display_name", "사"))[:1] or "사")
+
+    review_status_labels = {
+        "visible": "공개 중",
+        "hidden": "검토 중",
+    }
+    review_cards = "\n".join(
+        f"""<article class="mypage-card review-card">
+          <div class="mypage-card-head">
+            <div>
+              <span class="mypage-card-kicker">{html.escape(str(review['rating']))}점 · {html.escape(str(review_status_labels.get(review['status'], review['status'])))}</span>
+              <h3>{html.escape(str(review['restaurant_name']))}</h3>
+            </div>
+            <time>{html.escape(str(review['created_at'])[:10])}</time>
+          </div>
+          <p class="mypage-review-body">{html.escape(str(review['body']))}</p>
+          <p class="mypage-card-address">{html.escape(str(review.get('address') or '주소 정보 없음'))}</p>
+          <div class="mypage-card-actions">
+            <a href="/?restaurant_id={int(review['restaurant_id'])}">가게 보기</a>
+            <form action="/api/reviews/{int(review['id'])}/delete" method="post">
+              <input type="hidden" name="return_to" value="/mypage">
+              <button class="danger" type="submit">리뷰 삭제</button>
+            </form>
+          </div>
+        </article>"""
+        for review in reviews
+    ) or """<div class="mypage-empty">
+          <strong>아직 작성한 리뷰가 없어요.</strong>
+          <p>지도에서 다녀온 가게를 선택하고 첫 리뷰를 남겨보세요.</p>
+          <a href="/">가게 둘러보기</a>
+        </div>"""
+
+    saved_cards = "\n".join(
+        f"""<article class="mypage-card saved-card">
+          <div class="mypage-card-head">
+            <div>
+              <span class="mypage-card-kicker">{html.escape(str(restaurant['category_label']))}</span>
+              <h3>{html.escape(str(restaurant['name']))}</h3>
+            </div>
+            <span class="saved-mark" aria-label="저장됨">♥</span>
+          </div>
+          <p class="mypage-card-address">{html.escape(str(restaurant.get('road_address') or restaurant.get('address') or '주소 정보 없음'))}</p>
+          <div class="mypage-card-stats">
+            <span>공공기관 방문 <b>{int(restaurant['visit_count'])}회</b></span>
+            <span>평점 <b>{float(restaurant['average_rating']):.1f}</b></span>
+            <span>리뷰 <b>{int(restaurant['review_count'])}개</b></span>
+          </div>
+          <div class="mypage-card-actions">
+            <a href="/?restaurant_id={int(restaurant['id'])}">가게 보기</a>
+            <form action="/api/restaurants/{int(restaurant['id'])}/unsave" method="post">
+              <input type="hidden" name="return_to" value="/mypage">
+              <button type="submit">저장 해제</button>
+            </form>
+          </div>
+        </article>"""
+        for restaurant in saved_restaurants
+    ) or """<div class="mypage-empty">
+          <strong>저장한 가게가 아직 없어요.</strong>
+          <p>관심 있는 가게의 하트를 눌러 이곳에 모아보세요.</p>
+          <a href="/">가게 둘러보기</a>
+        </div>"""
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#063b3a">
+  <title>마이페이지 | {html.escape(app_name)}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="mypage-body">
+  <header class="mypage-header">
+    <a class="mypage-brand" href="/">{html.escape(app_name)}</a>
+    <nav aria-label="사용자 메뉴">
+      <a href="/">지도로 돌아가기</a>
+      <form action="/auth/logout" method="post">
+        <input type="hidden" name="return_to" value="/">
+        <button type="submit">로그아웃</button>
+      </form>
+    </nav>
+  </header>
+  <main class="mypage-shell">
+    <section class="mypage-hero">
+      <div class="mypage-avatar" aria-hidden="true">{initial}</div>
+      <div>
+        <span class="mypage-eyebrow">MY DINING ARCHIVE</span>
+        <h1>{display_name}님의 맛집 기록</h1>
+        <p>남긴 리뷰와 다시 찾고 싶은 가게를 한곳에서 관리하세요.</p>
+      </div>
+      <dl class="mypage-summary">
+        <div><dt>내 리뷰</dt><dd>{int(data['counts']['reviews'])}</dd></div>
+        <div><dt>저장한 가게</dt><dd>{int(data['counts']['saved_restaurants'])}</dd></div>
+      </dl>
+    </section>
+
+    <section class="mypage-section" aria-labelledby="saved-restaurants-title">
+      <div class="mypage-section-head">
+        <div><span>SAVED PLACES</span><h2 id="saved-restaurants-title">저장한 가게</h2></div>
+        <strong>{len(saved_restaurants)}곳</strong>
+      </div>
+      <div class="mypage-grid">{saved_cards}</div>
+    </section>
+
+    <section class="mypage-section" aria-labelledby="my-reviews-title">
+      <div class="mypage-section-head">
+        <div><span>MY REVIEWS</span><h2 id="my-reviews-title">내가 쓴 리뷰</h2></div>
+        <strong>{len(reviews)}개</strong>
+      </div>
+      <div class="mypage-grid">{review_cards}</div>
+    </section>
+  </main>
 </body>
 </html>"""
 
@@ -96,6 +344,7 @@ def admin_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -196,39 +445,21 @@ def admin_index() -> str:
       <div id="source-groups" class="source-groups"></div>
     </section>
 
-    <section class="collection-operations">
+    <section class="api-usage-section" aria-labelledby="api-usage-title">
       <div class="section-head">
         <div>
-          <span class="dashboard-eyebrow">수집 실행</span>
-          <h2>부산시 수집 작업</h2>
+          <span class="dashboard-eyebrow">외부 서비스 모니터링</span>
+          <h2 id="api-usage-title">API 연동 및 무료 사용량</h2>
+          <p id="api-usage-notice">연동 상태와 이 서버에서 기록한 호출량을 확인합니다.</p>
         </div>
-        <div class="collection-operation-actions">
-          <button id="create-collection-plan" type="button">수집 대상 확정</button>
-          <button id="run-plan-batch" type="button">계획 배치 수집</button>
-          <button id="retry-plan-failed" type="button">실패 문서 재처리</button>
-          <button id="run-live" type="button">즉시 수집</button>
+        <div class="api-usage-summary" aria-live="polite">
+          <strong id="api-connected-count">0/0</strong>
+          <span>API 연동</span>
         </div>
       </div>
-      <div class="live-collect-controls" aria-label="부산시 수집 조건">
-        <label>
-          <span>수집 시작일</span>
-          <input id="live-start-date" type="date" value="__START_DATE__">
-        </label>
-        <label>
-          <span>수집 종료일</span>
-          <input id="live-end-date" type="date" value="__END_DATE__">
-        </label>
-        <label>
-          <span>배치 크기</span>
-          <input id="collection-batch-size" type="number" min="1" max="200" value="20">
-        </label>
+      <div id="api-usage-grid" class="api-usage-grid">
+        <p class="empty">API 상태를 불러오는 중입니다.</p>
       </div>
-      <section id="collection-plan-status" class="batch-status" aria-live="polite">
-        <p>확정된 수집 계획이 없습니다.</p>
-      </section>
-      <section id="batch-status" class="batch-status" aria-live="polite">
-        <p>아직 실행된 배치가 없습니다.</p>
-      </section>
     </section>
   </main>
   <script src="/static/dashboard.js"></script>
@@ -243,6 +474,67 @@ def admin_index() -> str:
 
 def admin_parsing_index() -> str:
     return admin_workflow_index("parsing")
+
+
+def admin_restaurant_images_index() -> str:
+    return """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>음식점 사진 관리</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="admin-shell restaurant-image-admin-shell">
+    <header class="dashboard-header">
+      <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
+      <nav class="dashboard-nav" aria-label="관리자 메뉴">
+        <a href="/">운영 맵</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
+        <a href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
+        <a class="active" href="/admin/photos">사진</a>
+        <a href="/admin/logs">로그</a>
+      </nav>
+    </header>
+
+    <section class="restaurant-image-admin-head">
+      <div>
+        <span class="dashboard-eyebrow">관리자 직접 등록</span>
+        <h1>음식점 사진 관리</h1>
+        <p>관리자가 등록한 사진을 먼저 보여주고, 빈 자리는 네이버 이미지 검색 결과로 채웁니다.</p>
+      </div>
+      <a class="button-link secondary" href="/">운영 맵에서 확인</a>
+    </section>
+
+    <section class="restaurant-image-admin-layout">
+      <aside class="restaurant-image-restaurant-panel">
+        <form id="restaurant-image-search-form" class="restaurant-image-search">
+          <label for="restaurant-image-search">음식점 검색</label>
+          <div>
+            <input id="restaurant-image-search" type="search" placeholder="가게명 또는 주소">
+            <button type="submit">검색</button>
+          </div>
+        </form>
+        <p id="restaurant-image-search-summary" class="muted">음식점을 불러오는 중입니다.</p>
+        <div id="restaurant-image-restaurant-list" class="restaurant-image-restaurant-list"></div>
+      </aside>
+
+      <section id="restaurant-image-editor" class="restaurant-image-editor" aria-live="polite">
+        <div class="restaurant-image-editor-empty">
+          <strong>사진을 관리할 음식점을 선택하세요.</strong>
+          <span>가게당 최대 4장의 PNG, JPEG, WebP 사진을 등록할 수 있습니다.</span>
+        </div>
+      </section>
+    </section>
+    <div id="restaurant-image-toast" class="workflow-toast" hidden></div>
+  </main>
+  <script src="/static/admin_restaurant_images.js"></script>
+</body>
+</html>"""
 
 
 def _workflow_status_strip(mode: str) -> str:
@@ -470,6 +762,7 @@ def admin_workflow_index(mode: str = "collection") -> str:
         <a__ACTIVE_PARSING__ href="/admin/parsing">파싱</a>
         <a__ACTIVE_REVIEW__ href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -586,6 +879,7 @@ def admin_review_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -637,6 +931,7 @@ def map_issues_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -674,6 +969,7 @@ def ops_logs_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a class="active" href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -738,6 +1034,7 @@ def admin_documents_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
         <a class="active" href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -851,6 +1148,7 @@ def admin_document_detail_index() -> str:
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
         <a class="active" href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>

@@ -14,6 +14,12 @@ from http.server import ThreadingHTTPServer
 
 
 class HttpServerTests(unittest.TestCase):
+    PNG_1X1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+        b"\x1f\x15\xc4\x89"
+    )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         settings = Settings(db_path=Path(self.tmp.name) / "test.db", port=0)
@@ -44,6 +50,47 @@ class HttpServerTests(unittest.TestCase):
         with urlopen(request, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def post_multipart(
+        self,
+        path: str,
+        fields: dict[str, str],
+        filename: str,
+        content: bytes,
+        content_type: str = "image/png",
+    ) -> dict:
+        boundary = "----public-restaurant-test-boundary"
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.extend(
+                [
+                    f"--{boundary}\r\n".encode(),
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                    str(value).encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'.encode(),
+                f"Content-Type: {content_type}\r\n\r\n".encode(),
+                content,
+                b"\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+        request = Request(
+            f"{self.base_url}{path}",
+            data=b"".join(parts),
+            method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+            },
+        )
+        with urlopen(request, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def test_public_admin_and_ops_api(self) -> None:
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
         self.assertIn("공기밥", index)
@@ -51,6 +98,8 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("visit-filter-toggle", index)
         self.assertIn("visit-filter-label", index)
         self.assertIn('data-filter="min_visit_count"', index)
+        self.assertIn('data-filter="saved"', index)
+        self.assertIn("관심 가게", index)
         self.assertIn("10회 이상", index)
         admin = urlopen(f"{self.base_url}/admin", timeout=5).read().decode("utf-8")
         self.assertNotIn("live-max-pages", admin)
@@ -61,7 +110,10 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("dashboard-end-date", admin)
         self.assertIn("priority-chart", admin)
         self.assertIn("source-section", admin)
-        self.assertIn("collection-operations", admin)
+        self.assertIn("api-usage-section", admin)
+        self.assertIn("API 연동 및 무료 사용량", admin)
+        self.assertIn("api-usage-grid", admin)
+        self.assertNotIn("부산시 수집 작업", admin)
         self.assertIn("/admin/collection", admin)
         self.assertIn("대시보드", admin)
         self.assertNotIn("workflow-steps", admin)
@@ -146,6 +198,27 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(batch["status"], "success")
         restaurants = self.get_json("/api/map/restaurants")
         self.assertEqual(len(restaurants["restaurants"]), 3)
+        restaurant_detail = self.get_json(
+            f"/api/restaurants/{restaurants['restaurants'][0]['id']}"
+        )
+        self.assertEqual(len(restaurant_detail["visits"]), 1)
+        self.assertEqual(
+            set(restaurant_detail["ai_summary"]),
+            {
+                "text",
+                "status",
+                "summarized_review_count",
+                "current_review_count",
+                "next_summary_review_count",
+                "refresh_pending",
+                "last_generated_at",
+            },
+        )
+        self.assertEqual(restaurant_detail["ai_summary"]["next_summary_review_count"], 5)
+        self.assertEqual(
+            set(restaurant_detail["visits"][0]),
+            {"visited_at", "institution_name", "purpose"},
+        )
         visit_filtered = self.get_json("/api/map/restaurants?min_visit_count=10")
         self.assertEqual(visit_filtered["restaurants"], [])
         ranking = self.get_json("/api/rankings?category=cafe")
@@ -172,6 +245,23 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("overview", verification)
         self.assertIn("NAVER_SEARCH_CLIENT_ID", verification["missing_env"]["naver_search"])
         self.assertIn("pending_reviews", verification["overview"]["counts"])
+        api_usage = self.get_json("/ops/api-usage")
+        self.assertEqual(api_usage["connected_count"], 0)
+        self.assertEqual(api_usage["integration_count"], 4)
+        self.assertEqual(
+            {item["key"] for item in api_usage["integrations"]},
+            {"naver_place", "naver_image", "data_go_kr", "groq"},
+        )
+        self.assertTrue(
+            all(item["state"] == "disconnected" for item in api_usage["integrations"])
+        )
+        self.assertTrue(
+            all("인증 정보" in item["state_reason"] for item in api_usage["integrations"])
+        )
+        self.assertEqual(
+            next(item for item in api_usage["integrations"] if item["key"] == "groq")["usage"]["limit"],
+            1000,
+        )
         progress = self.get_json("/ops/verification-progress")
         self.assertIn("active", progress)
         self.assertIn("items", progress)
@@ -179,6 +269,70 @@ class HttpServerTests(unittest.TestCase):
             "/admin/candidates?start_date=2026-01-01&end_date=2026-12-31&limit=5"
         )
         self.assertIn("needs_review", candidates["groups"])
+
+    def test_api_usage_warning_explains_timeout_reason(self) -> None:
+        warning_app = PublicRestaurantApplication(
+            Settings(
+                db_path=Path(self.tmp.name) / "warning.db",
+                data_go_kr_service_key="configured-for-test",
+            )
+        )
+        with warning_app.database.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_call_logs
+                  (provider, endpoint, request_hash, success, error_message)
+                VALUES ('data_go_kr', 'food_permit_lookup', 'test-timeout', 0,
+                        'The read operation timed out')
+                """
+            )
+
+        status = warning_app.api_usage_status()
+        permit = next(
+            item for item in status["integrations"] if item["key"] == "data_go_kr"
+        )
+
+        self.assertEqual(permit["state"], "warning")
+        self.assertEqual(permit["state_label"], "확인 필요")
+        self.assertEqual(permit["state_reason"], "최근 호출 실패 · 응답 시간 초과")
+
+    def test_admin_can_upload_edit_and_delete_restaurant_image(self) -> None:
+        self.post_json("/ops/run-daily")
+        restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
+
+        admin_page = urlopen(f"{self.base_url}/admin/photos", timeout=5).read().decode("utf-8")
+        self.assertIn("음식점 사진 관리", admin_page)
+        self.assertIn("admin_restaurant_images.js", admin_page)
+        restaurant_list = self.get_json("/admin/photos/restaurants")
+        self.assertEqual(len(restaurant_list["restaurants"]), 3)
+
+        uploaded = self.post_multipart(
+            f"/admin/photos/restaurants/{restaurant_id}/images",
+            {"alt_text": "관리자 대표 사진", "sort_order": "1"},
+            "대표.png",
+            self.PNG_1X1,
+        )
+        self.assertEqual(len(uploaded["images"]), 1)
+        image = uploaded["images"][0]
+        self.assertTrue(image["is_admin_image"])
+        with urlopen(f"{self.base_url}{image['source_url']}", timeout=5) as response:
+            self.assertEqual(response.headers.get_content_type(), "image/png")
+            self.assertEqual(response.read(), self.PNG_1X1)
+
+        public_detail = self.get_json(f"/api/restaurants/{restaurant_id}")
+        self.assertEqual(public_detail["restaurant_images"][0]["provider"], "admin_upload")
+
+        updated = self.post_json(
+            f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}",
+            {"alt_text": "수정된 설명", "sort_order": 3},
+        )
+        self.assertEqual(updated["images"][0]["alt_text"], "수정된 설명")
+        self.assertEqual(updated["images"][0]["sort_order"], 3)
+
+        removed = self.post_json(
+            f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}/delete"
+        )
+        self.assertEqual(removed["images"], [])
 
     def test_review_api_rate_limit_status_code(self) -> None:
         self.post_json("/ops/run-daily")

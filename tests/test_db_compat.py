@@ -58,6 +58,16 @@ class DatabaseCompatibilityTests(unittest.TestCase):
         self.assertEqual(signature["restaurants"]["id"], "bigint")
         self.assertEqual(signature["restaurants"]["longitude"], "double precision")
         self.assertEqual(
+            signature["restaurant_ai_summaries"]["restaurant_id"],
+            "bigint",
+        )
+        self.assertEqual(
+            signature["restaurant_ai_summaries"]["summarized_review_count"],
+            "integer",
+        )
+        self.assertEqual(signature["user_saved_restaurants"]["user_id"], "bigint")
+        self.assertEqual(signature["user_saved_restaurants"]["restaurant_id"], "bigint")
+        self.assertEqual(
             signature["app_schema_migrations"]["applied_at"],
             "timestamp with time zone",
         )
