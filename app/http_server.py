@@ -10,6 +10,7 @@ from email.parser import BytesParser
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
@@ -55,6 +56,19 @@ OAUTH_STATE_COOKIE = "public_restaurant_oauth_state"
 OAUTH_RETURN_COOKIE = "public_restaurant_oauth_return"
 OAUTH_PROVIDER_COOKIE = "public_restaurant_oauth_provider"
 OAUTH_COOKIE_MAX_AGE_SECONDS = 10 * 60
+
+
+def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
+    try:
+        peer = ip_address(peer_ip)
+    except ValueError:
+        return peer_ip
+    if not peer.is_loopback or not forwarded_ip.strip():
+        return peer.compressed
+    try:
+        return ip_address(forwarded_ip.strip()).compressed
+    except ValueError:
+        return peer.compressed
 
 
 class PublicRestaurantApplication:
@@ -1235,7 +1249,10 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             current_user = self._current_user()
             user_id = int(current_user["id"]) if current_user else None
             return RequestContext(
-                ip=self.client_address[0],
+                ip=_trusted_proxy_client_ip(
+                    self.client_address[0],
+                    self.headers.get("X-Real-IP", ""),
+                ),
                 user_id=user_id,
                 actor_id=f"user:{user_id}" if user_id else str(payload.get("actor_id", "local-admin")),
             )

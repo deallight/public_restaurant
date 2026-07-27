@@ -9,7 +9,12 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from app.config import Settings
-from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
+from app.http_server import (
+    SESSION_COOKIE,
+    PublicRestaurantApplication,
+    _trusted_proxy_client_ip,
+    make_handler,
+)
 from http.server import ThreadingHTTPServer
 
 
@@ -429,19 +434,47 @@ class HttpServerTests(unittest.TestCase):
         admin_headers = self.session_headers("admin")
         self.post_json("/ops/run-daily", headers=admin_headers)
         restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
+        first_client = {"X-Real-IP": "203.0.113.10"}
         for index in range(3):
             review = self.post_json(
                 f"/api/restaurants/{restaurant_id}/reviews",
                 {"rating": 5, "body": f"좋아요 {index}", "reviewer_label": "방문자"},
+                headers=first_client,
             )
             self.assertEqual(review["status"], "visible")
         with self.assertRaises(HTTPError) as raised:
             self.post_json(
                 f"/api/restaurants/{restaurant_id}/reviews",
                 {"rating": 5, "body": "반복 리뷰", "reviewer_label": "방문자"},
+                headers=first_client,
             )
         self.assertEqual(raised.exception.code, 429)
         raised.exception.close()
+
+        different_client = self.post_json(
+            f"/api/restaurants/{restaurant_id}/reviews",
+            {"rating": 5, "body": "다른 사용자 리뷰", "reviewer_label": "방문자"},
+            headers={"X-Real-IP": "203.0.113.11"},
+        )
+        self.assertEqual(different_client["status"], "visible")
+
+    def test_forwarded_ip_is_only_trusted_from_loopback_proxy(self) -> None:
+        self.assertEqual(
+            _trusted_proxy_client_ip("127.0.0.1", "203.0.113.20"),
+            "203.0.113.20",
+        )
+        self.assertEqual(
+            _trusted_proxy_client_ip("::1", "2001:db8::20"),
+            "2001:db8::20",
+        )
+        self.assertEqual(
+            _trusted_proxy_client_ip("198.51.100.20", "203.0.113.20"),
+            "198.51.100.20",
+        )
+        self.assertEqual(
+            _trusted_proxy_client_ip("127.0.0.1", "not-an-ip"),
+            "127.0.0.1",
+        )
 
 
 if __name__ == "__main__":
