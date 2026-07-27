@@ -70,6 +70,54 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(rejected["result"], "rejected")
         self.assertEqual(service.admin_review_queue(), [])
 
+    def test_account_delete_contract(self) -> None:
+        DailyPipeline(self.db).run()
+        service = RestaurantService(self.db, review_rate_limit_per_hour=10)
+        account = service.upsert_oauth_account(
+            "naver", "postgres-delete-user", "PostgreSQL 탈퇴 사용자"
+        )
+        user_id = int(account["user"]["id"])
+        restaurant_id = int(service.list_map_restaurants()[0]["id"])
+        context = RequestContext(user_id=user_id, ip="203.0.113.92")
+        service.save_restaurant(user_id, restaurant_id)
+        review = service.add_review(
+            restaurant_id,
+            4,
+            "PostgreSQL 탈퇴 익명화 테스트",
+            "PostgreSQL 탈퇴 사용자",
+            context,
+        )
+        report = service.report_review(int(review["id"]), "spam_or_abuse", context)
+
+        result = service.delete_account(user_id)
+
+        self.assertEqual(result["result"], "deleted")
+        with self.db.session() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            oauth_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            saved_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            retained_review = conn.execute(
+                "SELECT * FROM restaurant_reviews WHERE id = ?", (review["id"],)
+            ).fetchone()
+            retained_report = conn.execute(
+                "SELECT * FROM review_reports WHERE id = ?", (report["id"],)
+            ).fetchone()
+        self.assertEqual(user["status"], "deleted")
+        self.assertEqual(user["display_name"], "탈퇴한 사용자")
+        self.assertEqual(oauth_count, 0)
+        self.assertEqual(saved_count, 0)
+        self.assertIsNone(retained_review["user_id"])
+        self.assertEqual(retained_review["reviewer_label"], "탈퇴한 사용자")
+        self.assertIsNone(retained_review["ip_hash"])
+        self.assertIsNone(retained_report["reporter_user_id"])
+        self.assertIsNone(retained_report["reporter_ip_hash"])
+
     def test_postgres_http_and_major_screen_contracts(self) -> None:
         settings = Settings(
             db_path=Path("unused.db"),

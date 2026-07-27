@@ -1380,10 +1380,127 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(AppError, "review not found"):
             self.service.delete_own_review(int(other["user"]["id"]), int(review["id"]))
 
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO restaurant_ai_summaries
+                  (restaurant_id, summary_text, summarized_review_count, status)
+                VALUES (?, '삭제할 리뷰를 포함한 요약', 5, 'ready')
+                """,
+                (restaurant_id,),
+            )
         self.service.delete_own_review(user_id, int(review["id"]))
         self.service.unsave_restaurant(user_id, restaurant_id)
         emptied = self.service.my_page(user_id)
         self.assertEqual(emptied["counts"], {"reviews": 0, "saved_restaurants": 0})
+        with self.db.session() as conn:
+            summary = conn.execute(
+                "SELECT * FROM restaurant_ai_summaries WHERE restaurant_id = ?",
+                (restaurant_id,),
+            ).fetchone()
+        self.assertEqual(summary["summary_text"], "")
+        self.assertEqual(summary["summarized_review_count"], 0)
+        self.assertEqual(summary["status"], "idle")
+        with self.db.session() as conn:
+            deleted_review = conn.execute(
+                "SELECT * FROM restaurant_reviews WHERE id = ?", (review["id"],)
+            ).fetchone()
+        self.assertIsNone(deleted_review["user_id"])
+        self.assertEqual(deleted_review["body"], "")
+        self.assertIsNone(deleted_review["ip_hash"])
+
+    def test_account_delete_removes_links_and_anonymizes_retained_activity(self) -> None:
+        account = self.service.upsert_oauth_account(
+            "naver", "delete-service-user", "탈퇴 사용자"
+        )
+        user_id = int(account["user"]["id"])
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        context = RequestContext(
+            user_id=user_id,
+            ip="203.0.113.81",
+            actor_id=f"user:{user_id}",
+        )
+        self.service.save_restaurant(user_id, restaurant_id)
+        review = self.service.add_review(
+            restaurant_id,
+            5,
+            "탈퇴 후에도 익명으로 남을 리뷰",
+            "탈퇴 사용자",
+            context,
+        )
+        report = self.service.report_review(int(review["id"]), "spam_or_abuse", context)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_moderation_logs
+                  (review_id, action, before_json, after_json)
+                VALUES (?, 'inspect', ?, ?)
+                """,
+                (review["id"], '{"reviewer_label":"탈퇴 사용자"}', '{"status":"visible"}'),
+            )
+
+        result = self.service.delete_account(user_id)
+
+        self.assertEqual(
+            result,
+            {
+                "result": "deleted",
+                "oauth_accounts_deleted": 1,
+                "saved_restaurants_deleted": 1,
+                "reviews_anonymized": 1,
+                "reports_anonymized": 1,
+            },
+        )
+        self.assertIsNone(self.service.get_active_user(user_id))
+        with self.db.session() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            linked_accounts = conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            saved = conn.execute(
+                "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            retained_review = conn.execute(
+                "SELECT * FROM restaurant_reviews WHERE id = ?", (review["id"],)
+            ).fetchone()
+            anonymized_report = conn.execute(
+                "SELECT * FROM review_reports WHERE id = ?", (report["id"],)
+            ).fetchone()
+            review_audits = conn.execute(
+                """
+                SELECT before_json, after_json FROM decision_audit_logs
+                WHERE target_type = 'restaurant_review' AND target_id = ?
+                """,
+                (review["id"],),
+            ).fetchall()
+            moderation = conn.execute(
+                "SELECT before_json, after_json FROM review_moderation_logs WHERE review_id = ?",
+                (review["id"],),
+            ).fetchone()
+
+        self.assertEqual(user["display_name"], "탈퇴한 사용자")
+        self.assertEqual(user["status"], "deleted")
+        self.assertEqual(linked_accounts, 0)
+        self.assertEqual(saved, 0)
+        self.assertIsNone(retained_review["user_id"])
+        self.assertEqual(retained_review["reviewer_label"], "탈퇴한 사용자")
+        self.assertIsNone(retained_review["ip_hash"])
+        self.assertIsNone(anonymized_report["reporter_user_id"])
+        self.assertIsNone(anonymized_report["reporter_ip_hash"])
+        self.assertTrue(review_audits)
+        self.assertTrue(
+            all(row["before_json"] == "{}" and row["after_json"] == "{}" for row in review_audits)
+        )
+        self.assertEqual(moderation["before_json"], "{}")
+        self.assertEqual(moderation["after_json"], "{}")
+
+        new_account = self.service.upsert_oauth_account(
+            "naver", "delete-service-user", "재가입 사용자"
+        )
+        self.assertTrue(new_account["created"])
+        self.assertNotEqual(int(new_account["user"]["id"]), user_id)
 
     def test_saved_restaurant_map_filter_is_scoped_to_logged_in_user(self) -> None:
         first = self.service.upsert_oauth_account("naver", "saved-filter-one", "첫 사용자")

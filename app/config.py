@@ -69,6 +69,7 @@ class Settings:
     data_go_kr_daily_quota: int = 10_000
     groq_daily_quota: int = 1_000
     app_name: str = "공기밥"
+    privacy_contact_email: str = ""
     review_rate_limit_per_hour: int = 3
 
 
@@ -81,6 +82,16 @@ def load_settings() -> Settings:
         raise ValueError("DATABASE_URL must use postgresql:// or sqlite:///")
     if app_env == "production" and not database_url.startswith(("postgresql://", "postgres://")):
         raise ValueError("APP_ENV=production requires a PostgreSQL DATABASE_URL")
+    privacy_contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "").strip()
+    email_local, email_separator, email_domain = privacy_contact_email.partition("@")
+    if app_env == "production" and (
+        not email_local
+        or email_separator != "@"
+        or not email_domain
+        or "@" in email_domain
+        or any(character.isspace() for character in privacy_contact_email)
+    ):
+        raise ValueError("APP_ENV=production requires PRIVACY_CONTACT_EMAIL")
     return Settings(
         db_path=db_path,
         database_url=database_url,
@@ -129,5 +140,6 @@ def load_settings() -> Settings:
             0, int(os.getenv("DATA_GO_KR_DAILY_QUOTA", "10000"))
         ),
         groq_daily_quota=max(0, int(os.getenv("GROQ_DAILY_QUOTA", "1000"))),
+        privacy_contact_email=privacy_contact_email,
         review_rate_limit_per_hour=int(os.getenv("REVIEW_RATE_LIMIT_PER_HOUR", "3")),
     )

@@ -9,6 +9,208 @@
   --focus: #f2b84b;
 }
 
+/* Legal pages and account controls */
+.auth-alert-success {
+  border-color: #b9ddd0;
+  color: #17644f;
+  background: #eef9f4;
+}
+
+.auth-legal-links,
+.site-policy-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px 18px;
+}
+
+.auth-legal-links {
+  margin-top: 18px;
+  font-size: 11px;
+}
+
+.auth-legal-links a,
+.site-policy-footer a {
+  color: #607370;
+  text-underline-offset: 3px;
+}
+
+.account-delete-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+  gap: 28px;
+  align-items: center;
+  border: 1px solid #e8cccc;
+  border-radius: 14px;
+  padding: 24px;
+  background: #fffafa;
+}
+
+.account-delete-section h2 {
+  margin: 4px 0 10px;
+  color: #713535;
+  font-size: 22px;
+}
+
+.account-delete-section p {
+  margin: 6px 0;
+  color: #765b5b;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.account-delete-form {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.account-delete-form label {
+  color: #624444;
+  font-size: 12px;
+}
+
+.account-delete-form > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.account-delete-form input {
+  min-width: 0;
+  border: 1px solid #d9bebe;
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #412f2f;
+  background: #fff;
+}
+
+.account-delete-form button {
+  border: 1px solid #a84444;
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: #fff;
+  background: #a84444;
+  font-weight: 800;
+}
+
+.account-delete-error {
+  color: #9b3434 !important;
+  font-weight: 800;
+}
+
+.site-policy-footer {
+  padding: 4px 20px 32px;
+  font-size: 12px;
+}
+
+.legal-body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  color: #243d3a;
+  background: #f4f7f5;
+}
+
+.legal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 64px;
+  border-bottom: 1px solid #dce6e1;
+  padding: 0 max(20px, calc((100vw - 840px) / 2));
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.legal-header a {
+  color: #063b3a;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.legal-header a:last-child {
+  font-size: 13px;
+}
+
+.legal-shell {
+  width: min(840px, calc(100% - 40px));
+  margin: 0 auto;
+  padding: 48px 0 52px;
+}
+
+.legal-heading {
+  margin-bottom: 28px;
+}
+
+.legal-heading span {
+  color: #0b7a75;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+}
+
+.legal-heading h1 {
+  margin: 8px 0 6px;
+  color: #063b3a;
+  font-size: clamp(30px, 5vw, 44px);
+  letter-spacing: -0.04em;
+}
+
+.legal-heading p,
+.legal-shell section p,
+.legal-shell li {
+  color: #5e706d;
+  line-height: 1.75;
+}
+
+.legal-shell section {
+  margin-top: 14px;
+  border: 1px solid #dce6e1;
+  border-radius: 12px;
+  padding: 22px 24px;
+  background: #fff;
+}
+
+.legal-shell section h2 {
+  margin: 0 0 10px;
+  color: #173f3b;
+  font-size: 18px;
+}
+
+.legal-shell section p {
+  margin: 7px 0;
+}
+
+.legal-shell ul {
+  margin: 9px 0;
+  padding-left: 22px;
+}
+
+.legal-shell a {
+  color: #08736d;
+}
+
+@media (max-width: 760px) {
+  .account-delete-section {
+    grid-template-columns: 1fr;
+    gap: 18px;
+    padding: 20px;
+  }
+
+  .account-delete-form > div {
+    grid-template-columns: 1fr;
+  }
+
+  .legal-shell {
+    width: min(100% - 28px, 840px);
+    padding-top: 28px;
+  }
+
+  .legal-shell section {
+    padding: 19px 18px;
+  }
+}
+
 /* My page */
 .mypage-body {
   min-width: 320px;
@@ -2170,8 +2372,30 @@ button {
 }
 
 .review-form textarea,
-.review-form button {
+.review-form button,
+.review-consent {
   grid-column: 1 / -1;
+}
+
+.review-consent {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  margin: 0;
+  color: #71817f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.review-form .review-consent input {
+  width: auto;
+  margin: 2px 0 0;
+}
+
+.review-consent a {
+  color: #0b7a75;
+  text-underline-offset: 2px;
 }
 
 .reviews article,

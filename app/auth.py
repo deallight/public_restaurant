@@ -70,6 +70,32 @@ class SessionCodec:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return None
 
+    def issue_action_token(self, session_token: str, action: str) -> str:
+        """Bind a CSRF token to one signed browser session and action."""
+        if self.verify(session_token) is None or not action:
+            raise ValueError("valid session and action are required")
+        return _base64url_encode(
+            hmac.new(
+                self._signing_key(),
+                f"{action}\0{session_token}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        )
+
+    def verify_action_token(
+        self,
+        session_token: str,
+        action: str,
+        supplied_token: str,
+    ) -> bool:
+        if not supplied_token:
+            return False
+        try:
+            expected_token = self.issue_action_token(session_token, action)
+        except ValueError:
+            return False
+        return hmac.compare_digest(supplied_token, expected_token)
+
     def _signing_key(self) -> bytes:
         return hmac.new(
             self.secret.encode("utf-8"),

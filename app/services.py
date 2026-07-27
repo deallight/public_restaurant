@@ -1042,6 +1042,7 @@ class RestaurantService:
         body: str,
         reviewer_label: str,
         context: RequestContext,
+        ai_processing_consent: bool = False,
     ) -> dict[str, Any]:
         if rating < 1 or rating > 5:
             raise AppError(400, "rating must be between 1 and 5")
@@ -1097,7 +1098,7 @@ class RestaurantService:
                 "review_create",
                 "restaurant_review",
                 int(cur.lastrowid),
-                after=review,
+                after=review | {"ai_processing_consent": bool(ai_processing_consent)},
                 reason_codes=["USER_REVIEW"],
             )
         try:
@@ -1181,10 +1182,36 @@ class RestaurantService:
             conn.execute(
                 """
                 UPDATE restaurant_reviews
-                SET status = 'deleted', updated_at = ?
+                SET user_id = NULL, body = '', reviewer_label = '삭제한 사용자',
+                    ip_hash = NULL, status = 'deleted', updated_at = ?
                 WHERE id = ? AND user_id = ?
                 """,
                 (utc_now(), review_id, user_id),
+            )
+            conn.execute(
+                """
+                UPDATE decision_audit_logs
+                SET before_json = '{}', after_json = '{}'
+                WHERE target_type = 'restaurant_review' AND target_id = ?
+                """,
+                (review_id,),
+            )
+            conn.execute(
+                """
+                UPDATE review_moderation_logs
+                SET before_json = '{}', after_json = '{}'
+                WHERE review_id = ?
+                """,
+                (review_id,),
+            )
+            conn.execute(
+                """
+                UPDATE restaurant_ai_summaries
+                SET summary_text = '', summarized_review_count = 0, status = 'idle',
+                    updated_at = ?
+                WHERE restaurant_id = ?
+                """,
+                (utc_now(), review["restaurant_id"]),
             )
             self._audit(
                 conn,
@@ -1192,8 +1219,8 @@ class RestaurantService:
                 "review_delete",
                 "restaurant_review",
                 review_id,
-                before=dict(review),
-                after={"status": "deleted"},
+                before={"restaurant_id": review["restaurant_id"], "status": review["status"]},
+                after={"status": "deleted", "content_removed": True},
                 reason_codes=["USER_REVIEW_DELETE"],
             )
         return {"review_id": review_id, "status": "deleted"}
@@ -1269,6 +1296,138 @@ class RestaurantService:
                 "saved_restaurants": len(saved_restaurants),
             },
         }
+
+    def delete_account(self, user_id: int) -> dict[str, Any]:
+        """Deactivate an account and remove or de-identify user-linked data."""
+        with self.database.session() as conn:
+            user = conn.execute(
+                "SELECT * FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                raise AppError(401, "login required")
+
+            review_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM restaurant_reviews WHERE user_id = ?",
+                    (user_id,),
+                )
+            ]
+            report_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM review_reports WHERE reporter_user_id = ?",
+                    (user_id,),
+                )
+            ]
+            oauth_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()["count"]
+            )
+            saved_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()["count"]
+            )
+
+            conn.execute(
+                "DELETE FROM account_merge_requests WHERE source_user_id = ? OR target_user_id = ?",
+                (user_id, user_id),
+            )
+            conn.execute("DELETE FROM oauth_accounts WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM user_saved_restaurants WHERE user_id = ?", (user_id,))
+            conn.execute(
+                """
+                UPDATE review_reports
+                SET reporter_user_id = NULL, reporter_ip_hash = NULL
+                WHERE reporter_user_id = ?
+                """,
+                (user_id,),
+            )
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE restaurant_reviews
+                SET user_id = NULL, reviewer_label = '탈퇴한 사용자', ip_hash = NULL,
+                    updated_at = ?
+                WHERE user_id = ?
+                """,
+                (now, user_id),
+            )
+
+            self._scrub_account_audit_data(conn, user_id, review_ids, report_ids)
+            conn.execute(
+                """
+                UPDATE users
+                SET display_name = '탈퇴한 사용자', role = 'user', status = 'deleted',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, user_id),
+            )
+            result = {
+                "result": "deleted",
+                "oauth_accounts_deleted": oauth_count,
+                "saved_restaurants_deleted": saved_count,
+                "reviews_anonymized": len(review_ids),
+                "reports_anonymized": len(report_ids),
+            }
+            self._audit(
+                conn,
+                "user",
+                "account_delete",
+                "user",
+                user_id,
+                after=result,
+                reason_codes=["USER_ACCOUNT_DELETE"],
+            )
+        return result
+
+    def _scrub_account_audit_data(
+        self,
+        conn: Any,
+        user_id: int,
+        review_ids: list[int],
+        report_ids: list[int],
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE decision_audit_logs
+            SET before_json = '{}', after_json = '{}'
+            WHERE target_type = 'user' AND target_id = ?
+            """,
+            (user_id,),
+        )
+        for target_type, target_ids in (
+            ("restaurant_review", review_ids),
+            ("review_report", report_ids),
+        ):
+            for offset in range(0, len(target_ids), 500):
+                target_id_batch = target_ids[offset : offset + 500]
+                placeholders = ", ".join("?" for _ in target_id_batch)
+                conn.execute(
+                    f"""
+                    UPDATE decision_audit_logs
+                    SET before_json = '{{}}', after_json = '{{}}'
+                    WHERE target_type = ? AND target_id IN ({placeholders})
+                    """,
+                    (target_type, *target_id_batch),
+                )
+        for offset in range(0, len(review_ids), 500):
+            review_id_batch = review_ids[offset : offset + 500]
+            placeholders = ", ".join("?" for _ in review_id_batch)
+            conn.execute(
+                f"""
+                UPDATE review_moderation_logs
+                SET before_json = '{{}}', after_json = '{{}}'
+                WHERE review_id IN ({placeholders})
+                """,
+                tuple(review_id_batch),
+            )
 
     def admin_review_queue(self, limit: int = 50) -> list[dict[str, Any]]:
         capped_limit = max(1, min(limit, 100))
