@@ -124,6 +124,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             database_url=TEST_DATABASE_URL,
             app_env="development",
             port=0,
+            session_secret="postgres-integration-test-session-secret",
         )
         app = PublicRestaurantApplication(settings)
         with app.database.session() as conn:
