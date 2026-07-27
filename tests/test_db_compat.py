@@ -77,6 +77,19 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires a PostgreSQL"):
                 load_settings()
 
+    def test_production_requires_privacy_contact_email(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "production",
+                "DATABASE_URL": "postgresql://restaurant_app@127.0.0.1/example",
+                "PRIVACY_CONTACT_EMAIL": "",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "PRIVACY_CONTACT_EMAIL"):
+                load_settings()
+
     def test_postgres_runtime_prepare_never_initializes_schema(self) -> None:
         database = Database("postgresql://restaurant_app@127.0.0.1/example_test")
         with patch.object(database, "verify_schema") as verify_schema, patch.object(

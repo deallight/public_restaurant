@@ -926,6 +926,10 @@ async function selectRestaurant(id) {
           ${window.IS_SIGNED_IN ? "disabled" : ""}
         >
         <textarea name="body" placeholder="리뷰" rows="3"></textarea>
+        <label class="review-consent">
+          <input type="checkbox" name="ai_processing_consent" value="1" required>
+          <span>공개 리뷰 본문의 AI 요약 처리를 확인하고 동의합니다. 개인정보는 입력하지 마세요. <a href="/privacy" target="_blank" rel="noopener noreferrer">자세히 보기</a></span>
+        </label>
         <button type="submit">등록</button>
       </form>
     </section>

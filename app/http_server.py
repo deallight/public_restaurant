@@ -47,6 +47,8 @@ from .views import (
     public_index,
     login_index,
     mypage_index,
+    privacy_index,
+    terms_index,
 )
 
 
@@ -56,6 +58,7 @@ OAUTH_STATE_COOKIE = "public_restaurant_oauth_state"
 OAUTH_RETURN_COOKIE = "public_restaurant_oauth_return"
 OAUTH_PROVIDER_COOKIE = "public_restaurant_oauth_provider"
 OAUTH_COOKIE_MAX_AGE_SECONDS = 10 * 60
+ACCOUNT_DELETE_ACTION = "account-delete"
 
 
 def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
@@ -505,19 +508,40 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             current_user=self._current_user(),
                             naver_configured=self._provider_configured("naver"),
                             return_to=return_to,
+                            account_deleted=query.get("account_deleted") == "1",
                         )
                     )
                 elif path == "/signup":
                     self._redirect("/login", status=302)
+                elif path == "/privacy":
+                    self._html(
+                        privacy_index(
+                            app.settings.app_name,
+                            app.settings.privacy_contact_email,
+                        )
+                    )
+                elif path == "/terms":
+                    self._html(
+                        terms_index(
+                            app.settings.app_name,
+                            app.settings.privacy_contact_email,
+                        )
+                    )
                 elif path == "/mypage":
                     current_user = self._current_user()
                     if current_user is None:
                         self._redirect("/login?return_to=/mypage", status=302)
                     else:
+                        session_token = self._cookies().get(SESSION_COOKIE, "")
                         self._html(
                             mypage_index(
                                 app.settings.app_name,
                                 app.service.my_page(int(current_user["id"])),
+                                account_delete_token=app.session_codec.issue_action_token(
+                                    session_token,
+                                    ACCOUNT_DELETE_ACTION,
+                                ),
+                                account_error=str(query.get("account_error", "")),
                             )
                         )
                 elif path in {"/admin", "/admin/dashboard"}:
@@ -871,6 +895,11 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 elif path.startswith("/api/restaurants/") and path.endswith("/reviews"):
                     restaurant_id = int(path.split("/")[3])
                     current_user = self._current_user()
+                    ai_processing_consent = str(
+                        payload.get("ai_processing_consent", "")
+                    ).strip().lower() in {"1", "true", "on", "yes"}
+                    if not ai_processing_consent:
+                        raise AppError(400, "AI review processing consent is required")
                     review = app.service.add_review(
                         restaurant_id=restaurant_id,
                         rating=int(payload.get("rating", 0)),
@@ -881,6 +910,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             else str(payload.get("reviewer_label", "방문자"))
                         ),
                         context=context,
+                        ai_processing_consent=ai_processing_consent,
                     )
                     self._json(review, status=201)
                 elif path.startswith("/api/reviews/") and path.endswith("/report"):
@@ -973,6 +1003,29 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             else None,
                         )
                     )
+                elif path == "/account/delete":
+                    current_user = self._authenticated_user()
+                    session_token = self._cookies().get(SESSION_COOKIE, "")
+                    if not app.session_codec.verify_action_token(
+                        session_token,
+                        ACCOUNT_DELETE_ACTION,
+                        str(payload.get("action_token", "")),
+                    ):
+                        raise AppError(403, "invalid account action token")
+                    if str(payload.get("confirmation", "")).strip() != "계정 삭제":
+                        if self._wants_json():
+                            raise AppError(400, "account deletion confirmation is required")
+                        self._redirect("/mypage?account_error=confirmation")
+                        return
+                    result = app.service.delete_account(int(current_user["id"]))
+                    expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
+                    if self._wants_json():
+                        self._json(result, cookies=[expired_session])
+                    else:
+                        self._redirect(
+                            "/login?account_deleted=1",
+                            cookies=[expired_session],
+                        )
                 elif path == "/auth/logout":
                     expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
                     if self._wants_json():

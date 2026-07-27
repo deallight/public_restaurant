@@ -109,6 +109,7 @@ def login_index(
     current_user: dict | None = None,
     naver_configured: bool = True,
     return_to: str = "/",
+    account_deleted: bool = False,
 ) -> str:
     escaped_app_name = html.escape(app_name)
     error_messages = {
@@ -121,7 +122,11 @@ def login_index(
     alert_markup = (
         f'<div class="auth-alert" role="alert">{html.escape(error_message)}</div>'
         if error_message
-        else ""
+        else (
+            '<div class="auth-alert auth-alert-success" role="status">계정과 네이버 연결 정보가 삭제되었습니다.</div>'
+            if account_deleted
+            else ""
+        )
     )
     if current_user:
         raw_display_name = str(current_user.get("display_name", "사용자"))
@@ -192,9 +197,13 @@ def login_index(
         </div>
         <div class="auth-assurance">
           <div><span aria-hidden="true">✓</span><p><strong>비밀번호를 저장하지 않아요</strong>네이버에서 안전하게 인증합니다.</p></div>
-          <div><span aria-hidden="true">✓</span><p><strong>최소 정보만 사용해요</strong>회원 식별값과 표시 이름만 저장합니다.</p></div>
+          <div><span aria-hidden="true">✓</span><p><strong>최소 정보만 사용해요</strong>로그인 때는 네이버 회원 식별값과 별명만 받습니다.</p></div>
         </div>
         <p class="auth-footnote">등록된 계정이 없으면 인증 과정에서 자동으로 만들어집니다.</p>
+        <nav class="auth-legal-links" aria-label="서비스 정책">
+          <a href="/privacy">개인정보처리방침</a>
+          <a href="/terms">이용약관</a>
+        </nav>
       </div>
     </section>
   </main>
@@ -202,12 +211,22 @@ def login_index(
 </html>"""
 
 
-def mypage_index(app_name: str, data: dict) -> str:
+def mypage_index(
+    app_name: str,
+    data: dict,
+    account_delete_token: str = "",
+    account_error: str = "",
+) -> str:
     user = data["user"]
     reviews = data["reviews"]
     saved_restaurants = data["saved_restaurants"]
     display_name = html.escape(str(user.get("display_name", "사용자")))
     initial = html.escape(str(user.get("display_name", "사"))[:1] or "사")
+    account_error_markup = (
+        '<p class="account-delete-error" role="alert">확인 문구로 ‘계정 삭제’를 정확히 입력해 주세요.</p>'
+        if account_error == "confirmation"
+        else ""
+    )
 
     review_status_labels = {
         "visible": "공개 중",
@@ -318,7 +337,123 @@ def mypage_index(app_name: str, data: dict) -> str:
       </div>
       <div class="mypage-grid">{review_cards}</div>
     </section>
+
+    <section class="mypage-section account-delete-section" aria-labelledby="account-delete-title">
+      <div>
+        <span class="mypage-eyebrow">ACCOUNT CONTROL</span>
+        <h2 id="account-delete-title">계정 삭제</h2>
+        <p>네이버 연결 정보와 저장한 가게는 즉시 삭제됩니다. 작성한 리뷰는 작성자와 접속 식별값을 제거한 뒤 ‘탈퇴한 사용자’의 리뷰로 남습니다.</p>
+        <p>리뷰 본문까지 삭제하려면 계정을 삭제하기 전에 위의 ‘리뷰 삭제’를 먼저 이용해 주세요. 백업 사본은 최대 30일 안에 순차 삭제됩니다.</p>
+      </div>
+      <form class="account-delete-form" action="/account/delete" method="post">
+        <input type="hidden" name="action_token" value="{html.escape(account_delete_token)}">
+        <label for="account-delete-confirmation">계속하려면 <strong>계정 삭제</strong>를 입력하세요.</label>
+        <div>
+          <input id="account-delete-confirmation" name="confirmation" type="text" autocomplete="off" required>
+          <button type="submit">계정 삭제</button>
+        </div>
+        {account_error_markup}
+      </form>
+    </section>
   </main>
+  <footer class="site-policy-footer">
+    <a href="/privacy">개인정보처리방침</a>
+    <a href="/terms">이용약관</a>
+  </footer>
+</body>
+</html>"""
+
+
+def privacy_index(app_name: str = "공기밥", contact_email: str = "") -> str:
+    escaped_app_name = html.escape(app_name)
+    escaped_email = html.escape(contact_email)
+    contact_markup = (
+        f'<a href="mailto:{escaped_email}">{escaped_email}</a>'
+        if escaped_email
+        else "운영 환경에 등록된 개인정보 문의 이메일"
+    )
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#063b3a">
+  <title>개인정보처리방침 | {escaped_app_name}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="legal-body">
+  <header class="legal-header"><a href="/">{escaped_app_name}</a><a href="/login">로그인</a></header>
+  <main class="legal-shell">
+    <div class="legal-heading"><span>PRIVACY POLICY</span><h1>개인정보처리방침</h1><p>시행일: 2026년 7월 27일</p></div>
+    <section><h2>1. 처리 목적과 항목</h2>
+      <p>{escaped_app_name}은 로그인과 사용자 기능 제공, 리뷰 운영, 부정 이용 방지, 장애 대응을 위해 필요한 최소한의 정보만 처리합니다.</p>
+      <ul>
+        <li>네이버 로그인: 네이버가 제공하는 회원 식별값과 별명</li>
+        <li>사용자 기능: 저장한 가게, 작성한 리뷰·별점, 리뷰 신고 내역</li>
+        <li>보안·운영: 세션 쿠키, 접속 IP와 브라우저 정보가 포함될 수 있는 서버 접속 기록, 리뷰·신고 시 생성되는 단방향 IP 식별값</li>
+      </ul>
+      <p>비밀번호, 성별, 생일, 출생연도, 휴대전화번호는 수집하지 않습니다.</p>
+    </section>
+    <section><h2>2. 보유 및 파기</h2>
+      <ul>
+        <li>계정과 네이버 연결 정보: 회원 탈퇴 시 즉시 삭제 또는 비식별화</li>
+        <li>저장한 가게: 회원 탈퇴 시 즉시 삭제</li>
+        <li>리뷰: 사용자가 삭제할 때까지 공개되며, 회원 탈퇴 시 작성자와 IP 식별값을 제거하여 익명화</li>
+        <li>세션 쿠키: 로그인 후 최대 7일, OAuth 진행 쿠키: 최대 10분</li>
+        <li>서버 접속 기록: 보안 및 장애 대응을 위해 최대 90일</li>
+        <li>백업 사본: 생성 후 최대 30일</li>
+      </ul>
+      <p>보유 기간이 끝난 전자 기록은 복구하기 어렵도록 삭제하거나 식별할 수 없도록 처리합니다.</p>
+    </section>
+    <section><h2>3. 외부 서비스 및 처리 위탁</h2>
+      <p>네이버 로그인 인증 과정은 네이버에서 진행됩니다. 네이버 지도·검색 및 공공데이터 API에는 장소명·주소 등 음식점 검색에 필요한 정보만 전송하며, 회원 식별값은 전송하지 않습니다.</p>
+      <p>리뷰 작성 화면에서 별도 동의한 경우 음식점명, 별점, 공개 리뷰 본문을 암호화된 API 통신으로 미국의 Groq, Inc.에 전송하여 AI 요약 생성을 맡깁니다. 별명과 네이버 회원 식별값은 요청에 포함하지 않습니다. Groq는 일반 추론 요청의 입력·출력을 기본적으로 보관하지 않지만, 장애 대응·부정 이용 조사 시 미국의 GCP에 최대 30일 보관할 수 있다고 고지합니다. 동의하지 않으면 리뷰를 등록할 수 없지만 지도·검색·저장 등 다른 기능은 이용할 수 있습니다. 자세한 내용은 <a href="https://console.groq.com/docs/your-data" target="_blank" rel="noopener noreferrer">Groq 데이터 처리 안내</a>에서 확인할 수 있습니다.</p>
+    </section>
+    <section><h2>4. 이용자의 권리</h2>
+      <p>이용자는 마이페이지에서 저장한 가게와 리뷰를 관리하고 계정을 삭제할 수 있습니다. 리뷰 본문까지 삭제하려면 회원 탈퇴 전에 해당 리뷰를 먼저 삭제해야 합니다. 그 밖의 열람·정정·삭제·처리정지 요청은 아래 연락처로 접수할 수 있습니다.</p>
+    </section>
+    <section><h2>5. 안전성 확보 조치</h2>
+      <p>HTTPS 통신, 비밀번호를 저장하지 않는 OAuth 로그인, 서명된 세션, 접근권한 제한, 방화벽, 데이터베이스의 로컬 전용 바인딩, 정기 백업과 보안 업데이트를 적용합니다.</p>
+    </section>
+    <section><h2>6. 개인정보 문의</h2><p>공기밥 개인정보 보호 담당 · {contact_markup}</p></section>
+    <section><h2>7. 변경 고지</h2><p>방침이 변경되면 시행 전에 이 페이지에서 변경 내용과 시행일을 알립니다.</p></section>
+  </main>
+  <footer class="site-policy-footer"><a href="/privacy" aria-current="page">개인정보처리방침</a><a href="/terms">이용약관</a></footer>
+</body>
+</html>"""
+
+
+def terms_index(app_name: str = "공기밥", contact_email: str = "") -> str:
+    escaped_app_name = html.escape(app_name)
+    escaped_email = html.escape(contact_email)
+    contact_markup = (
+        f'<a href="mailto:{escaped_email}">{escaped_email}</a>'
+        if escaped_email
+        else "운영 환경에 등록된 문의 이메일"
+    )
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#063b3a">
+  <title>이용약관 | {escaped_app_name}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="legal-body">
+  <header class="legal-header"><a href="/">{escaped_app_name}</a><a href="/login">로그인</a></header>
+  <main class="legal-shell">
+    <div class="legal-heading"><span>TERMS OF SERVICE</span><h1>이용약관</h1><p>시행일: 2026년 7월 27일</p></div>
+    <section><h2>1. 목적</h2><p>이 약관은 {escaped_app_name}이 제공하는 공공기관 방문 기록 기반 음식점 탐색, 저장, 리뷰 기능의 이용 조건을 정합니다.</p></section>
+    <section><h2>2. 계정과 로그인</h2><p>네이버 인증이 완료되면 계정이 자동 생성됩니다. 이용자는 자신의 인증 수단을 안전하게 관리해야 하며, 타인의 계정을 사용하거나 서비스 운영을 방해해서는 안 됩니다.</p></section>
+    <section><h2>3. 공공데이터와 서비스 정보</h2><p>음식점 방문 기록과 순위는 공개 자료를 수집·검증한 결과입니다. 원문 변경, 수집 시점, 외부 API 상태에 따라 실제 정보와 차이가 있을 수 있으므로 중요한 판단에는 원 출처를 함께 확인해 주세요.</p></section>
+    <section><h2>4. 사용자 콘텐츠</h2><p>이용자는 자신이 작성한 리뷰에 대한 책임을 집니다. 불법 정보, 개인정보 침해, 명예훼손, 광고·스팸, 조작된 내용은 게시할 수 없습니다. 신고 또는 운영상 필요가 있으면 해당 콘텐츠를 숨기거나 삭제할 수 있습니다.</p></section>
+    <section><h2>5. 계정 삭제</h2><p>마이페이지에서 언제든 계정을 삭제할 수 있습니다. 네이버 연결 정보와 저장한 가게는 삭제되고, 공개 리뷰는 작성자 정보가 제거된 상태로 남습니다. 리뷰 본문까지 삭제하려면 탈퇴 전에 리뷰 삭제 기능을 이용해야 합니다.</p></section>
+    <section><h2>6. 서비스 변경과 중단</h2><p>점검, 장애, 외부 서비스 변경, 천재지변 등으로 서비스 일부가 변경되거나 일시 중단될 수 있습니다. 중요한 변경은 가능한 범위에서 서비스 화면을 통해 안내합니다.</p></section>
+    <section><h2>7. 책임의 범위</h2><p>고의 또는 중대한 과실이 없는 한 무료로 제공되는 정보의 최신성·완전성, 이용자의 선택 또는 외부 서비스 장애로 생긴 간접 손해를 보증하지 않습니다. 관계 법령에서 달리 정한 책임은 그 규정을 따릅니다.</p></section>
+    <section><h2>8. 문의</h2><p>약관 및 서비스 문의 · {contact_markup}</p></section>
+  </main>
+  <footer class="site-policy-footer"><a href="/privacy">개인정보처리방침</a><a href="/terms" aria-current="page">이용약관</a></footer>
 </body>
 </html>"""
 

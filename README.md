@@ -117,6 +117,7 @@ curl http://127.0.0.1:8000/api/map/restaurants
 | `GROQ_DAILY_QUOTA` | 관리자 대시보드의 Groq 일일 요청 한도 기준값 (기본 `1000`) |
 | `NAVER_LOGIN_CLIENT_ID`, `NAVER_LOGIN_CLIENT_SECRET`, `NAVER_LOGIN_REDIRECT_URI` | 네이버 로그인 |
 | `APP_SESSION_SECRET` | 로그인 세션 서명 전용 비밀값(선택, 미설정 시 로그인 provider secret에서 별도 키 파생) |
+| `PRIVACY_CONTACT_EMAIL` | 개인정보처리방침·이용약관에 공개할 문의 이메일. 운영 환경에서는 필수 |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | 구글 OAuth |
 | `REVIEW_RATE_LIMIT_PER_HOUR` | 같은 음식점에 대한 사용자/IP 기준 시간당 리뷰 제한 |
 
@@ -131,6 +132,8 @@ curl http://127.0.0.1:8000/api/map/restaurants
 서버를 시작한 뒤 `http://127.0.0.1:8000/login`에서 확인합니다.
 
 별도 회원가입 화면은 없습니다. 네이버 인증 후 등록된 회원 정보가 있으면 기존 계정으로 로그인하고, 없으면 회원 계정을 자동 생성한 뒤 바로 로그인합니다.
+
+개인정보처리방침은 `/privacy`, 이용약관은 `/terms`에서 공개됩니다. 공개 리뷰 등록에는 AI 요약 처리를 위한 별도 확인·동의가 필요합니다. 사용자는 마이페이지에서 계정을 삭제할 수 있습니다. 탈퇴하면 OAuth 연결과 저장 목록은 즉시 삭제되고 작성 리뷰는 작성자와 IP 식별값이 제거된 익명 리뷰로 남으므로, 리뷰 본문도 지우려면 탈퇴 전에 리뷰를 먼저 삭제해야 합니다. 운영 백업은 최대 30일 안에 순차 삭제하는 정책을 전제로 합니다.
 
 ## 데이터 파이프라인
 

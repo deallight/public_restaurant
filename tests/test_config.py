@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from app.config import load_dotenv, read_dotenv
+from app.config import Settings, load_dotenv, read_dotenv
+from app.server import main
 
 
 class ConfigTests(unittest.TestCase):
@@ -40,6 +42,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded["APP_PORT"], "9000")
         self.assertEqual(environ["APP_PORT"], "8000")
         self.assertEqual(environ["APP_HOST"], "0.0.0.0")
+
+    def test_server_cli_overrides_preserve_all_loaded_settings(self) -> None:
+        settings = Settings(
+            db_path=Path("original.db"),
+            host="127.0.0.1",
+            port=8000,
+            privacy_contact_email="privacy@example.test",
+        )
+        server = MagicMock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with patch("app.server.load_settings", return_value=settings), patch(
+            "app.server.serve", return_value=server
+        ) as serve, patch("sys.argv", ["app.server", "--port", "18002"]):
+            main()
+
+        runtime_settings = serve.call_args.args[0]
+        self.assertEqual(runtime_settings.port, 18002)
+        self.assertEqual(runtime_settings.privacy_contact_email, "privacy@example.test")
+        server.server_close.assert_called_once_with()
 
 
 if __name__ == "__main__":
