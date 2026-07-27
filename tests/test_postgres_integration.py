@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 
 from app.config import Settings
 from app.database import Database, SQLITE_TABLES
-from app.http_server import PublicRestaurantApplication, make_handler
+from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
 from app.pipeline import DailyPipeline
 from app.services import RequestContext, RestaurantService
 
@@ -78,6 +78,14 @@ class PostgresIntegrationTests(unittest.TestCase):
             port=0,
         )
         app = PublicRestaurantApplication(settings)
+        with app.database.session() as conn:
+            admin_user = conn.execute(
+                "INSERT INTO users (display_name, role) VALUES (?, ?) RETURNING id",
+                ("PostgreSQL admin test user", "admin"),
+            ).fetchone()
+        admin_headers = {
+            "Cookie": f"{SESSION_COOKIE}={app.issue_session(int(admin_user['id']))}"
+        }
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -93,14 +101,15 @@ class PostgresIntegrationTests(unittest.TestCase):
                 ("/admin/map-issues", "승인 항목 점검"),
                 ("/admin/logs", "수집/검증 로그"),
             ]:
-                with urlopen(f"{base_url}{path}", timeout=5) as response:
+                request = Request(f"{base_url}{path}", headers=admin_headers)
+                with urlopen(request, timeout=5) as response:
                     self.assertEqual(response.status, 200)
                     self.assertIn(marker, response.read().decode("utf-8"))
             request = Request(
                 f"{base_url}/ops/run-daily",
                 data=b"{}",
                 method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", **admin_headers},
             )
             with urlopen(request, timeout=10) as response:
                 self.assertEqual(json.load(response)["status"], "success")
@@ -112,8 +121,11 @@ class PostgresIntegrationTests(unittest.TestCase):
                 ("/ops/sources", "summary"),
             ]:
                 with self.subTest(path=path):
+                    headers = {"Accept": "application/json"}
+                    if path.startswith(("/admin", "/ops", "/review")):
+                        headers.update(admin_headers)
                     request = Request(
-                        f"{base_url}{path}", headers={"Accept": "application/json"}
+                        f"{base_url}{path}", headers=headers
                     )
                     with urlopen(request, timeout=5) as response:
                         self.assertEqual(response.status, 200)

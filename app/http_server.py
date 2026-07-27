@@ -472,6 +472,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = self._query(parsed.query)
+                if self._is_admin_route(path):
+                    self._admin_user()
                 if path == "/":
                     self._html(
                         public_index(
@@ -519,10 +521,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 elif path == "/admin/logs":
                     self._html(ops_logs_index())
                 elif path == "/admin/photos":
-                    self._admin_user()
                     self._html(admin_restaurant_images_index())
                 elif path == "/admin/photos/restaurants":
-                    self._admin_user()
                     self._json(
                         app.service.admin_restaurants_for_images(
                             q=str(query.get("q", "")),
@@ -530,7 +530,6 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                     )
                 elif path.startswith("/admin/photos/restaurants/"):
-                    self._admin_user()
                     parts = path.strip("/").split("/")
                     if len(parts) != 4:
                         raise AppError(404, "not found")
@@ -701,7 +700,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path
-                if path.startswith("/admin/photos/restaurants/"):
+                if self._is_admin_route(path):
                     self._admin_user()
                 payload = self._payload()
                 context = self._context(payload)
@@ -1267,6 +1266,11 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             if str(current_user.get("role") or "").lower() != "admin":
                 raise AppError(403, "admin access required")
             return current_user
+
+        def _is_admin_route(self, path: str) -> bool:
+            return path in {"/admin", "/ops", "/review"} or path.startswith(
+                ("/admin/", "/ops/", "/review/")
+            )
 
         def _safe_return_to(self, value: str) -> str:
             value = (value or "/").strip()
