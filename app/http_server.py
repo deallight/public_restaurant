@@ -519,8 +519,10 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 elif path == "/admin/logs":
                     self._html(ops_logs_index())
                 elif path == "/admin/photos":
+                    self._admin_user()
                     self._html(admin_restaurant_images_index())
                 elif path == "/admin/photos/restaurants":
+                    self._admin_user()
                     self._json(
                         app.service.admin_restaurants_for_images(
                             q=str(query.get("q", "")),
@@ -528,6 +530,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                     )
                 elif path.startswith("/admin/photos/restaurants/"):
+                    self._admin_user()
                     parts = path.strip("/").split("/")
                     if len(parts) != 4:
                         raise AppError(404, "not found")
@@ -698,6 +701,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path
+                if path.startswith("/admin/photos/restaurants/"):
+                    self._admin_user()
                 payload = self._payload()
                 context = self._context(payload)
                 if path == "/ops/run-daily":
@@ -1255,6 +1260,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             current_user = self._current_user()
             if current_user is None:
                 raise AppError(401, "login required")
+            return current_user
+
+        def _admin_user(self) -> dict:
+            current_user = self._authenticated_user()
+            if str(current_user.get("role") or "").lower() != "admin":
+                raise AppError(403, "admin access required")
             return current_user
 
         def _safe_return_to(self, value: str) -> str:

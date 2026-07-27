@@ -238,6 +238,10 @@ curl -X POST http://127.0.0.1:8000/ops/verify-collected \
 
 관리자 API:
 
+사진 관리 화면과 아래 `/admin/photos` API는 로그인한 사용자의 `users.role`이
+`admin`일 때만 접근할 수 있다. 공개 음식점 상세 응답과
+`/media/restaurant-images/...` 이미지 제공 경로는 계속 공개된다.
+
 - `GET /admin/photos`: 음식점 사진 관리 화면
 - `GET /admin/photos/restaurants`
 - `GET /admin/photos/restaurants/{restaurant_id}`

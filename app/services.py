@@ -315,16 +315,7 @@ class RestaurantService:
                     (restaurant_id,),
                 )
             ]
-            visible_review_count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM restaurant_reviews
-                    WHERE restaurant_id = ? AND status = 'visible'
-                    """,
-                    (restaurant_id,),
-                ).fetchone()["c"]
-            )
+            visible_review_count = int(row["review_count"] or 0)
             visits = [
                 dict(visit)
                 for visit in conn.execute(
@@ -2794,9 +2785,14 @@ class RestaurantService:
             ).fetchall()
             latest_rows = conn.execute(
                 """
-                SELECT provider, success, status_code, error_message, called_at
-                FROM api_call_logs
-                ORDER BY id DESC
+                SELECT logs.provider, logs.success, logs.status_code,
+                       logs.error_message, logs.called_at
+                FROM api_call_logs logs
+                JOIN (
+                  SELECT provider, MAX(id) AS id
+                  FROM api_call_logs
+                  GROUP BY provider
+                ) latest ON latest.id = logs.id
                 """
             ).fetchall()
             ai_attempts = conn.execute(

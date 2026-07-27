@@ -1181,6 +1181,47 @@ class ServiceTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(int(image_log["success"]), 0)
 
+    def test_api_usage_metrics_uses_latest_log_per_provider(self) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_call_logs
+                  (provider, endpoint, request_hash, success, status_code,
+                   error_message, called_at)
+                VALUES ('provider-a', 'lookup', 'provider-a-old', 0, 503,
+                        'temporary failure', '2026-07-26T23:59:00')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO api_call_logs
+                  (provider, endpoint, request_hash, success, status_code,
+                   error_message, called_at)
+                VALUES ('provider-b', 'lookup', 'provider-b-latest', 0, 429,
+                        'quota exceeded', '2026-07-27T00:02:00')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO api_call_logs
+                  (provider, endpoint, request_hash, success, status_code,
+                   error_message, called_at)
+                VALUES ('provider-a', 'lookup', 'provider-a-latest', 1, 200,
+                        NULL, '2026-07-27T00:03:00')
+                """
+            )
+
+        metrics = self.service.api_usage_metrics("2026-07-27", "2026-07")
+
+        self.assertEqual(metrics["provider-a"]["day_count"], 1)
+        self.assertEqual(metrics["provider-a"]["month_count"], 2)
+        self.assertTrue(metrics["provider-a"]["last_success"])
+        self.assertEqual(metrics["provider-a"]["last_status_code"], 200)
+        self.assertIsNone(metrics["provider-a"]["last_error"])
+        self.assertFalse(metrics["provider-b"]["last_success"])
+        self.assertEqual(metrics["provider-b"]["last_status_code"], 429)
+        self.assertEqual(metrics["provider-b"]["last_error"], "quota exceeded")
+
     def test_admin_image_upload_precedes_search_images_and_can_be_edited(self) -> None:
         restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
         client = FakeRestaurantImageClient()

@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from app.config import Settings
-from app.http_server import PublicRestaurantApplication, make_handler
+from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
 from http.server import ThreadingHTTPServer
 
 
@@ -22,9 +22,13 @@ class HttpServerTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        settings = Settings(db_path=Path(self.tmp.name) / "test.db", port=0)
-        app = PublicRestaurantApplication(settings)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+        settings = Settings(
+            db_path=Path(self.tmp.name) / "test.db",
+            port=0,
+            session_secret="http-server-test-session-secret",
+        )
+        self.app = PublicRestaurantApplication(settings)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.app))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -35,17 +39,26 @@ class HttpServerTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.tmp.cleanup()
 
-    def get_json(self, path: str) -> dict:
-        with urlopen(Request(f"{self.base_url}{path}", headers={"Accept": "application/json"}), timeout=5) as resp:
+    def get_json(self, path: str, headers: dict[str, str] | None = None) -> dict:
+        request_headers = {"Accept": "application/json"}
+        request_headers.update(headers or {})
+        with urlopen(Request(f"{self.base_url}{path}", headers=request_headers), timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def post_json(self, path: str, payload: dict | None = None) -> dict:
+    def post_json(
+        self,
+        path: str,
+        payload: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict:
         data = json.dumps(payload or {}).encode("utf-8")
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(headers or {})
         request = Request(
             f"{self.base_url}{path}",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=request_headers,
         )
         with urlopen(request, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -57,6 +70,7 @@ class HttpServerTests(unittest.TestCase):
         filename: str,
         content: bytes,
         content_type: str = "image/png",
+        headers: dict[str, str] | None = None,
     ) -> dict:
         boundary = "----public-restaurant-test-boundary"
         parts: list[bytes] = []
@@ -79,17 +93,28 @@ class HttpServerTests(unittest.TestCase):
                 f"--{boundary}--\r\n".encode(),
             ]
         )
+        request_headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        }
+        request_headers.update(headers or {})
         request = Request(
             f"{self.base_url}{path}",
             data=b"".join(parts),
             method="POST",
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json",
-            },
+            headers=request_headers,
         )
         with urlopen(request, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def session_headers(self, role: str) -> dict[str, str]:
+        with self.app.database.session() as conn:
+            user = conn.execute(
+                "INSERT INTO users (display_name, role) VALUES (?, ?)",
+                (f"{role} test user", role),
+            )
+        token = self.app.issue_session(int(user.lastrowid))
+        return {"Cookie": f"{SESSION_COOKIE}={token}"}
 
     def test_public_admin_and_ops_api(self) -> None:
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
@@ -299,11 +324,15 @@ class HttpServerTests(unittest.TestCase):
     def test_admin_can_upload_edit_and_delete_restaurant_image(self) -> None:
         self.post_json("/ops/run-daily")
         restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
+        admin_headers = self.session_headers("admin")
 
-        admin_page = urlopen(f"{self.base_url}/admin/photos", timeout=5).read().decode("utf-8")
+        admin_page = urlopen(
+            Request(f"{self.base_url}/admin/photos", headers=admin_headers),
+            timeout=5,
+        ).read().decode("utf-8")
         self.assertIn("음식점 사진 관리", admin_page)
         self.assertIn("admin_restaurant_images.js", admin_page)
-        restaurant_list = self.get_json("/admin/photos/restaurants")
+        restaurant_list = self.get_json("/admin/photos/restaurants", headers=admin_headers)
         self.assertEqual(len(restaurant_list["restaurants"]), 3)
 
         uploaded = self.post_multipart(
@@ -311,6 +340,7 @@ class HttpServerTests(unittest.TestCase):
             {"alt_text": "관리자 대표 사진", "sort_order": "1"},
             "대표.png",
             self.PNG_1X1,
+            headers=admin_headers,
         )
         self.assertEqual(len(uploaded["images"]), 1)
         image = uploaded["images"][0]
@@ -325,14 +355,51 @@ class HttpServerTests(unittest.TestCase):
         updated = self.post_json(
             f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}",
             {"alt_text": "수정된 설명", "sort_order": 3},
+            headers=admin_headers,
         )
         self.assertEqual(updated["images"][0]["alt_text"], "수정된 설명")
         self.assertEqual(updated["images"][0]["sort_order"], 3)
 
         removed = self.post_json(
-            f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}/delete"
+            f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}/delete",
+            headers=admin_headers,
         )
         self.assertEqual(removed["images"], [])
+
+    def test_admin_photo_routes_require_admin_role(self) -> None:
+        self.post_json("/ops/run-daily")
+        restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
+        user_headers = self.session_headers("user")
+        protected_paths = [
+            "/admin/photos",
+            "/admin/photos/restaurants",
+            f"/admin/photos/restaurants/{restaurant_id}",
+        ]
+
+        for path in protected_paths:
+            for headers, expected_status in [({}, 401), (user_headers, 403)]:
+                with self.subTest(path=path, expected_status=expected_status):
+                    request = Request(
+                        f"{self.base_url}{path}",
+                        headers={"Accept": "application/json", **headers},
+                    )
+                    with self.assertRaises(HTTPError) as raised:
+                        urlopen(request, timeout=5)
+                    self.assertEqual(raised.exception.code, expected_status)
+                    raised.exception.close()
+
+        for headers, expected_status in [({}, 401), (user_headers, 403)]:
+            with self.subTest(upload_status=expected_status):
+                with self.assertRaises(HTTPError) as raised:
+                    self.post_multipart(
+                        f"/admin/photos/restaurants/{restaurant_id}/images",
+                        {"alt_text": "blocked upload"},
+                        "blocked.png",
+                        self.PNG_1X1,
+                        headers=headers,
+                    )
+                self.assertEqual(raised.exception.code, expected_status)
+                raised.exception.close()
 
     def test_review_api_rate_limit_status_code(self) -> None:
         self.post_json("/ops/run-daily")
