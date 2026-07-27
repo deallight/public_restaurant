@@ -116,7 +116,13 @@ class HttpServerTests(unittest.TestCase):
         token = self.app.issue_session(int(user.lastrowid))
         return {"Cookie": f"{SESSION_COOKIE}={token}"}
 
+    def get_text(self, path: str, headers: dict[str, str] | None = None) -> str:
+        request = Request(f"{self.base_url}{path}", headers=headers or {})
+        with urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")
+
     def test_public_admin_and_ops_api(self) -> None:
+        admin_headers = self.session_headers("admin")
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
         self.assertIn("공기밥", index)
         self.assertIn("filter-index", index)
@@ -126,7 +132,7 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn('data-filter="saved"', index)
         self.assertIn("관심 가게", index)
         self.assertIn("10회 이상", index)
-        admin = urlopen(f"{self.base_url}/admin", timeout=5).read().decode("utf-8")
+        admin = self.get_text("/admin", admin_headers)
         self.assertNotIn("live-max-pages", admin)
         self.assertNotIn("live-max-documents", admin)
         self.assertIn("관리자 대시보드", admin)
@@ -143,7 +149,7 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("대시보드", admin)
         self.assertNotIn("workflow-steps", admin)
         self.assertNotIn("workflow-fetch-list", admin)
-        collection = urlopen(f"{self.base_url}/admin/collection", timeout=5).read().decode("utf-8")
+        collection = self.get_text("/admin/collection", admin_headers)
         self.assertIn("수집 작업판", collection)
         self.assertIn("workflow-start-date", collection)
         self.assertIn("workflow-end-date", collection)
@@ -161,7 +167,7 @@ class HttpServerTests(unittest.TestCase):
         self.assertNotIn("검증 배치 크기", collection)
         self.assertNotIn("parsing-run", collection)
         self.assertNotIn("review-queue", collection)
-        parsing = urlopen(f"{self.base_url}/admin/parsing", timeout=5).read().decode("utf-8")
+        parsing = self.get_text("/admin/parsing", admin_headers)
         self.assertIn("파싱 작업판", parsing)
         self.assertIn('data-workflow-mode="parsing"', parsing)
         self.assertIn("workflow-run-parse", parsing)
@@ -174,23 +180,21 @@ class HttpServerTests(unittest.TestCase):
         self.assertNotIn("workflow-candidate-rows", parsing)
         self.assertNotIn("검증 항목", parsing)
         self.assertIn("전체 파싱 상태", parsing)
-        workflow_alias = urlopen(f"{self.base_url}/admin/workflow", timeout=5).read().decode("utf-8")
+        workflow_alias = self.get_text("/admin/workflow", admin_headers)
         self.assertIn("파싱 작업판", workflow_alias)
         workflow_js = urlopen(f"{self.base_url}/static/workflow.js", timeout=5).read().decode("utf-8")
         self.assertIn("publicRestaurant.workflow.localLogs", workflow_js)
         self.assertIn("sessionStorage", workflow_js)
         self.assertIn("retry-parse-failed", workflow_js)
-        documents_admin = urlopen(
-            f"{self.base_url}/admin/documents",
-            timeout=5,
-        ).read().decode("utf-8")
+        documents_admin = self.get_text("/admin/documents", admin_headers)
         self.assertIn("기관별 수집 문서", documents_admin)
         self.assertIn("document-board-list", documents_admin)
         documents = self.get_json(
-            "/admin/documents/data?start_date=2026-01-01&end_date=2026-12-31"
+            "/admin/documents/data?start_date=2026-01-01&end_date=2026-12-31",
+            headers=admin_headers,
         )
         self.assertEqual(documents["total"], 0)
-        review_admin = urlopen(f"{self.base_url}/admin/review", timeout=5).read().decode("utf-8")
+        review_admin = self.get_text("/admin/review", admin_headers)
         self.assertIn("검토 작업판", review_admin)
         self.assertIn("workflow-run-verification", review_admin)
         self.assertIn("검증 항목", review_admin)
@@ -203,23 +207,25 @@ class HttpServerTests(unittest.TestCase):
         self.assertNotIn("기간 내 게시물", review_admin)
         self.assertNotIn("workflow-document-rows", review_admin)
         self.assertNotIn("workflow-db-list", review_admin)
-        review_results = urlopen(f"{self.base_url}/admin/review/results", timeout=5).read().decode("utf-8")
+        review_results = self.get_text("/admin/review/results", admin_headers)
         self.assertIn("검증 결과 수정", review_results)
         self.assertIn("승인·수동검토·반려 항목", review_results)
         self.assertIn("review-queue", review_results)
         progress = self.get_json(
-            "/ops/collection-progress?start_date=2026-01-01&end_date=2026-12-31"
+            "/ops/collection-progress?start_date=2026-01-01&end_date=2026-12-31",
+            headers=admin_headers,
         )
         self.assertEqual(progress["start_date"], "2026-01-01")
         self.assertEqual(progress["end_date"], "2026-12-31")
         self.assertEqual(progress["document_count"], 0)
         dashboard = self.get_json(
-            "/ops/dashboard?start_date=2026-01-01&end_date=2026-12-31"
+            "/ops/dashboard?start_date=2026-01-01&end_date=2026-12-31",
+            headers=admin_headers,
         )
         self.assertEqual(dashboard["city"]["name"], "부산광역시")
         self.assertEqual(len(dashboard["priorities"]), 8)
 
-        batch = self.post_json("/ops/run-daily")
+        batch = self.post_json("/ops/run-daily", headers=admin_headers)
         self.assertEqual(batch["status"], "success")
         restaurants = self.get_json("/api/map/restaurants")
         self.assertEqual(len(restaurants["restaurants"]), 3)
@@ -248,29 +254,29 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(visit_filtered["restaurants"], [])
         ranking = self.get_json("/api/rankings?category=cafe")
         self.assertEqual(ranking["rankings"][0]["category"], "cafe")
-        queue = self.get_json("/review")
+        queue = self.get_json("/review", headers=admin_headers)
         self.assertEqual(len(queue["reviews"]), 1)
         self.assertEqual(queue["total"], 1)
         self.assertEqual(queue["limit"], 50)
         self.assertIn("institution_name", queue["reviews"][0])
         self.assertIn("source_title", queue["reviews"][0])
         self.assertIn("payment_method", queue["reviews"][0])
-        verify = self.post_json("/ops/verify-pending", {"limit": 10})
+        verify = self.post_json("/ops/verify-pending", {"limit": 10}, admin_headers)
         self.assertEqual(verify["status"], "success")
         self.assertEqual(verify["summary"]["rows_seen"], 1)
         self.assertEqual(verify["summary"]["rows_processed"], 1)
-        batch_lookup = self.get_json(f"/ops/batches/{batch['batch_id']}")
+        batch_lookup = self.get_json(f"/ops/batches/{batch['batch_id']}", admin_headers)
         self.assertEqual(batch_lookup["status"], "success")
-        sources = self.get_json("/ops/sources")
+        sources = self.get_json("/ops/sources", admin_headers)
         self.assertGreaterEqual(sources["summary"]["source_count"], 1)
         self.assertEqual(sources["groups"][0]["group_key"], "busan_city_core")
-        verification = self.get_json("/ops/verification-status")
+        verification = self.get_json("/ops/verification-status", admin_headers)
         self.assertIn("integrations", verification)
         self.assertIn("missing_env", verification)
         self.assertIn("overview", verification)
         self.assertIn("NAVER_SEARCH_CLIENT_ID", verification["missing_env"]["naver_search"])
         self.assertIn("pending_reviews", verification["overview"]["counts"])
-        api_usage = self.get_json("/ops/api-usage")
+        api_usage = self.get_json("/ops/api-usage", admin_headers)
         self.assertEqual(api_usage["connected_count"], 0)
         self.assertEqual(api_usage["integration_count"], 4)
         self.assertEqual(
@@ -287,11 +293,12 @@ class HttpServerTests(unittest.TestCase):
             next(item for item in api_usage["integrations"] if item["key"] == "groq")["usage"]["limit"],
             1000,
         )
-        progress = self.get_json("/ops/verification-progress")
+        progress = self.get_json("/ops/verification-progress", admin_headers)
         self.assertIn("active", progress)
         self.assertIn("items", progress)
         candidates = self.get_json(
-            "/admin/candidates?start_date=2026-01-01&end_date=2026-12-31&limit=5"
+            "/admin/candidates?start_date=2026-01-01&end_date=2026-12-31&limit=5",
+            headers=admin_headers,
         )
         self.assertIn("needs_review", candidates["groups"])
 
@@ -322,9 +329,9 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(permit["state_reason"], "최근 호출 실패 · 응답 시간 초과")
 
     def test_admin_can_upload_edit_and_delete_restaurant_image(self) -> None:
-        self.post_json("/ops/run-daily")
-        restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
         admin_headers = self.session_headers("admin")
+        self.post_json("/ops/run-daily", headers=admin_headers)
+        restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
 
         admin_page = urlopen(
             Request(f"{self.base_url}/admin/photos", headers=admin_headers),
@@ -366,11 +373,15 @@ class HttpServerTests(unittest.TestCase):
         )
         self.assertEqual(removed["images"], [])
 
-    def test_admin_photo_routes_require_admin_role(self) -> None:
-        self.post_json("/ops/run-daily")
+    def test_admin_routes_require_admin_role(self) -> None:
+        admin_headers = self.session_headers("admin")
+        self.post_json("/ops/run-daily", headers=admin_headers)
         restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
         user_headers = self.session_headers("user")
         protected_paths = [
+            "/admin",
+            "/ops/sources",
+            "/review",
             "/admin/photos",
             "/admin/photos/restaurants",
             f"/admin/photos/restaurants/{restaurant_id}",
@@ -401,8 +412,22 @@ class HttpServerTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, expected_status)
                 raised.exception.close()
 
+        protected_posts = [
+            "/ops/run-daily",
+            "/review/1/reject",
+            "/admin/accounts/1/merge",
+        ]
+        for path in protected_posts:
+            for headers, expected_status in [({}, 401), (user_headers, 403)]:
+                with self.subTest(path=path, expected_status=expected_status):
+                    with self.assertRaises(HTTPError) as raised:
+                        self.post_json(path, headers=headers)
+                    self.assertEqual(raised.exception.code, expected_status)
+                    raised.exception.close()
+
     def test_review_api_rate_limit_status_code(self) -> None:
-        self.post_json("/ops/run-daily")
+        admin_headers = self.session_headers("admin")
+        self.post_json("/ops/run-daily", headers=admin_headers)
         restaurant_id = self.get_json("/api/map/restaurants")["restaurants"][0]["id"]
         for index in range(3):
             review = self.post_json(
