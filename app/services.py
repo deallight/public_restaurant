@@ -365,9 +365,10 @@ class RestaurantService:
                     (user_id, restaurant_id),
                 ).fetchone()
             )
-        restaurant_images = self._restaurant_images_payload(payload)
-        payload["restaurant_images"] = restaurant_images
-        payload["restaurant_image"] = restaurant_images[0] if restaurant_images else None
+        # Public restaurant photos are intentionally disabled until image usage
+        # rights can be verified. Keep the response fields for API compatibility.
+        payload["restaurant_images"] = []
+        payload["restaurant_image"] = None
         return payload
 
     def _restaurant_images_payload(self, restaurant: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1306,85 +1307,128 @@ class RestaurantService:
             ).fetchone()
             if user is None:
                 raise AppError(401, "login required")
-
-            review_ids = [
-                int(row["id"])
-                for row in conn.execute(
-                    "SELECT id FROM restaurant_reviews WHERE user_id = ?",
-                    (user_id,),
-                )
-            ]
-            report_ids = [
-                int(row["id"])
-                for row in conn.execute(
-                    "SELECT id FROM review_reports WHERE reporter_user_id = ?",
-                    (user_id,),
-                )
-            ]
-            oauth_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
-                    (user_id,),
-                ).fetchone()["count"]
-            )
-            saved_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
-                    (user_id,),
-                ).fetchone()["count"]
+            return self._delete_account_record(
+                conn,
+                user,
+                actor_type="user",
+                action="account_delete",
+                reason_code="USER_ACCOUNT_DELETE",
             )
 
-            conn.execute(
-                "DELETE FROM account_merge_requests WHERE source_user_id = ? OR target_user_id = ?",
-                (user_id, user_id),
+    def admin_delete_account(self, user_id: int, *, actor_user_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            actor = conn.execute(
+                "SELECT id FROM users WHERE id = ? AND role = 'admin' AND status = 'active'",
+                (actor_user_id,),
+            ).fetchone()
+            if actor is None:
+                raise AppError(403, "admin access required")
+            if user_id == actor_user_id:
+                raise AppError(409, "cannot delete your own admin account")
+            user = conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                raise AppError(404, "user not found")
+            if user["status"] not in {"active", "suspended"}:
+                raise AppError(409, "closed accounts cannot be deleted again")
+            return self._delete_account_record(
+                conn,
+                user,
+                actor_type="admin",
+                action="admin_account_delete",
+                reason_code="ADMIN_ACCOUNT_DELETE",
             )
-            conn.execute("DELETE FROM oauth_accounts WHERE user_id = ?", (user_id,))
-            conn.execute("DELETE FROM user_saved_restaurants WHERE user_id = ?", (user_id,))
-            conn.execute(
-                """
-                UPDATE review_reports
-                SET reporter_user_id = NULL, reporter_ip_hash = NULL
-                WHERE reporter_user_id = ?
-                """,
+
+    def _delete_account_record(
+        self,
+        conn: Any,
+        user: Any,
+        *,
+        actor_type: str,
+        action: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        user_id = int(user["id"])
+        review_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM restaurant_reviews WHERE user_id = ?",
                 (user_id,),
             )
-            now = utc_now()
-            conn.execute(
-                """
-                UPDATE restaurant_reviews
-                SET user_id = NULL, reviewer_label = '탈퇴한 사용자', ip_hash = NULL,
-                    updated_at = ?
-                WHERE user_id = ?
-                """,
-                (now, user_id),
+        ]
+        report_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM review_reports WHERE reporter_user_id = ?",
+                (user_id,),
             )
+        ]
+        oauth_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+        )
+        saved_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+        )
 
-            self._scrub_account_audit_data(conn, user_id, review_ids, report_ids)
-            conn.execute(
-                """
-                UPDATE users
-                SET display_name = '탈퇴한 사용자', role = 'user', status = 'deleted',
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (now, user_id),
-            )
-            result = {
-                "result": "deleted",
-                "oauth_accounts_deleted": oauth_count,
-                "saved_restaurants_deleted": saved_count,
-                "reviews_anonymized": len(review_ids),
-                "reports_anonymized": len(report_ids),
-            }
-            self._audit(
-                conn,
-                "user",
-                "account_delete",
-                "user",
-                user_id,
-                after=result,
-                reason_codes=["USER_ACCOUNT_DELETE"],
-            )
+        conn.execute(
+            "DELETE FROM account_merge_requests WHERE source_user_id = ? OR target_user_id = ?",
+            (user_id, user_id),
+        )
+        conn.execute("DELETE FROM oauth_accounts WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_saved_restaurants WHERE user_id = ?", (user_id,))
+        conn.execute(
+            """
+            UPDATE review_reports
+            SET reporter_user_id = NULL, reporter_ip_hash = NULL
+            WHERE reporter_user_id = ?
+            """,
+            (user_id,),
+        )
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE restaurant_reviews
+            SET user_id = NULL, reviewer_label = '탈퇴한 사용자', ip_hash = NULL,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (now, user_id),
+        )
+
+        self._scrub_account_audit_data(conn, user_id, review_ids, report_ids)
+        conn.execute(
+            """
+            UPDATE users
+            SET display_name = '탈퇴한 사용자', role = 'user', status = 'deleted',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, user_id),
+        )
+        result = {
+            "result": "deleted",
+            "oauth_accounts_deleted": oauth_count,
+            "saved_restaurants_deleted": saved_count,
+            "reviews_anonymized": len(review_ids),
+            "reports_anonymized": len(report_ids),
+        }
+        self._audit(
+            conn,
+            actor_type,
+            action,
+            "user",
+            user_id,
+            after=result,
+            reason_codes=[reason_code],
+        )
         return result
 
     def _scrub_account_audit_data(
@@ -3091,6 +3135,189 @@ class RestaurantService:
                 (user_id,),
             ).fetchone()
         return dict(user) if user is not None else None
+
+    def admin_accounts(
+        self,
+        q: str = "",
+        role: str = "",
+        status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        normalized_query = q.strip()[:80]
+        normalized_role = role.strip().lower()
+        normalized_status = status.strip().lower()
+        if normalized_role not in {"", "user", "admin"}:
+            raise AppError(400, "invalid account role filter")
+        if normalized_status not in {"", "active", "suspended", "deleted", "merged"}:
+            raise AppError(400, "invalid account status filter")
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_query:
+            clauses.append("LOWER(u.display_name) LIKE LOWER(?)")
+            params.append(f"%{normalized_query}%")
+        if normalized_role:
+            clauses.append("u.role = ?")
+            params.append(normalized_role)
+        if normalized_status:
+            clauses.append("u.status = ?")
+            params.append(normalized_status)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self.database.session() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) AS count FROM users u {where_sql}",
+                    tuple(params),
+                ).fetchone()["count"]
+            )
+            accounts = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT
+                      u.id,
+                      u.display_name,
+                      u.role,
+                      u.status,
+                      u.created_at,
+                      u.updated_at,
+                      CASE
+                        WHEN EXISTS (
+                          SELECT 1 FROM oauth_accounts o
+                          WHERE o.user_id = u.id AND o.provider = 'naver'
+                        ) THEN 'naver'
+                        WHEN EXISTS (
+                          SELECT 1 FROM oauth_accounts o
+                          WHERE o.user_id = u.id AND o.provider = 'google'
+                        ) THEN 'google'
+                        ELSE 'none'
+                      END AS provider,
+                      (
+                        SELECT MAX(o.last_login_at)
+                        FROM oauth_accounts o
+                        WHERE o.user_id = u.id
+                      ) AS last_login_at,
+                      (
+                        SELECT COUNT(*)
+                        FROM restaurant_reviews rv
+                        WHERE rv.user_id = u.id AND rv.status <> 'deleted'
+                      ) AS review_count,
+                      (
+                        SELECT COUNT(*)
+                        FROM user_saved_restaurants s
+                        WHERE s.user_id = u.id
+                      ) AS saved_restaurant_count
+                    FROM users u
+                    {where_sql}
+                    ORDER BY u.created_at DESC, u.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, limit, offset),
+                )
+            ]
+            summary = dict(
+                conn.execute(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
+                      SUM(CASE WHEN status = 'suspended' THEN 1 ELSE 0 END) AS suspended,
+                      SUM(
+                        CASE WHEN role = 'admin' AND status = 'active' THEN 1 ELSE 0 END
+                      ) AS active_admins
+                    FROM users
+                    """
+                ).fetchone()
+            )
+        return {
+            "accounts": accounts,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "summary": {key: int(value or 0) for key, value in summary.items()},
+        }
+
+    def admin_update_account(
+        self,
+        user_id: int,
+        *,
+        role: str,
+        status: str,
+        actor_user_id: int,
+    ) -> dict[str, Any]:
+        normalized_role = role.strip().lower()
+        normalized_status = status.strip().lower()
+        if normalized_role not in {"user", "admin"}:
+            raise AppError(400, "invalid account role")
+        if normalized_status not in {"active", "suspended"}:
+            raise AppError(400, "invalid account status")
+
+        with self.database.session() as conn:
+            actor = conn.execute(
+                "SELECT id FROM users WHERE id = ? AND role = 'admin' AND status = 'active'",
+                (actor_user_id,),
+            ).fetchone()
+            if actor is None:
+                raise AppError(403, "admin access required")
+            account = conn.execute(
+                "SELECT id, role, status FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            if account is None:
+                raise AppError(404, "user not found")
+            if account["status"] in {"deleted", "merged"}:
+                raise AppError(409, "closed accounts cannot be reactivated here")
+            if user_id == actor_user_id and (
+                normalized_role != "admin" or normalized_status != "active"
+            ):
+                raise AppError(409, "cannot remove your own admin access")
+            removes_active_admin = (
+                account["role"] == "admin"
+                and account["status"] == "active"
+                and (normalized_role != "admin" or normalized_status != "active")
+            )
+            if removes_active_admin:
+                remaining = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM users
+                        WHERE role = 'admin' AND status = 'active' AND id <> ?
+                        """,
+                        (user_id,),
+                    ).fetchone()["count"]
+                )
+                if remaining == 0:
+                    raise AppError(409, "at least one active admin is required")
+
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE users
+                SET role = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_role, normalized_status, now, user_id),
+            )
+            self._audit(
+                conn,
+                "admin",
+                "account_access_update",
+                "user",
+                user_id,
+                before={"role": account["role"], "status": account["status"]},
+                after={"role": normalized_role, "status": normalized_status},
+                reason_codes=["ADMIN_ACCOUNT_ACCESS_UPDATE"],
+            )
+            updated = conn.execute(
+                "SELECT id, display_name, role, status, created_at, updated_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return dict(updated)
 
     def request_account_merge(
         self, source_user_id: int, target_user_id: int, reason: str, context: RequestContext

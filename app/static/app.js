@@ -2,6 +2,13 @@ const state = {
   restaurants: [],
   map: null,
   markers: [],
+  markerZoom: null,
+  mapEventsBound: false,
+  clusterEntries: [],
+  clusterInfoWindow: null,
+  openClusterMarker: null,
+  fallbackClusters: [],
+  fallbackClusterIndex: null,
   selectedId: null,
   fallbackFocus: null,
   fallbackViewport: null,
@@ -13,12 +20,8 @@ const state = {
   },
 };
 
-const categoryColors = {
-  restaurant: "#e4572e",
-  cafe: "#0b7a75",
-  bar: "#7851a9",
-  other: "#667085",
-};
+const markerClusterRadius = 56;
+const numericClusterMaxZoom = 14;
 
 const regionSearches = [
   {
@@ -381,6 +384,8 @@ async function loadRestaurants(options = {}) {
   if (state.filters.savedOnly) params.set("saved_only", "1");
   const payload = await fetchJson(`/api/map/restaurants?${params.toString()}`);
   state.restaurants = payload.restaurants;
+  state.fallbackClusterIndex = null;
+  closeClusterInfoWindow();
   if (options.focus === "results" && state.restaurants.length === 1) {
     state.selectedId = state.restaurants[0].id;
   }
@@ -492,6 +497,8 @@ async function renderMap(options = {}) {
   } catch {
     clearNaverMarkers();
     state.map = null;
+    state.mapEventsBound = false;
+    state.markerZoom = null;
     if (options.focus === "results" && options.regionFocus) {
       setFallbackRegionFocus(options.regionFocus);
     } else if (options.focus === "results") {
@@ -504,15 +511,33 @@ async function renderMap(options = {}) {
   }
 }
 
+function closeClusterInfoWindow() {
+  try {
+    state.clusterInfoWindow?.close();
+  } catch {
+    // The provider may already have disposed the info window with the map.
+  }
+  state.clusterInfoWindow = null;
+  state.openClusterMarker = null;
+}
+
 function clearNaverMarkers() {
-  state.markers.forEach((marker) => {
+  closeClusterInfoWindow();
+  const markers = state.markers;
+  state.markers = [];
+  state.clusterEntries = [];
+  markers.forEach((marker) => {
     try {
       marker.setMap(null);
     } catch {
-      // Ignore provider cleanup failures and fall back to a fresh marker list.
+      // Continue removing the remaining markers if one provider marker fails.
+    }
+    try {
+      window.naver?.maps?.Event?.clearInstanceListeners?.(marker);
+    } catch {
+      // Listener cleanup must never prevent the visual marker from being removed.
     }
   });
-  state.markers = [];
 }
 
 function restaurantPosition(restaurant) {
@@ -526,6 +551,122 @@ function naverPosition(restaurant) {
   const position = restaurantPosition(restaurant);
   if (!position || !window.naver?.maps) return null;
   return new naver.maps.LatLng(position.latitude, position.longitude);
+}
+
+function clusterGridKey(x, y, cellSize) {
+  return `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
+}
+
+function addClusterToGrid(grid, cluster, cellSize) {
+  const key = clusterGridKey(cluster.x, cluster.y, cellSize);
+  if (!grid.has(key)) grid.set(key, new Set());
+  grid.get(key).add(cluster);
+  cluster.gridKey = key;
+}
+
+function buildRestaurantClusters(restaurants, pointForRestaurant, radius = markerClusterRadius) {
+  const grid = new Map();
+  const clusters = [];
+  const orderedRestaurants = [...restaurants].sort((left, right) => {
+    const idDifference = Number(left.id) - Number(right.id);
+    return Number.isFinite(idDifference) && idDifference !== 0
+      ? idDifference
+      : String(left.name || "").localeCompare(String(right.name || ""), "ko");
+  });
+
+  orderedRestaurants.forEach((restaurant) => {
+    const position = restaurantPosition(restaurant);
+    if (!position) return;
+    const point = pointForRestaurant(restaurant, position);
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+
+    const cellX = Math.floor(point.x / radius);
+    const cellY = Math.floor(point.y / radius);
+    let nearestCluster = null;
+    let nearestDistanceSquared = radius * radius;
+    for (let xOffset = -1; xOffset <= 1; xOffset += 1) {
+      for (let yOffset = -1; yOffset <= 1; yOffset += 1) {
+        const candidates = grid.get(`${cellX + xOffset}:${cellY + yOffset}`);
+        if (!candidates) continue;
+        candidates.forEach((cluster) => {
+          const distanceSquared = ((cluster.x - point.x) ** 2) + ((cluster.y - point.y) ** 2);
+          if (distanceSquared <= nearestDistanceSquared) {
+            nearestCluster = cluster;
+            nearestDistanceSquared = distanceSquared;
+          }
+        });
+      }
+    }
+
+    if (!nearestCluster) {
+      const cluster = {
+        x: point.x,
+        y: point.y,
+        latitude: position.latitude,
+        longitude: position.longitude,
+        restaurants: [restaurant],
+        gridKey: "",
+      };
+      clusters.push(cluster);
+      addClusterToGrid(grid, cluster, radius);
+      return;
+    }
+
+    const previousSize = nearestCluster.restaurants.length;
+    const previousBucket = grid.get(nearestCluster.gridKey);
+    previousBucket?.delete(nearestCluster);
+    if (previousBucket?.size === 0) grid.delete(nearestCluster.gridKey);
+    nearestCluster.x = ((nearestCluster.x * previousSize) + point.x) / (previousSize + 1);
+    nearestCluster.y = ((nearestCluster.y * previousSize) + point.y) / (previousSize + 1);
+    nearestCluster.latitude = (
+      (nearestCluster.latitude * previousSize) + position.latitude
+    ) / (previousSize + 1);
+    nearestCluster.longitude = (
+      (nearestCluster.longitude * previousSize) + position.longitude
+    ) / (previousSize + 1);
+    nearestCluster.restaurants.push(restaurant);
+    addClusterToGrid(grid, nearestCluster, radius);
+  });
+
+  return clusters;
+}
+
+function webMercatorPoint(position, zoom) {
+  const latitude = Math.max(-85.05112878, Math.min(85.05112878, position.latitude));
+  const latitudeRadians = latitude * Math.PI / 180;
+  const worldSize = 256 * (2 ** Number(zoom || 0));
+  const sine = Math.sin(latitudeRadians);
+  return {
+    x: ((position.longitude + 180) / 360) * worldSize,
+    y: (
+      0.5 - (Math.log((1 + sine) / (1 - sine)) / (4 * Math.PI))
+    ) * worldSize,
+  };
+}
+
+function naverMapPoint(position, zoom) {
+  if (state.map && window.naver?.maps) {
+    try {
+      const projection = state.map.getProjection();
+      const offset = projection.fromCoordToOffset(
+        new naver.maps.LatLng(position.latitude, position.longitude),
+      );
+      return {
+        x: Number(offset.x),
+        y: Number(offset.y),
+      };
+    } catch {
+      // Keep clustering available for fallback map providers and test environments.
+    }
+  }
+  return webMercatorPoint(position, zoom);
+}
+
+function clustersForNaverMap(restaurants, zoom) {
+  return buildRestaurantClusters(
+    restaurants,
+    (_restaurant, position) => naverMapPoint(position, zoom),
+  );
 }
 
 function focusNaverMapOnPoint(position, zoom, options = {}) {
@@ -584,10 +725,13 @@ function focusNaverMapOnRestaurants(restaurants) {
   }
 }
 
-function markerIcon(restaurant) {
-  const active = state.selectedId === restaurant.id;
+function markerIcon(restaurant, mergedCount = 1, activeOverride = false) {
+  const active = activeOverride || state.selectedId === restaurant.id;
   const color = active ? "#f2b84b" : "#3b82f6";
   const stroke = active ? "#1d2939" : "#fff";
+  const isMerged = mergedCount > 1;
+  const countLabel = mergedCount > 99 ? "99+" : String(mergedCount);
+  const countFontSize = countLabel.length > 2 ? 7 : 9;
   return {
     content: `
       <svg
@@ -595,7 +739,7 @@ function markerIcon(restaurant) {
         height="42"
         viewBox="0 0 30 42"
         role="img"
-        aria-label="${escapeHtml(restaurant.name)}"
+        aria-label="${isMerged ? `묶인 음식점 ${mergedCount}곳` : escapeHtml(restaurant.name)}"
         style="display:block; filter:drop-shadow(0 8px 14px rgba(29,41,57,0.28)); pointer-events:none;"
       >
         <path
@@ -604,12 +748,185 @@ function markerIcon(restaurant) {
           stroke="${stroke}"
           stroke-width="2"
         />
-        <circle cx="15" cy="15" r="5.25" fill="#fff" opacity="0.96" />
+        <circle cx="15" cy="15" r="${isMerged ? 7.5 : 5.25}" fill="#fff" opacity="0.96" />
+        ${isMerged ? `
+          <text
+            x="15"
+            y="18"
+            fill="#1d2939"
+            font-size="${countFontSize}"
+            font-weight="900"
+            text-anchor="middle"
+          >${countLabel}</text>
+        ` : ""}
       </svg>
     `,
     size: new naver.maps.Size(30, 42),
     anchor: new naver.maps.Point(15, 40),
   };
+}
+
+function clusterIcon(cluster, index) {
+  const count = cluster.restaurants.length;
+  const countLabel = count > 999 ? "999+" : String(count);
+  const active = cluster.restaurants.some((restaurant) => restaurant.id === state.selectedId);
+  const clusterAttribute = count > 1 ? `data-map-cluster-index="${index}"` : "";
+  const ariaLabel = count > 1
+    ? `묶인 음식점 ${count}곳 목록 보기`
+    : `${cluster.restaurants[0]?.name || "음식점"} 선택`;
+  return {
+    content: `
+      <button
+        type="button"
+        class="naver-cluster-marker${active ? " active" : ""}"
+        ${clusterAttribute}
+        aria-label="${escapeHtml(ariaLabel)}"
+      >
+        <strong>${countLabel}</strong>
+      </button>
+    `,
+    size: new naver.maps.Size(50, 50),
+    anchor: new naver.maps.Point(25, 25),
+  };
+}
+
+function sortedClusterRestaurants(cluster) {
+  return [...cluster.restaurants].sort((left, right) => (
+    Number(right.visit_count || 0) - Number(left.visit_count || 0)
+    || Number(right.average_rating || 0) - Number(left.average_rating || 0)
+    || String(left.name || "").localeCompare(String(right.name || ""), "ko")
+  ));
+}
+
+function clusterListMarkup(cluster) {
+  const restaurants = sortedClusterRestaurants(cluster);
+  return `
+    <section
+      class="map-cluster-popover"
+      role="dialog"
+      aria-label="이 핀에 묶인 음식점 ${restaurants.length}곳"
+    >
+      <header class="map-cluster-head">
+        <div>
+          <strong>이 핀의 음식점</strong>
+          <span>${restaurants.length}곳</span>
+        </div>
+        <button type="button" data-close-map-cluster aria-label="목록 닫기">×</button>
+      </header>
+      <ol class="map-cluster-list">
+        ${restaurants.map((restaurant) => `
+          <li>
+            <button type="button" data-cluster-restaurant-id="${restaurant.id}">
+              <strong>${escapeHtml(restaurant.name)}</strong>
+              <small>
+                ${escapeHtml(restaurant.category_label || restaurant.category || "기타")}
+                · 방문 ${Number(restaurant.visit_count || 0)}회
+                ${restaurant.average_rating ? ` · ${Number(restaurant.average_rating).toFixed(1)}점` : ""}
+              </small>
+            </button>
+          </li>
+        `).join("")}
+      </ol>
+    </section>
+  `;
+}
+
+function handleClusterListInteraction(event) {
+  const target = event.target;
+  if (!(target instanceof Element)) return false;
+  if (target.closest("[data-close-map-cluster]")) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeClusterInfoWindow();
+    if (state.fallbackClusterIndex !== null) {
+      state.fallbackClusterIndex = null;
+      renderFallbackMap();
+    }
+    return true;
+  }
+  const restaurantButton = target.closest("[data-cluster-restaurant-id]");
+  if (!restaurantButton) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  const restaurantId = Number(restaurantButton.dataset.clusterRestaurantId);
+  if (!Number.isFinite(restaurantId) || restaurantId <= 0) return true;
+  closeClusterInfoWindow();
+  state.fallbackClusterIndex = null;
+  selectRestaurant(restaurantId).catch((error) => console.error(error));
+  return true;
+}
+
+function clusterPopoverOffset(marker) {
+  const mapNode = document.querySelector("#map");
+  if (!state.map || !mapNode || mapNode.clientWidth < 720) {
+    return new naver.maps.Point(0, -10);
+  }
+  try {
+    const markerOffset = state.map.getProjection().fromCoordToOffset(marker.getPosition());
+    const markerX = Number(markerOffset?.x);
+    const direction = Number.isFinite(markerX) && markerX > mapNode.clientWidth / 2 ? -1 : 1;
+    return new naver.maps.Point(direction * 184, 8);
+  } catch {
+    return new naver.maps.Point(184, 8);
+  }
+}
+
+function openNaverClusterList(cluster, marker) {
+  if (!state.map || !window.naver?.maps || cluster.restaurants.length < 2) return;
+  if (state.clusterInfoWindow && state.openClusterMarker === marker) return;
+  closeClusterInfoWindow();
+  const infoWindow = new naver.maps.InfoWindow({
+    content: clusterListMarkup(cluster),
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    anchorSize: new naver.maps.Size(0, 0),
+    pixelOffset: clusterPopoverOffset(marker),
+    zIndex: 400,
+  });
+  state.clusterInfoWindow = infoWindow;
+  state.openClusterMarker = marker;
+  infoWindow.open(state.map, marker);
+}
+
+function renderNaverMarkers() {
+  if (!state.map || !window.naver?.maps) return;
+  clearNaverMarkers();
+  const zoom = Number(state.map.getZoom?.() || 12);
+  const numericMode = zoom <= numericClusterMaxZoom;
+  const clusters = clustersForNaverMap(state.restaurants, zoom);
+  state.markerZoom = zoom;
+  state.markers = clusters.map((cluster, index) => {
+    const isCluster = cluster.restaurants.length > 1;
+    const restaurant = cluster.restaurants[0];
+    const active = cluster.restaurants.some((item) => item.id === state.selectedId);
+    const marker = new naver.maps.Marker({
+      position: new naver.maps.LatLng(cluster.latitude, cluster.longitude),
+      map: state.map,
+      title: isCluster ? `묶인 음식점 ${cluster.restaurants.length}곳` : restaurant.name,
+      icon: numericMode
+        ? clusterIcon(cluster, index)
+        : markerIcon(restaurant, cluster.restaurants.length, active),
+      zIndex: active ? 220 : (numericMode ? 120 : 100),
+    });
+    if (isCluster) {
+      state.clusterEntries[index] = { cluster, marker };
+      naver.maps.Event.addListener(marker, "click", () => openNaverClusterList(cluster, marker));
+    } else {
+      naver.maps.Event.addListener(marker, "click", () => selectRestaurant(restaurant.id));
+    }
+    return marker;
+  });
+}
+
+function bindNaverMapEvents() {
+  if (!state.map || state.mapEventsBound) return;
+  state.mapEventsBound = true;
+  naver.maps.Event.addListener(state.map, "idle", () => {
+    const zoom = Number(state.map?.getZoom?.());
+    if (Number.isFinite(zoom) && zoom !== state.markerZoom) renderNaverMarkers();
+  });
+  naver.maps.Event.addListener(state.map, "dragstart", closeClusterInfoWindow);
+  naver.maps.Event.addListener(state.map, "click", closeClusterInfoWindow);
 }
 
 function renderNaverMap() {
@@ -621,38 +938,56 @@ function renderNaverMap() {
     mapDataControl: false,
     scaleControl: false,
   });
-  clearNaverMarkers();
-  state.markers = state.restaurants.map((restaurant) => {
-    const marker = new naver.maps.Marker({
-      position: new naver.maps.LatLng(restaurant.latitude, restaurant.longitude),
-      map: state.map,
-      title: restaurant.name,
-      icon: markerIcon(restaurant),
-      zIndex: state.selectedId === restaurant.id ? 200 : 100,
-    });
-    naver.maps.Event.addListener(marker, "click", () => selectRestaurant(restaurant.id));
-    return marker;
-  });
+  state.fallbackClusterIndex = null;
+  bindNaverMapEvents();
+  renderNaverMarkers();
 }
 
 function renderFallbackMap() {
   const mapNode = document.querySelector("#map");
+  const mapWidth = Math.max(320, mapNode.clientWidth || window.innerWidth || 1200);
+  const mapHeight = Math.max(480, mapNode.clientHeight || window.innerHeight || 800);
+  const clusters = buildRestaurantClusters(
+    state.restaurants,
+    (restaurant) => {
+      const point = fallbackPoint(restaurant);
+      return {
+        x: point.left * mapWidth / 100,
+        y: point.top * mapHeight / 100,
+      };
+    },
+  );
+  state.fallbackClusters = clusters;
+  const openCluster = clusters[state.fallbackClusterIndex];
   mapNode.innerHTML = `
     <div class="fallback-map"${fallbackMapStyle()}>
       <div class="water-label">BUSAN</div>
-      ${state.restaurants.map((restaurant) => {
-        const { left, top } = fallbackPoint(restaurant);
+      ${clusters.map((cluster, index) => {
+        const left = cluster.x * 100 / mapWidth;
+        const top = cluster.y * 100 / mapHeight;
+        const isCluster = cluster.restaurants.length > 1;
+        const restaurant = cluster.restaurants[0];
+        const active = cluster.restaurants.some((item) => item.id === state.selectedId);
         return `
           <button
             type="button"
-            class="map-marker ${state.selectedId === restaurant.id ? "active" : ""}"
-            style="left:${left}%; top:${top}%; --marker:${categoryColors[restaurant.category] || categoryColors.other}"
-            data-id="${restaurant.id}"
-            title="${escapeHtml(restaurant.name)}">
-            <span>${restaurant.visit_count}</span>
+            class="map-marker map-marker-cluster ${active ? "active" : ""}"
+            style="left:${left}%; top:${top}%"
+            ${isCluster ? `data-fallback-cluster-index="${index}"` : `data-id="${restaurant.id}"`}
+            aria-label="${isCluster ? `묶인 음식점 ${cluster.restaurants.length}곳 목록 보기` : `${escapeHtml(restaurant.name)} 선택`}"
+          >
+            <strong>${cluster.restaurants.length > 999 ? "999+" : cluster.restaurants.length}</strong>
           </button>
         `;
       }).join("")}
+      ${openCluster?.restaurants?.length > 1 ? `
+        <div
+          class="fallback-cluster-popover${openCluster.x > mapWidth / 2 ? " opens-left" : ""}"
+          style="left:${openCluster.x * 100 / mapWidth}%; top:${openCluster.y * 100 / mapHeight}%"
+        >
+          ${clusterListMarkup(openCluster)}
+        </div>
+      ` : ""}
     </div>
   `;
 }
@@ -745,14 +1080,6 @@ async function selectRestaurant(id) {
   renderRanking();
   const restaurant = await fetchJson(`/api/restaurants/${id}`);
   const visits = Array.isArray(restaurant.visits) ? restaurant.visits : [];
-  const restaurantImages = (
-    Array.isArray(restaurant.restaurant_images)
-      ? restaurant.restaurant_images
-      : (restaurant.restaurant_image ? [restaurant.restaurant_image] : [])
-  ).filter((image) => image?.thumbnail_url && image?.source_url).slice(0, 4);
-  const hasRestaurantImages = restaurantImages.length > 0;
-  const adminRestaurantImageCount = restaurantImages.filter((image) => image.is_admin_image).length;
-  const searchedRestaurantImageCount = restaurantImages.length - adminRestaurantImageCount;
   const aiSummary = restaurant.ai_summary || {};
   const aiSummaryText = String(aiSummary.text || "").trim();
   const currentReviewCount = Number(aiSummary.current_review_count || restaurant.review_count || 0);
@@ -790,7 +1117,7 @@ async function selectRestaurant(id) {
           type="button"
           class="detail-expand-toggle"
           aria-expanded="false"
-          aria-controls="visit-history ai-review-summary restaurant-photo detail-review-entry visit-reviews"
+          aria-controls="visit-history ai-review-summary detail-review-entry visit-reviews"
         >
           <span>${escapeHtml(restaurant.name)}</span>
           <small class="detail-expand-label">방문 정보 펼치기</small>
@@ -864,51 +1191,6 @@ async function selectRestaurant(id) {
         ` : ""}
       </div>
     </section>
-    <section id="restaurant-photo" class="restaurant-photo-card">
-      <div class="restaurant-photo-head">
-        <h3>음식점 사진</h3>
-        <span>${adminRestaurantImageCount ? "관리자 등록 사진 우선" : "네이버 이미지 검색 결과"}</span>
-      </div>
-      ${hasRestaurantImages ? `
-        <div class="restaurant-photo-grid" data-image-count="${restaurantImages.length}">
-          ${restaurantImages.map((image, index) => `
-            <article class="restaurant-photo-item">
-              <a
-                class="restaurant-photo-link"
-                href="${escapeHtml(image.source_url)}"
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label="${escapeHtml(restaurant.name)} 사진 ${index + 1} 원본 보기"
-              >
-                <img
-                  class="restaurant-photo-image"
-                  src="${escapeHtml(image.thumbnail_url)}"
-                  alt="${escapeHtml(image.title || `${restaurant.name} 사진 ${index + 1}`)}"
-                  loading="lazy"
-                  referrerpolicy="no-referrer"
-                >
-                ${image.is_admin_image ? `
-                  <span class="restaurant-photo-badge admin">관리자 등록</span>
-                ` : image.is_naver_place_image ? `
-                  <span class="restaurant-photo-badge">플레이스 이미지</span>
-                ` : ""}
-              </a>
-            </article>
-          `).join("")}
-        </div>
-        <div class="restaurant-photo-meta">
-          <span>${adminRestaurantImageCount ? `등록 ${adminRestaurantImageCount}장${searchedRestaurantImageCount ? ` · 검색 ${searchedRestaurantImageCount}장` : ""}` : `검색 결과 ${searchedRestaurantImageCount}장`}</span>
-          <span>${adminRestaurantImageCount ? "관리자 사진 다음에 검색 사진을 표시합니다." : "사진을 누르면 원본을 확인할 수 있습니다."}</span>
-        </div>
-        <p class="restaurant-photo-empty" hidden>
-          사진을 불러오지 못했습니다.
-        </p>
-      ` : `
-        <p class="restaurant-photo-empty">
-          가게명과 일치하는 네이버 이미지 검색 결과가 없습니다.
-        </p>
-      `}
-    </section>
     <section id="detail-review-entry" class="detail-review-entry" hidden>
       <h3>리뷰 남기기</h3>
       <form id="review-form" class="review-form">
@@ -979,20 +1261,6 @@ async function selectRestaurant(id) {
     panel.querySelector('[data-visit-page="next"]').disabled = visitPage === visitPageCount;
   };
   renderVisitPage();
-  const restaurantPhotoItems = [...panel.querySelectorAll(".restaurant-photo-item")];
-  const updateRestaurantPhotoFallback = () => {
-    if (!restaurantPhotoItems.length) return;
-    const hasVisiblePhoto = restaurantPhotoItems.some((item) => !item.hidden);
-    panel.querySelector(".restaurant-photo-grid").hidden = !hasVisiblePhoto;
-    panel.querySelector(".restaurant-photo-meta").hidden = !hasVisiblePhoto;
-    panel.querySelector(".restaurant-photo-empty").hidden = hasVisiblePhoto;
-  };
-  restaurantPhotoItems.forEach((item) => {
-    item.querySelector(".restaurant-photo-image").addEventListener("error", () => {
-      item.hidden = true;
-      updateRestaurantPhotoFallback();
-    });
-  });
   panel.querySelector('[data-visit-page="previous"]').addEventListener("click", () => {
     if (visitPage <= 1) return;
     visitPage -= 1;
@@ -1077,7 +1345,22 @@ document.querySelector("#ranking-list").addEventListener("click", (event) => {
   if (!button) return;
   selectRestaurant(Number(button.dataset.id)).catch((error) => console.error(error));
 });
+document.addEventListener("click", handleClusterListInteraction, true);
 document.querySelector("#map").addEventListener("click", (event) => {
+  const naverClusterMarker = event.target.closest("[data-map-cluster-index]");
+  if (naverClusterMarker) {
+    event.stopPropagation();
+    const entry = state.clusterEntries[Number(naverClusterMarker.dataset.mapClusterIndex)];
+    if (entry) openNaverClusterList(entry.cluster, entry.marker);
+    return;
+  }
+  const fallbackClusterMarker = event.target.closest("[data-fallback-cluster-index]");
+  if (fallbackClusterMarker) {
+    event.stopPropagation();
+    state.fallbackClusterIndex = Number(fallbackClusterMarker.dataset.fallbackClusterIndex);
+    renderFallbackMap();
+    return;
+  }
   const marker = event.target.closest(".map-marker");
   if (!marker) return;
   selectRestaurant(Number(marker.dataset.id)).catch((error) => console.error(error));

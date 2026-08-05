@@ -1131,55 +1131,21 @@ class ServiceTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([int(row["success"]) for row in groq_logs], [1, 1])
 
-    def test_restaurant_detail_includes_optional_naver_image(self) -> None:
+    def test_restaurant_detail_omits_images_and_skips_search_provider(self) -> None:
         restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
         client = FakeRestaurantImageClient()
         service = RestaurantService(self.db, restaurant_image_client=client)
 
         detail = service.get_restaurant(restaurant_id)
 
-        self.assertEqual(len(detail["restaurant_images"]), 4)
-        self.assertEqual(detail["restaurant_image"], detail["restaurant_images"][0])
-        self.assertEqual(
-            detail["restaurant_images"][0],
-            {
-                "thumbnail_url": "https://search.pstatic.net/example-1.jpg",
-                "source_url": "https://example.com/example-1.jpg",
-                "title": f"{detail['name']} 사진 1",
-                "provider": "naver_image_search",
-                "provider_label": "네이버 이미지 검색",
-                "is_naver_place_image": True,
-                "is_admin_image": False,
-            },
-        )
-        self.assertEqual(client.calls[0]["name"], detail["name"])
-        self.assertEqual(
-            client.calls[0]["address"],
-            detail["road_address"] or detail["address"],
-        )
-        with self.db.session() as conn:
-            image_log = conn.execute(
-                "SELECT success FROM api_call_logs WHERE provider = 'naver_image_search'"
-            ).fetchone()
-        self.assertEqual(int(image_log["success"]), 1)
-
-    def test_restaurant_detail_survives_image_provider_failure(self) -> None:
-        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
-        service = RestaurantService(
-            self.db,
-            restaurant_image_client=FakeRestaurantImageClient(fail=True),
-        )
-
-        detail = service.get_restaurant(restaurant_id)
-
         self.assertEqual(detail["restaurant_images"], [])
         self.assertIsNone(detail["restaurant_image"])
-        self.assertEqual(detail["id"], restaurant_id)
+        self.assertEqual(client.calls, [])
         with self.db.session() as conn:
             image_log = conn.execute(
                 "SELECT success FROM api_call_logs WHERE provider = 'naver_image_search'"
             ).fetchone()
-        self.assertEqual(int(image_log["success"]), 0)
+        self.assertIsNone(image_log)
 
     def test_api_usage_metrics_uses_latest_log_per_provider(self) -> None:
         with self.db.session() as conn:
@@ -1222,7 +1188,155 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(metrics["provider-b"]["last_status_code"], 429)
         self.assertEqual(metrics["provider-b"]["last_error"], "quota exceeded")
 
-    def test_admin_image_upload_precedes_search_images_and_can_be_edited(self) -> None:
+    def test_admin_accounts_excludes_oauth_subject_and_updates_access(self) -> None:
+        with self.db.session() as conn:
+            admin = conn.execute(
+                "INSERT INTO users (display_name, role) VALUES ('운영 관리자', 'admin')"
+            )
+            member = conn.execute(
+                "INSERT INTO users (display_name) VALUES ('가입 회원')"
+            )
+            conn.execute(
+                """
+                INSERT INTO oauth_accounts
+                  (user_id, provider, provider_subject, display_name, last_login_at)
+                VALUES (?, 'naver', 'private-provider-subject', '가입 회원', CURRENT_TIMESTAMP)
+                """,
+                (member.lastrowid,),
+            )
+
+        result = self.service.admin_accounts(q="가입", role="user", status="active")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["accounts"][0]["provider"], "naver")
+        self.assertNotIn("provider_subject", result["accounts"][0])
+        updated = self.service.admin_update_account(
+            int(member.lastrowid),
+            role="admin",
+            status="active",
+            actor_user_id=int(admin.lastrowid),
+        )
+        self.assertEqual(updated["role"], "admin")
+        with self.db.session() as conn:
+            audit = conn.execute(
+                """
+                SELECT action FROM decision_audit_logs
+                WHERE target_type = 'user' AND target_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (member.lastrowid,),
+            ).fetchone()
+        self.assertEqual(audit["action"], "account_access_update")
+
+    def test_admin_cannot_remove_own_access_or_reactivate_closed_account(self) -> None:
+        with self.db.session() as conn:
+            admin = conn.execute(
+                "INSERT INTO users (display_name, role) VALUES ('운영 관리자', 'admin')"
+            )
+            deleted = conn.execute(
+                "INSERT INTO users (display_name, status) VALUES ('탈퇴 회원', 'deleted')"
+            )
+
+        with self.assertRaises(AppError) as own_access_error:
+            self.service.admin_update_account(
+                int(admin.lastrowid),
+                role="user",
+                status="active",
+                actor_user_id=int(admin.lastrowid),
+            )
+        self.assertEqual(own_access_error.exception.status, 409)
+        with self.assertRaises(AppError) as closed_account_error:
+            self.service.admin_update_account(
+                int(deleted.lastrowid),
+                role="user",
+                status="active",
+                actor_user_id=int(admin.lastrowid),
+            )
+        self.assertEqual(closed_account_error.exception.status, 409)
+
+    def test_admin_delete_account_removes_links_and_anonymizes_activity(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        with self.db.session() as conn:
+            admin = conn.execute(
+                "INSERT INTO users (display_name, role) VALUES ('운영 관리자', 'admin')"
+            )
+            member = conn.execute(
+                "INSERT INTO users (display_name, status) VALUES ('삭제 대상', 'suspended')"
+            )
+            member_id = int(member.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO oauth_accounts (user_id, provider, provider_subject, display_name)
+                VALUES (?, 'naver', 'delete-target-subject', '삭제 대상')
+                """,
+                (member_id,),
+            )
+            conn.execute(
+                "INSERT INTO user_saved_restaurants (user_id, restaurant_id) VALUES (?, ?)",
+                (member_id, restaurant_id),
+            )
+            review = conn.execute(
+                """
+                INSERT INTO restaurant_reviews
+                  (restaurant_id, user_id, rating, body, reviewer_label)
+                VALUES (?, ?, 5, '삭제 전 리뷰', '삭제 대상')
+                """,
+                (restaurant_id, member_id),
+            )
+
+        result = self.service.admin_delete_account(
+            member_id,
+            actor_user_id=int(admin.lastrowid),
+        )
+
+        self.assertEqual(result["result"], "deleted")
+        self.assertEqual(result["oauth_accounts_deleted"], 1)
+        self.assertEqual(result["saved_restaurants_deleted"], 1)
+        self.assertEqual(result["reviews_anonymized"], 1)
+        with self.db.session() as conn:
+            deleted_user = conn.execute(
+                "SELECT display_name, role, status FROM users WHERE id = ?",
+                (member_id,),
+            ).fetchone()
+            oauth_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (member_id,),
+            ).fetchone()["count"]
+            saved_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM user_saved_restaurants WHERE user_id = ?",
+                (member_id,),
+            ).fetchone()["count"]
+            anonymized_review = conn.execute(
+                "SELECT user_id, reviewer_label FROM restaurant_reviews WHERE id = ?",
+                (review.lastrowid,),
+            ).fetchone()
+            audit = conn.execute(
+                """
+                SELECT action FROM decision_audit_logs
+                WHERE target_type = 'user' AND target_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (member_id,),
+            ).fetchone()
+        self.assertEqual(dict(deleted_user), {
+            "display_name": "탈퇴한 사용자",
+            "role": "user",
+            "status": "deleted",
+        })
+        self.assertEqual(int(oauth_count), 0)
+        self.assertEqual(int(saved_count), 0)
+        self.assertIsNone(anonymized_review["user_id"])
+        self.assertEqual(anonymized_review["reviewer_label"], "탈퇴한 사용자")
+        self.assertEqual(audit["action"], "admin_account_delete")
+
+        with self.assertRaises(AppError) as self_delete_error:
+            self.service.admin_delete_account(
+                int(admin.lastrowid),
+                actor_user_id=int(admin.lastrowid),
+            )
+        self.assertEqual(self_delete_error.exception.status, 409)
+
+    def test_admin_image_can_be_managed_without_public_exposure(self) -> None:
         restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
         client = FakeRestaurantImageClient()
         service = RestaurantService(self.db, restaurant_image_client=client)
@@ -1245,10 +1359,9 @@ class ServiceTests(unittest.TestCase):
         ).exists())
 
         detail = service.get_restaurant(restaurant_id)
-        self.assertEqual(len(detail["restaurant_images"]), 4)
-        self.assertEqual(detail["restaurant_images"][0]["title"], "매장 외관")
-        self.assertEqual(detail["restaurant_images"][0]["provider"], "admin_upload")
-        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(detail["restaurant_images"], [])
+        self.assertIsNone(detail["restaurant_image"])
+        self.assertEqual(client.calls, [])
 
         updated = service.update_admin_restaurant_image(
             restaurant_id,

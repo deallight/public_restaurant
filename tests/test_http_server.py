@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -362,7 +363,8 @@ class HttpServerTests(unittest.TestCase):
             self.assertEqual(response.read(), self.PNG_1X1)
 
         public_detail = self.get_json(f"/api/restaurants/{restaurant_id}")
-        self.assertEqual(public_detail["restaurant_images"][0]["provider"], "admin_upload")
+        self.assertEqual(public_detail["restaurant_images"], [])
+        self.assertIsNone(public_detail["restaurant_image"])
 
         updated = self.post_json(
             f"/admin/photos/restaurants/{restaurant_id}/images/{image['id']}",
@@ -378,6 +380,83 @@ class HttpServerTests(unittest.TestCase):
         )
         self.assertEqual(removed["images"], [])
 
+    def test_admin_can_list_and_manage_accounts_without_provider_subject(self) -> None:
+        admin_headers = self.session_headers("admin")
+        with self.app.database.session() as conn:
+            member = conn.execute(
+                "INSERT INTO users (display_name) VALUES ('실제 가입 회원')"
+            )
+            member_id = int(member.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO oauth_accounts
+                  (user_id, provider, provider_subject, display_name, last_login_at)
+                VALUES (?, 'naver', 'private-subject', '실제 가입 회원', CURRENT_TIMESTAMP)
+                """,
+                (member_id,),
+            )
+
+        page = self.get_text("/admin/accounts", admin_headers)
+        self.assertIn("가입 계정 관리", page)
+        self.assertIn("admin_accounts.js", page)
+        token_match = re.search(r'data-action-token="([^"]+)"', page)
+        self.assertIsNotNone(token_match)
+        action_token = token_match.group(1)
+
+        payload = self.get_json(
+            "/admin/accounts/data?q=%EC%8B%A4%EC%A0%9C",
+            admin_headers,
+        )
+        self.assertEqual(payload["total"], 1)
+        self.assertNotIn("provider_subject", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(payload["accounts"][0]["provider"], "naver")
+
+        with self.assertRaises(HTTPError) as missing_token_error:
+            self.post_json(
+                f"/admin/accounts/{member_id}",
+                {"role": "admin", "status": "active"},
+                headers=admin_headers,
+            )
+        self.assertEqual(missing_token_error.exception.code, 403)
+        missing_token_error.exception.close()
+
+        updated = self.post_json(
+            f"/admin/accounts/{member_id}",
+            {"role": "admin", "status": "active", "action_token": action_token},
+            headers=admin_headers,
+        )
+        self.assertEqual(updated["role"], "admin")
+        self.assertEqual(updated["status"], "active")
+
+        with self.assertRaises(HTTPError) as confirmation_error:
+            self.post_json(
+                f"/admin/accounts/{member_id}/delete",
+                {"confirmation": "삭제", "action_token": action_token},
+                headers=admin_headers,
+            )
+        self.assertEqual(confirmation_error.exception.code, 400)
+        confirmation_error.exception.close()
+
+        deleted = self.post_json(
+            f"/admin/accounts/{member_id}/delete",
+            {"confirmation": "계정 삭제", "action_token": action_token},
+            headers=admin_headers,
+        )
+        self.assertEqual(deleted["result"], "deleted")
+        with self.app.database.session() as conn:
+            account = conn.execute(
+                "SELECT display_name, role, status FROM users WHERE id = ?",
+                (member_id,),
+            ).fetchone()
+            oauth_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (member_id,),
+            ).fetchone()["count"]
+        self.assertEqual(account["display_name"], "탈퇴한 사용자")
+        self.assertEqual(account["role"], "user")
+        self.assertEqual(account["status"], "deleted")
+        self.assertEqual(int(oauth_count), 0)
+
     def test_admin_routes_require_admin_role(self) -> None:
         admin_headers = self.session_headers("admin")
         self.post_json("/ops/run-daily", headers=admin_headers)
@@ -388,6 +467,8 @@ class HttpServerTests(unittest.TestCase):
             "/ops/sources",
             "/review",
             "/admin/photos",
+            "/admin/accounts",
+            "/admin/accounts/data",
             "/admin/photos/restaurants",
             f"/admin/photos/restaurants/{restaurant_id}",
         ]
@@ -421,6 +502,7 @@ class HttpServerTests(unittest.TestCase):
             "/ops/run-daily",
             "/review/1/reject",
             "/admin/accounts/1/merge",
+            "/admin/accounts/1/delete",
         ]
         for path in protected_posts:
             for headers, expected_status in [({}, 401), (user_headers, 403)]:

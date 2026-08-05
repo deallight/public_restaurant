@@ -122,7 +122,7 @@ function restaurantImageEditorMarkup(detail) {
       `).join("") : `
         <div class="restaurant-image-editor-empty compact">
           <strong>관리자가 등록한 사진이 없습니다.</strong>
-          <span>현재는 네이버 이미지 검색 결과만 사용하며, 등록 사진은 그보다 먼저 노출됩니다.</span>
+          <span>저작권 확인 전까지 공개 화면의 사진 노출은 중지되어 있습니다.</span>
         </div>
       `}
     </section>

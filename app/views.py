@@ -458,6 +458,102 @@ def terms_index(app_name: str = "공기밥", contact_email: str = "") -> str:
 </html>"""
 
 
+def admin_accounts_index(action_token: str) -> str:
+    escaped_action_token = html.escape(action_token, quote=True)
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>가입 계정 관리 | 관리자</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main
+    id="admin-account-app"
+    class="admin-shell account-admin-shell"
+    data-action-token="{escaped_action_token}"
+  >
+    <header class="dashboard-header">
+      <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
+      <nav class="dashboard-nav" aria-label="관리자 메뉴">
+        <a href="/">운영 맵</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
+        <a href="/admin/review">검토</a>
+        <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
+        <a class="active" href="/admin/accounts">계정</a>
+        <a href="/admin/logs">로그</a>
+      </nav>
+    </header>
+
+    <section class="account-admin-head">
+      <div>
+        <span class="dashboard-eyebrow">회원 운영</span>
+        <h1>가입 계정 관리</h1>
+        <p>가입 현황을 조회하고 역할과 이용 상태를 관리합니다. OAuth 원본 식별자는 표시하지 않습니다.</p>
+      </div>
+    </section>
+
+    <section class="account-summary-grid" aria-label="계정 요약">
+      <article><span>전체 계정</span><strong id="account-summary-total">0</strong></article>
+      <article><span>활성 계정</span><strong id="account-summary-active">0</strong></article>
+      <article><span>이용 정지</span><strong id="account-summary-suspended">0</strong></article>
+      <article><span>활성 관리자</span><strong id="account-summary-admins">0</strong></article>
+    </section>
+
+    <section class="account-admin-panel">
+      <form id="account-filter-form" class="account-filter-form">
+        <label class="account-search-field">
+          <span>계정 검색</span>
+          <input id="account-search" type="search" maxlength="80" placeholder="표시 이름으로 검색">
+        </label>
+        <label>
+          <span>역할</span>
+          <select id="account-role-filter">
+            <option value="">전체 역할</option>
+            <option value="user">일반 사용자</option>
+            <option value="admin">관리자</option>
+          </select>
+        </label>
+        <label>
+          <span>상태</span>
+          <select id="account-status-filter">
+            <option value="">전체 상태</option>
+            <option value="active">활성</option>
+            <option value="suspended">이용 정지</option>
+            <option value="deleted">탈퇴</option>
+            <option value="merged">통합됨</option>
+          </select>
+        </label>
+        <button type="submit">조회</button>
+      </form>
+
+      <div class="account-list-head">
+        <div>
+          <h2>계정 목록</h2>
+          <p id="account-list-summary" aria-live="polite">계정을 불러오는 중입니다.</p>
+        </div>
+        <button id="account-list-refresh" class="secondary" type="button">새로고침</button>
+      </div>
+      <div id="account-list" class="account-list" aria-live="polite">
+        <p class="empty">계정을 불러오는 중입니다.</p>
+      </div>
+      <nav class="account-pagination" aria-label="계정 목록 페이지">
+        <button id="account-page-prev" class="secondary" type="button">이전</button>
+        <span id="account-page-label">1 / 1</span>
+        <button id="account-page-next" class="secondary" type="button">다음</button>
+      </nav>
+    </section>
+    <div id="account-admin-toast" class="workflow-toast" hidden></div>
+  </main>
+  <script src="/static/admin_accounts.js"></script>
+</body>
+</html>"""
+
+
 def admin_index() -> str:
     today = date.today()
     markup = """<!doctype html>
@@ -480,6 +576,7 @@ def admin_index() -> str:
         <a href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -632,6 +729,7 @@ def admin_restaurant_images_index() -> str:
         <a href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a class="active" href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -640,7 +738,7 @@ def admin_restaurant_images_index() -> str:
       <div>
         <span class="dashboard-eyebrow">관리자 직접 등록</span>
         <h1>음식점 사진 관리</h1>
-        <p>관리자가 등록한 사진을 먼저 보여주고, 빈 자리는 네이버 이미지 검색 결과로 채웁니다.</p>
+        <p>등록 사진은 보존·관리할 수 있지만 저작권 확인 전까지 공개 화면에는 표시하지 않습니다.</p>
       </div>
       <a class="button-link secondary" href="/">운영 맵에서 확인</a>
     </section>
@@ -898,6 +996,7 @@ def admin_workflow_index(mode: str = "collection") -> str:
         <a__ACTIVE_REVIEW__ href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1015,6 +1114,7 @@ def admin_review_index() -> str:
         <a class="active" href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1067,6 +1167,7 @@ def map_issues_index() -> str:
         <a class="active" href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1105,6 +1206,7 @@ def ops_logs_index() -> str:
         <a href="/admin/review">검토</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a class="active" href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1170,6 +1272,7 @@ def admin_documents_index() -> str:
         <a href="/admin/review">검토</a>
         <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1284,6 +1387,7 @@ def admin_document_detail_index() -> str:
         <a href="/admin/review">검토</a>
         <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
