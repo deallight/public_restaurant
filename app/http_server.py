@@ -22,7 +22,6 @@ from .integrations import (
     GoogleOAuthClient,
     GroqReviewSummaryClient,
     IntegrationError,
-    NaverImageSearchClient,
     NaverLoginClient,
     NaverMapsGeocodingClient,
     NaverSearchLocalClient,
@@ -36,6 +35,7 @@ from .pipeline import (
 from .progress import VerificationProgressStore
 from .services import AppError, RequestContext, RestaurantService
 from .views import (
+    admin_accounts_index,
     admin_document_detail_index,
     admin_documents_index,
     admin_index,
@@ -59,6 +59,7 @@ OAUTH_RETURN_COOKIE = "public_restaurant_oauth_return"
 OAUTH_PROVIDER_COOKIE = "public_restaurant_oauth_provider"
 OAUTH_COOKIE_MAX_AGE_SECONDS = 10 * 60
 ACCOUNT_DELETE_ACTION = "account-delete"
+ADMIN_ACCOUNT_UPDATE_ACTION = "admin-account-update"
 
 
 def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
@@ -100,25 +101,14 @@ class PublicRestaurantApplication:
                 settings.groq_api_key,
                 settings.groq_model,
             )
-        restaurant_image_client = None
-        if settings.naver_api_hub_client_id and settings.naver_api_hub_client_secret:
-            restaurant_image_client = NaverImageSearchClient(
-                settings.naver_api_hub_client_id,
-                settings.naver_api_hub_client_secret,
-                api_hub=True,
-            )
-        elif settings.naver_search_client_id and settings.naver_search_client_secret:
-            restaurant_image_client = NaverImageSearchClient(
-                settings.naver_search_client_id,
-                settings.naver_search_client_secret,
-            )
         self.service = RestaurantService(
             self.database,
             review_rate_limit_per_hour=settings.review_rate_limit_per_hour,
             geocoding_client=geocoding_client,
             naver_client=naver_client,
             ai_summary_client=ai_summary_client,
-            restaurant_image_client=restaurant_image_client,
+            # Public photo search is disabled until image usage rights can be verified.
+            restaurant_image_client=None,
             restaurant_image_upload_dir=(
                 settings.restaurant_image_upload_dir
                 or settings.db_path.parent / "restaurant_images"
@@ -546,6 +536,28 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                 elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
+                elif path == "/admin/accounts":
+                    session_token = self._cookies().get(SESSION_COOKIE, "")
+                    self._html(
+                        admin_accounts_index(
+                            app.session_codec.issue_action_token(
+                                session_token,
+                                ADMIN_ACCOUNT_UPDATE_ACTION,
+                            )
+                        )
+                    )
+                elif path == "/admin/accounts/data":
+                    current_user = self._admin_user()
+                    self._json(
+                        app.service.admin_accounts(
+                            q=str(query.get("q", "")),
+                            role=str(query.get("role", "")),
+                            status=str(query.get("status", "")),
+                            limit=int(query.get("limit", "50") or "50"),
+                            offset=int(query.get("offset", "0") or "0"),
+                        )
+                        | {"current_user_id": int(current_user["id"])}
+                    )
                 elif path == "/admin/collection":
                     self._html(admin_workflow_index("collection"))
                 elif path in {"/admin/parsing", "/admin/workflow"}:
@@ -1038,10 +1050,50 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             self._safe_return_to(str(payload.get("return_to", "/"))),
                             cookies=[expired_session],
                         )
+                elif path.startswith("/admin/accounts/") and path.endswith("/delete"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4:
+                        raise AppError(404, "not found")
+                    session_token = self._cookies().get(SESSION_COOKIE, "")
+                    if not app.session_codec.verify_action_token(
+                        session_token,
+                        ADMIN_ACCOUNT_UPDATE_ACTION,
+                        str(payload.get("action_token", "")),
+                    ):
+                        raise AppError(403, "invalid admin account action token")
+                    if str(payload.get("confirmation", "")).strip() != "계정 삭제":
+                        raise AppError(400, "account deletion confirmation is required")
+                    current_user = self._admin_user()
+                    self._json(
+                        app.service.admin_delete_account(
+                            int(parts[2]),
+                            actor_user_id=int(current_user["id"]),
+                        )
+                    )
                 elif path.startswith("/admin/accounts/") and path.endswith("/merge"):
                     user_id = int(path.split("/")[3])
                     target_user_id = int(payload.get("target_user_id", 0))
                     self._json(app.service.merge_account(user_id, target_user_id, context))
+                elif path.startswith("/admin/accounts/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 3:
+                        raise AppError(404, "not found")
+                    session_token = self._cookies().get(SESSION_COOKIE, "")
+                    if not app.session_codec.verify_action_token(
+                        session_token,
+                        ADMIN_ACCOUNT_UPDATE_ACTION,
+                        str(payload.get("action_token", "")),
+                    ):
+                        raise AppError(403, "invalid admin account action token")
+                    current_user = self._admin_user()
+                    self._json(
+                        app.service.admin_update_account(
+                            int(parts[2]),
+                            role=str(payload.get("role", "")),
+                            status=str(payload.get("status", "")),
+                            actor_user_id=int(current_user["id"]),
+                        )
+                    )
                 else:
                     raise AppError(404, "not found")
             except AppError as exc:
