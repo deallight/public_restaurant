@@ -6,10 +6,16 @@ from pathlib import Path
 from typing import Any, Iterator, Iterable
 
 from database.migrations.m0001_app_compatible import (
-    DESCRIPTION,
-    VERSION,
+    DESCRIPTION as BASELINE_DESCRIPTION,
+    MIGRATION_TABLE_STATEMENT,
+    VERSION as BASELINE_VERSION,
     expected_schema_signature,
     statements,
+)
+from database.migrations.m0003_user_interactions import (
+    DESCRIPTION as USER_INTERACTIONS_DESCRIPTION,
+    STATEMENTS as USER_INTERACTIONS_STATEMENTS,
+    VERSION as USER_INTERACTIONS_VERSION,
 )
 
 from .db_compat import connect_postgres
@@ -50,6 +56,15 @@ SQLITE_TABLES = [
     "institutions",
     "regions",
 ]
+
+REQUIRED_POSTGRES_MIGRATIONS = (
+    (BASELINE_VERSION, BASELINE_DESCRIPTION, ()),
+    (
+        USER_INTERACTIONS_VERSION,
+        USER_INTERACTIONS_DESCRIPTION,
+        USER_INTERACTIONS_STATEMENTS,
+    ),
+)
 
 
 class Database:
@@ -124,11 +139,21 @@ class Database:
                     )
         if require_migration and ("app_schema_migrations", "version") in actual:
             with self.session() as conn:
-                migration = conn.execute(
-                    "SELECT version FROM app_schema_migrations WHERE version = ?", (VERSION,)
-                ).fetchone()
-            if migration is None:
-                issues.insert(0, f"app_schema_migrations: version {VERSION} is missing")
+                applied_versions = {
+                    str(row["version"])
+                    for row in conn.execute(
+                        "SELECT version FROM app_schema_migrations"
+                    ).fetchall()
+                }
+            missing_versions = [
+                version
+                for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS
+                if version not in applied_versions
+            ]
+            issues[0:0] = [
+                f"app_schema_migrations: version {version} is missing"
+                for version in missing_versions
+            ]
         elif require_migration:
             issues.insert(0, "app_schema_migrations: migration table is missing")
         return issues
@@ -144,22 +169,52 @@ class Database:
             ) from exc
         if issues:
             preview = "; ".join(issues[:5])
-            raise RuntimeError(f"PostgreSQL schema is incompatible with migration 0001: {preview}")
+            raise RuntimeError(f"PostgreSQL schema is incompatible with required migrations: {preview}")
 
     def _initialize_postgres(self) -> None:
         with self.session() as conn:
-            for statement in postgres_schema_statements():
-                conn.execute(statement)
-            conn.execute(
-                """
-                INSERT INTO app_schema_migrations (version, description)
-                VALUES (?, ?)
-                ON CONFLICT(version) DO NOTHING
-                """,
-                (VERSION, DESCRIPTION),
-            )
+            conn.execute(MIGRATION_TABLE_STATEMENT)
+            applied_versions = {
+                str(row["version"])
+                for row in conn.execute(
+                    "SELECT version FROM app_schema_migrations"
+                ).fetchall()
+            }
+            if BASELINE_VERSION not in applied_versions:
+                for statement in postgres_schema_statements():
+                    conn.execute(statement)
+                self._record_postgres_migration(
+                    conn,
+                    BASELINE_VERSION,
+                    BASELINE_DESCRIPTION,
+                )
+            for (
+                version,
+                description,
+                migration_statements,
+            ) in REQUIRED_POSTGRES_MIGRATIONS[1:]:
+                if version in applied_versions:
+                    continue
+                for statement in migration_statements:
+                    conn.execute(statement)
+                self._record_postgres_migration(conn, version, description)
             self._backfill_parse_status(conn)
             self.seed_core(conn)
+
+    def _record_postgres_migration(
+        self,
+        conn: Any,
+        version: str,
+        description: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO app_schema_migrations (version, description)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (version, description),
+        )
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         self._ensure_columns(

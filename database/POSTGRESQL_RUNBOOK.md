@@ -61,8 +61,9 @@ python3 -m app.server --host 127.0.0.1 --port 8000
 ```
 
 Production mode rejects SQLite and a missing `DATABASE_URL`. Normal application
-startup verifies migration 0001 plus every required table, column, and PostgreSQL
-data type, and never applies DDL. Schema drift causes startup to fail closed.
+startup verifies every required migration plus every required table, column, and
+PostgreSQL data type, and never applies DDL. Schema drift causes startup to fail
+closed.
 
 ## 5. Roll back
 

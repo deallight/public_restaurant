@@ -14,6 +14,7 @@ from app.database import Database, SQLITE_TABLES
 from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
 from app.pipeline import DailyPipeline
 from app.services import RequestContext, RestaurantService
+from database.migrations.m0003_user_interactions import VERSION as USER_INTERACTIONS_VERSION
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "")
@@ -69,6 +70,33 @@ class PostgresIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(rejected["result"], "rejected")
         self.assertEqual(service.admin_review_queue(), [])
+
+    def test_existing_baseline_applies_user_interactions_migration(self) -> None:
+        with self.db.session() as conn:
+            conn.execute("DROP TABLE IF EXISTS restaurant_user_images CASCADE")
+            conn.execute("DROP TABLE IF EXISTS review_reactions CASCADE")
+            conn.execute(
+                "DELETE FROM app_schema_migrations WHERE version = ?",
+                (USER_INTERACTIONS_VERSION,),
+            )
+
+        try:
+            issues = self.db.schema_issues()
+            self.assertTrue(any(USER_INTERACTIONS_VERSION in issue for issue in issues))
+            self.assertTrue(any("restaurant_user_images.id" in issue for issue in issues))
+            self.assertTrue(any("review_reactions.review_id" in issue for issue in issues))
+
+            self.db.initialize()
+
+            self.assertEqual(self.db.schema_issues(), [])
+            with self.db.session() as conn:
+                migration = conn.execute(
+                    "SELECT description FROM app_schema_migrations WHERE version = ?",
+                    (USER_INTERACTIONS_VERSION,),
+                ).fetchone()
+            self.assertIsNotNone(migration)
+        finally:
+            self.db.initialize()
 
     def test_account_delete_contract(self) -> None:
         DailyPipeline(self.db).run()

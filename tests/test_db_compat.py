@@ -7,9 +7,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import load_settings
-from app.database import Database, postgres_schema_statements
+from app.database import (
+    REQUIRED_POSTGRES_MIGRATIONS,
+    Database,
+    postgres_schema_statements,
+)
 from app.db_compat import postgres_sql
 from database.migrations.m0001_app_compatible import expected_schema_signature
+from database.migrations.m0003_user_interactions import (
+    STATEMENTS as USER_INTERACTIONS_STATEMENTS,
+    VERSION as USER_INTERACTIONS_VERSION,
+)
 from scripts.db_transfer import (
     fingerprint,
     require_sqlite_copy,
@@ -85,6 +93,17 @@ class DatabaseCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             signature["app_schema_migrations"]["applied_at"],
             "timestamp with time zone",
+        )
+
+    def test_user_interactions_are_an_explicit_additive_migration(self) -> None:
+        ddl = "\n".join(USER_INTERACTIONS_STATEMENTS)
+        self.assertIn("CREATE TABLE IF NOT EXISTS review_reactions", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS restaurant_user_images", ddl)
+        self.assertIn("CREATE INDEX IF NOT EXISTS idx_review_reactions_user", ddl)
+        self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE|ALTER)\b")
+        self.assertIn(
+            USER_INTERACTIONS_VERSION,
+            {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
         )
 
     def test_production_requires_postgres(self) -> None:
