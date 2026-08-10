@@ -13,6 +13,7 @@ const state = {
   fallbackFocus: null,
   fallbackViewport: null,
   regionFocus: null,
+  detailSelectionRequest: 0,
   filters: {
     category: "",
     minVisitCount: "",
@@ -307,6 +308,15 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function reviewStars(value) {
+  const rating = Math.max(0, Math.min(5, Math.round(Number(value) || 0)));
+  return `
+    <span class="review-stars" aria-label="${rating}점">
+      <span class="review-stars-filled" aria-hidden="true">${"★".repeat(rating)}</span><span class="review-stars-empty" aria-hidden="true">${"☆".repeat(5 - rating)}</span>
+    </span>
+  `;
+}
+
 function formatVisitDateTime(value) {
   const text = String(value || "").trim();
   if (!text) return "-";
@@ -457,7 +467,7 @@ function renderRanking() {
       <button type="button" data-id="${restaurant.id}" class="rank-item ${state.selectedId === restaurant.id ? "active" : ""}">
         <span class="rank-main">
           <strong>${escapeHtml(restaurant.name)}</strong>
-          <small>${escapeHtml(restaurant.category_label)} · ${restaurant.visit_count}회 방문</small>
+          <small>${escapeHtml(restaurant.category_detail_label || restaurant.category_label)} · ${restaurant.visit_count}회 방문</small>
         </span>
         <span class="rank-meta">
           <b>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}</b>
@@ -1075,12 +1085,65 @@ function fallbackMapStyle() {
   return ` style="--fallback-scale:${state.fallbackFocus.scale}; --fallback-pan-x:${state.fallbackFocus.panX}%; --fallback-pan-y:${state.fallbackFocus.panY}%;"`;
 }
 
-async function selectRestaurant(id) {
+function waitForDetailPanelSlide(panel) {
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let slideTimer;
+    const finishSlide = () => {
+      window.clearTimeout(slideTimer);
+      panel.removeEventListener("transitionend", handleSlideTransitionEnd);
+      resolve();
+    };
+    const handleSlideTransitionEnd = (event) => {
+      if (event.target === panel && event.propertyName === "transform") finishSlide();
+    };
+    panel.addEventListener("transitionend", handleSlideTransitionEnd);
+    slideTimer = window.setTimeout(finishSlide, 360);
+  });
+}
+
+function slideDetailPanelSnapshotOut(panel, stage) {
+  stage.querySelectorAll(".detail-panel-snapshot").forEach((snapshot) => snapshot.remove());
+  const snapshot = panel.cloneNode(true);
+  snapshot.removeAttribute("id");
+  snapshot.querySelectorAll("[id]").forEach((element) => element.removeAttribute("id"));
+  snapshot.classList.remove("detail-entering", "detail-closing", "detail-resetting");
+  snapshot.classList.add("detail-panel-snapshot");
+  snapshot.setAttribute("aria-hidden", "true");
+  snapshot.inert = true;
+  stage.append(snapshot);
+  requestAnimationFrame(() => {
+    snapshot.classList.add("detail-closing");
+    waitForDetailPanelSlide(snapshot).then(() => snapshot.remove());
+  });
+}
+
+async function selectRestaurant(id, options = {}) {
+  const restoreExpanded = options.expanded === true;
+  const panel = document.querySelector("#detail-panel");
+  const stage = panel.closest(".map-stage");
+  const previousSelectedId = state.selectedId;
+  const selectionRequest = ++state.detailSelectionRequest;
+  const restaurant = await fetchJson(`/api/restaurants/${id}`);
+  if (selectionRequest !== state.detailSelectionRequest) return;
+  const animatePanelEntry = options.animate === true
+    && (panel.hidden || previousSelectedId !== id);
+  const switchingRestaurant = animatePanelEntry
+    && !panel.hidden
+    && previousSelectedId !== null
+    && previousSelectedId !== id;
+  if (switchingRestaurant) {
+    slideDetailPanelSnapshotOut(panel, stage);
+  }
   state.selectedId = id;
   renderRanking();
-  const restaurant = await fetchJson(`/api/restaurants/${id}`);
   const visits = Array.isArray(restaurant.visits) ? restaurant.visits : [];
   const aiSummary = restaurant.ai_summary || {};
+  const restaurantImages = Array.isArray(restaurant.restaurant_images)
+    ? restaurant.restaurant_images
+    : [];
   const aiSummaryText = String(aiSummary.text || "").trim();
   const currentReviewCount = Number(aiSummary.current_review_count || restaurant.review_count || 0);
   const summarizedReviewCount = Number(aiSummary.summarized_review_count || 0);
@@ -1103,45 +1166,85 @@ async function selectRestaurant(id) {
     setFallbackFocus([restaurant]);
     renderFallbackMap();
   }
-  const panel = document.querySelector("#detail-panel");
-  const stage = panel.closest(".map-stage");
   panel.hidden = false;
-  panel.classList.remove("detail-expanded");
+  panel.classList.remove("detail-expanded", "detail-entering");
+  if (animatePanelEntry) {
+    panel.classList.add("detail-resetting", "detail-entering");
+    panel.classList.remove("detail-closing");
+    void panel.offsetHeight;
+    panel.classList.remove("detail-resetting");
+    requestAnimationFrame(() => panel.classList.remove("detail-entering"));
+  } else {
+    panel.classList.remove("detail-closing");
+  }
   stage?.classList.remove("detail-expanded");
   stage?.classList.add("detail-open");
   panel.innerHTML = `
+    <div class="detail-panel-controls">
+      <button
+        type="button"
+        class="save-restaurant-button${restaurant.is_saved ? " is-saved" : ""}"
+        aria-pressed="${restaurant.is_saved ? "true" : "false"}"
+        aria-label="${restaurant.is_saved ? "관심 가게 저장 해제" : "관심 가게 저장"}"
+        title="${restaurant.is_saved ? "관심 가게 저장 해제" : "관심 가게 저장"}"
+      >
+        <span aria-hidden="true">${restaurant.is_saved ? "♥" : "♡"}</span>
+      </button>
+      <button
+        type="button"
+        class="detail-expand-toggle"
+        aria-expanded="false"
+        aria-controls="visit-history ai-review-summary detail-review-entry visit-reviews"
+      >
+        <span class="detail-expand-label">방문 정보 펼치기</span>
+      </button>
+    </div>
     <button type="button" class="panel-close" aria-label="닫기">×</button>
     <section class="detail-summary">
-      <h2>
-        <button
-          type="button"
-          class="detail-expand-toggle"
-          aria-expanded="false"
-          aria-controls="visit-history ai-review-summary detail-review-entry visit-reviews"
-        >
-          <span>${escapeHtml(restaurant.name)}</span>
-          <small class="detail-expand-label">방문 정보 펼치기</small>
-        </button>
-      </h2>
-      <p class="detail-address">${escapeHtml(restaurant.road_address || restaurant.address)}</p>
-      <div class="detail-stats">
-        <span>${restaurant.category_label}</span>
-        <span>${restaurant.visit_count}회</span>
-        <span>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}점</span>
+      <div class="detail-title-line">
+        <h2>${escapeHtml(restaurant.name)}</h2>
+        <div class="detail-stats">
+          <span class="detail-category-label" title="${escapeHtml(restaurant.category_detail_label || restaurant.category_label)}">
+            ${escapeHtml(restaurant.category_detail_label || restaurant.category_label)}
+          </span>
+          <span class="detail-stat-divider" aria-hidden="true">|</span>
+          <span>${restaurant.visit_count}회</span>
+          <span class="detail-stat-divider" aria-hidden="true">|</span>
+          <span>${restaurant.average_rating ? restaurant.average_rating.toFixed(1) : "-"}점</span>
+        </div>
       </div>
+      <p class="detail-address">${escapeHtml(restaurant.road_address || restaurant.address)}</p>
       <div class="detail-primary-actions">
         <a class="naver-map-link" href="${escapeHtml(naverSearchUrl(restaurant))}" target="_blank" rel="noopener">
           네이버 지도에서 보기
         </a>
-        <button
-          type="button"
-          class="save-restaurant-button${restaurant.is_saved ? " is-saved" : ""}"
-          aria-pressed="${restaurant.is_saved ? "true" : "false"}"
-        >
-          <span aria-hidden="true">${restaurant.is_saved ? "♥" : "♡"}</span>
-          ${restaurant.is_saved ? "저장됨" : "관심 가게 저장"}
-        </button>
       </div>
+    </section>
+    <section id="restaurant-photo" class="restaurant-photo-card">
+      <div class="restaurant-photo-head">
+        <div class="restaurant-photo-title">
+          <h3>사진</h3>
+          <a class="restaurant-photo-add" href="/restaurants/${id}/photos/add">사진 등록</a>
+        </div>
+        <span>${restaurantImages.length}장</span>
+      </div>
+      ${restaurantImages.length ? `
+        <div class="restaurant-photo-grid" data-image-count="${restaurantImages.length}">
+          ${restaurantImages.map((image) => `
+            <figure class="restaurant-photo-item">
+              <a class="restaurant-photo-link" href="${escapeHtml(image.source_url)}" target="_blank" rel="noopener">
+                <img class="restaurant-photo-image" src="${escapeHtml(image.thumbnail_url)}" alt="${escapeHtml(image.alt_text || restaurant.name)}" loading="lazy">
+                <span class="restaurant-photo-badge">사용자 등록</span>
+              </a>
+            </figure>
+          `).join("")}
+        </div>
+      ` : `
+        <div class="restaurant-photo-empty">
+          <p>여러분의 밥상을 등록해 주세요</p>
+          <a href="/restaurants/${id}/photos/add">사진 추가하기 &gt;</a>
+        </div>
+      `}
     </section>
     <section id="visit-history" class="visit-history" hidden>
       <div class="visit-history-head">
@@ -1154,6 +1257,7 @@ async function selectRestaurant(id) {
             <tr>
               <th scope="col">방문일시</th>
               <th scope="col">방문 기관</th>
+              <th scope="col">원문 상호명</th>
               <th scope="col">방문 사유</th>
             </tr>
           </thead>
@@ -1194,16 +1298,17 @@ async function selectRestaurant(id) {
     <section id="detail-review-entry" class="detail-review-entry" hidden>
       <h3>리뷰 남기기</h3>
       <form id="review-form" class="review-form">
-        <select name="rating" aria-label="별점">
-          <option value="5">5점</option>
-          <option value="4">4점</option>
-          <option value="3">3점</option>
-          <option value="2">2점</option>
-          <option value="1">1점</option>
+        <select class="review-rating-select" name="rating" aria-label="별점">
+          <option value="5">★ × 5</option>
+          <option value="4">★ × 4</option>
+          <option value="3">★ × 3</option>
+          <option value="2">★ × 2</option>
+          <option value="1">★ × 1</option>
         </select>
         <input
           name="reviewer_label"
-          placeholder="${window.IS_SIGNED_IN ? "로그인 이름으로 등록" : "닉네임"}"
+          value="${window.IS_SIGNED_IN ? escapeHtml(window.CURRENT_USER_DISPLAY_NAME || "사용자") : ""}"
+          placeholder="${window.IS_SIGNED_IN ? "" : "닉네임"}"
           maxlength="40"
           ${window.IS_SIGNED_IN ? "disabled" : ""}
         >
@@ -1220,9 +1325,39 @@ async function selectRestaurant(id) {
       <div class="review-list">
         ${restaurant.reviews.map((review) => `
           <article>
-            <div><b>${review.rating}점</b><span>${escapeHtml(review.reviewer_label)}</span></div>
+            <div class="visit-review-meta">
+              <div class="review-author">
+                <div class="review-identity">
+                  <strong class="review-nickname">${escapeHtml(review.reviewer_label)}</strong>
+                  <span class="reviewer-review-count">리뷰 ${Number(review.reviewer_review_count || 0)}개</span>
+                </div>
+                ${reviewStars(review.rating)}
+              </div>
+            </div>
             <p>${escapeHtml(review.body)}</p>
-            <button type="button" data-review="${review.id}" class="report-button">신고</button>
+            <div class="review-actions">
+              <button
+                type="button"
+                class="review-reaction-button${review.current_reaction === "up" ? " is-active" : ""}"
+                data-review="${review.id}"
+                data-reaction="up"
+                aria-label="추천 ${Number(review.recommendation_count || 0)}개"
+                aria-pressed="${review.current_reaction === "up" ? "true" : "false"}"
+                title="추천"
+              >👍 <span class="review-reaction-count">${Number(review.recommendation_count || 0)}</span></button>
+              <span class="review-action-separator" aria-hidden="true">|</span>
+              <button
+                type="button"
+                class="review-reaction-button${review.current_reaction === "down" ? " is-active" : ""}"
+                data-review="${review.id}"
+                data-reaction="down"
+                aria-label="비추천 ${Number(review.not_recommended_count || 0)}개"
+                aria-pressed="${review.current_reaction === "down" ? "true" : "false"}"
+                title="비추천"
+              >👎 <span class="review-reaction-count">${Number(review.not_recommended_count || 0)}</span></button>
+              <span class="review-action-separator" aria-hidden="true">|</span>
+              <button type="button" data-review="${review.id}" class="report-button">신고하기</button>
+            </div>
           </article>
         `).join("") || "<p class=\"empty\">등록된 리뷰가 없습니다.</p>"}
       </div>
@@ -1246,11 +1381,12 @@ async function selectRestaurant(id) {
       <tr>
         <td>${escapeHtml(formatVisitDateTime(visit.visited_at))}</td>
         <td>${escapeHtml(visit.institution_name || "-")}</td>
+        <td>${escapeHtml(visit.source_place_name || "-")}</td>
         <td>${escapeHtml(visit.purpose || "-")}</td>
       </tr>
     `).join("") || `
       <tr>
-        <td colspan="3" class="visit-empty">공개된 방문 기록이 없습니다.</td>
+        <td colspan="4" class="visit-empty">공개된 방문 기록이 없습니다.</td>
       </tr>
     `;
     const isPaginated = visits.length > visitPageSize;
@@ -1271,8 +1407,7 @@ async function selectRestaurant(id) {
     visitPage += 1;
     renderVisitPage();
   });
-  expandToggle.addEventListener("click", () => {
-    const expanded = expandToggle.getAttribute("aria-expanded") !== "true";
+  const setDetailExpanded = (expanded) => {
     expandToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
     panel.classList.toggle("detail-expanded", expanded);
     stage?.classList.toggle("detail-expanded", expanded);
@@ -1283,10 +1418,19 @@ async function selectRestaurant(id) {
     panel.querySelector(".detail-expand-label").textContent = expanded
       ? "간단히 보기"
       : "방문 정보 펼치기";
+  };
+  expandToggle.addEventListener("click", () => {
+    setDetailExpanded(expandToggle.getAttribute("aria-expanded") !== "true");
   });
-  panel.querySelector(".panel-close").addEventListener("click", () => {
+  if (restoreExpanded) setDetailExpanded(true);
+  panel.querySelector(".panel-close").addEventListener("click", async () => {
+    if (panel.classList.contains("detail-closing")) return;
+    state.detailSelectionRequest += 1;
+    stage?.querySelectorAll(".detail-panel-snapshot").forEach((snapshot) => snapshot.remove());
+    panel.classList.add("detail-closing");
+    await waitForDetailPanelSlide(panel);
     panel.hidden = true;
-    panel.classList.remove("detail-expanded");
+    panel.classList.remove("detail-expanded", "detail-entering", "detail-closing");
     stage?.classList.remove("detail-open", "detail-expanded");
     state.selectedId = null;
     renderRanking();
@@ -1300,13 +1444,14 @@ async function selectRestaurant(id) {
   });
   panel.querySelector("#review-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    const keepExpanded = panel.classList.contains("detail-expanded");
     const form = new FormData(event.currentTarget);
     await fetchJson(`/api/restaurants/${id}/reviews`, {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(form.entries())),
     });
     await loadRestaurants();
-    await selectRestaurant(id);
+    await selectRestaurant(id, { expanded: keepExpanded });
   });
   panel.querySelector(".save-restaurant-button").addEventListener("click", async (event) => {
     if (!window.IS_SIGNED_IN) {
@@ -1322,7 +1467,40 @@ async function selectRestaurant(id) {
     );
     button.classList.toggle("is-saved", result.is_saved);
     button.setAttribute("aria-pressed", result.is_saved ? "true" : "false");
-    button.innerHTML = `<span aria-hidden="true">${result.is_saved ? "♥" : "♡"}</span> ${result.is_saved ? "저장됨" : "관심 가게 저장"}`;
+    const label = result.is_saved ? "관심 가게 저장 해제" : "관심 가게 저장";
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
+    button.querySelector("span").textContent = result.is_saved ? "♥" : "♡";
+  });
+  panel.querySelectorAll(".review-reaction-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!window.IS_SIGNED_IN) {
+        const returnTo = `/?restaurant_id=${id}`;
+        window.location.href = `/login?return_to=${encodeURIComponent(returnTo)}`;
+        return;
+      }
+      const article = button.closest("article");
+      const reactionButtons = article.querySelectorAll(".review-reaction-button");
+      reactionButtons.forEach((item) => { item.disabled = true; });
+      try {
+        const result = await fetchJson(`/api/reviews/${button.dataset.review}/reaction`, {
+          method: "POST",
+          body: JSON.stringify({ reaction: button.dataset.reaction }),
+        });
+        reactionButtons.forEach((item) => {
+          const active = item.dataset.reaction === result.reaction;
+          const count = item.dataset.reaction === "up"
+            ? result.recommendation_count
+            : result.not_recommended_count;
+          item.classList.toggle("is-active", active);
+          item.setAttribute("aria-pressed", active ? "true" : "false");
+          item.setAttribute("aria-label", `${item.dataset.reaction === "up" ? "추천" : "비추천"} ${count}개`);
+          item.querySelector(".review-reaction-count").textContent = String(count);
+        });
+      } finally {
+        reactionButtons.forEach((item) => { item.disabled = false; });
+      }
+    });
   });
   panel.querySelectorAll(".report-button").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -1343,7 +1521,7 @@ document.querySelector("#search-form").addEventListener("submit", (event) => {
 document.querySelector("#ranking-list").addEventListener("click", (event) => {
   const button = event.target.closest(".rank-item");
   if (!button) return;
-  selectRestaurant(Number(button.dataset.id)).catch((error) => console.error(error));
+  selectRestaurant(Number(button.dataset.id), { animate: true }).catch((error) => console.error(error));
 });
 document.addEventListener("click", handleClusterListInteraction, true);
 document.querySelector("#map").addEventListener("click", (event) => {
@@ -1395,8 +1573,17 @@ if (state.filters.savedOnly && !window.IS_SIGNED_IN) {
 updateFilterIndex();
 loadRestaurants()
   .then(async () => {
-    const requestedId = Number(new URLSearchParams(window.location.search).get("restaurant_id"));
-    if (requestedId > 0) await selectRestaurant(requestedId);
+    const requestedUrl = new URL(window.location.href);
+    const requestedId = Number(requestedUrl.searchParams.get("restaurant_id"));
+    if (requestedId > 0) {
+      requestedUrl.searchParams.delete("restaurant_id");
+      window.history.replaceState(
+        {},
+        "",
+        `${requestedUrl.pathname}${requestedUrl.search}${requestedUrl.hash}`,
+      );
+      await selectRestaurant(requestedId);
+    }
   })
   .catch((error) => {
     document.querySelector("#ranking-list").innerHTML = `<li class="empty">${escapeHtml(error.message)}</li>`;

@@ -74,7 +74,30 @@ class VerificationProgressStore:
                 (dict(item) for item in self._payload["items"]),
                 key=lambda item: (int(item.get("order") or 0), int(item.get("candidate_id") or 0)),
             )
-            return {**self._payload, "items": items}
+            classifications = self._classification_counts(items)
+            return {**self._payload, "items": items, "classifications": classifications}
+
+    def _classification_counts(self, items: list[dict[str, Any]]) -> dict[str, int]:
+        summary = self._payload.get("summary") or {}
+        if not self._payload.get("active") and summary:
+            return {
+                "approved": int(summary.get("approved") or 0),
+                "needs_review": int(summary.get("needs_review") or 0),
+                "rejected": int(summary.get("rejected") or 0),
+                "failed": int(summary.get("dlq") or 0),
+            }
+
+        counts = {"approved": 0, "needs_review": 0, "rejected": 0, "failed": 0}
+        for item in items:
+            if item.get("status") == "failed":
+                counts["failed"] += 1
+                continue
+            if item.get("status") != "completed":
+                continue
+            decision = str(item.get("decision") or "")
+            if decision in {"approved", "needs_review", "rejected"}:
+                counts[decision] += 1
+        return counts
 
     def _item(self, candidate_id: int) -> dict[str, Any]:
         for item in self._payload["items"]:

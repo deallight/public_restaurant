@@ -20,6 +20,7 @@ CORE_TABLES = [
     "manual_review_tasks",
     "user_saved_restaurants",
     "restaurant_reviews",
+    "review_reactions",
 ]
 
 
@@ -58,6 +59,8 @@ def transfer_key_columns(table: str, columns: Iterable[str]) -> list[str]:
         return ["id"]
     if table == "user_saved_restaurants":
         return ["user_id", "restaurant_id"]
+    if table == "review_reactions":
+        return ["review_id", "user_id"]
     if "restaurant_id" in available:
         return ["restaurant_id"]
     raise ValueError(f"no transfer key configured for {table}")

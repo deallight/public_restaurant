@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .agents import (
@@ -19,8 +19,14 @@ from .agents import (
     PlaceCandidate,
     VerificationDecision,
     VerifierAgent,
+    candidate_address_similarity,
+    candidate_structured_address_match,
     expense_scope_reject_decision,
+    has_valid_provider_coordinates,
+    is_food_context_purpose,
+    name_similarity_with_branch,
     non_food_purpose_decision,
+    row_name_for_matching,
 )
 from .alias_memory import alias_memory_decision, remember_aliases
 from .config import BASE_DIR, Settings
@@ -38,6 +44,16 @@ from .xlsx_parser import parse_expense_xlsx
 COLLECTION_SCAN_SAFETY_MAX_PAGES = 500
 COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS = 10000
 VerificationProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def source_document_identity(value: str) -> str:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    if parsed.path.rstrip("/").endswith("/ghopen12/view"):
+        document_ids = parse_qs(parsed.query).get("schIndx") or []
+        if document_ids and str(document_ids[0]).isdigit():
+            return f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}?schIndx={document_ids[0]}"
+    return url
 
 
 @dataclass(frozen=True)
@@ -93,6 +109,68 @@ class RawExpenseRow:
     amount: int
     participants: str = ""
     payment_method: str = "card"
+    split_from_place_name: str = ""
+    cleaned_from_place_name: str = ""
+    split_index: int = 0
+    split_count: int = 1
+    source_amount: int | None = None
+
+
+def clean_parsed_place_name(value: str) -> str:
+    original = re.sub(r"\s+", " ", str(value or "")).strip()
+    cleaned = original
+    suffix_pattern = re.compile(r"(?:\s*외\s*\d+\s*(?:개소|개|곳|명)?|\s*등)\s*$")
+    while cleaned:
+        without_suffix = suffix_pattern.sub("", cleaned).strip(" ,;，；/_·-")
+        if without_suffix == cleaned or not without_suffix:
+            break
+        cleaned = without_suffix
+    return cleaned or original
+
+
+def split_raw_expense_row_places(raw_row: RawExpenseRow) -> list[RawExpenseRow]:
+    if raw_row.split_count > 1:
+        return [raw_row]
+    parts: list[str] = []
+    original_parts: dict[str, str] = {}
+    seen: set[str] = set()
+    for value in re.split(r"[,;，；]+", raw_row.place_name or ""):
+        original_part = re.sub(r"\s+", " ", value).strip()
+        part = clean_parsed_place_name(original_part)
+        key = normalize_text(part).replace(" ", "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        parts.append(part)
+        original_parts[key] = original_part
+    if len(parts) < 2:
+        cleaned_name = clean_parsed_place_name(raw_row.place_name)
+        if cleaned_name == raw_row.place_name:
+            return [raw_row]
+        return [
+            replace(
+                raw_row,
+                place_name=cleaned_name,
+                cleaned_from_place_name=raw_row.place_name,
+            )
+        ]
+    return [
+        replace(
+            raw_row,
+            place_name=place_name,
+            amount=0,
+            split_from_place_name=raw_row.place_name,
+            cleaned_from_place_name=(
+                original_parts[normalize_text(place_name).replace(" ", "")]
+                if original_parts[normalize_text(place_name).replace(" ", "")] != place_name
+                else ""
+            ),
+            split_index=index,
+            split_count=len(parts),
+            source_amount=raw_row.amount,
+        )
+        for index, place_name in enumerate(parts, start=1)
+    ]
 
 
 class ExpenseAdapter(Protocol):
@@ -244,16 +322,24 @@ class CachedPermitClient:
 
 
 class StoredProviderNaverClient:
-    def __init__(self, candidate: PlaceCandidate):
-        self.candidate = candidate
+    def __init__(self, candidates: PlaceCandidate | list[PlaceCandidate]):
+        self.candidates = candidates if isinstance(candidates, list) else [candidates]
 
     def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
-        return [self.candidate]
+        return self.candidates
 
 
 class NoPermitClient:
     def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
         return None
+
+
+class StoredPermitClient:
+    def __init__(self, permit: PermitSnapshot):
+        self.permit = permit
+
+    def lookup(self, row: NormalizedExpenseRow) -> PermitSnapshot | None:
+        return self.permit
 
 
 def existing_success_verification_decision(
@@ -307,6 +393,48 @@ def existing_success_verification_decision(
     )
 
 
+def stored_provider_evidence_review_decision(
+    conn: Any,
+    candidate_id: int,
+    row: NormalizedExpenseRow,
+) -> VerificationDecision | None:
+    verifications = conn.execute(
+        """
+        SELECT *
+        FROM place_verifications
+        WHERE candidate_id = ?
+          AND provider_place_id IS NOT NULL
+          AND is_coordinate_valid = 1
+        ORDER BY
+          CASE WHEN provider_category IN ('restaurant', 'cafe', 'bar') THEN 0 ELSE 1 END,
+          name_similarity DESC,
+          address_similarity DESC,
+          verified_at DESC,
+          id DESC
+        LIMIT 10
+        """,
+        (candidate_id,),
+    ).fetchall()
+    if not verifications:
+        return None
+    candidates = [
+        PlaceCandidate(
+            provider_place_id=verification["provider_place_id"],
+            name=verification["provider_place_name"],
+            category=verification["provider_category"],
+            address=verification["provider_address"] or verification["provider_road_address"] or "",
+            road_address=verification["provider_road_address"] or verification["provider_address"] or "",
+            longitude=float(verification["longitude"]),
+            latitude=float(verification["latitude"]),
+            provider_category_raw=str(
+                safe_json_loads(verification["raw_response_json"], {}).get("provider_category_raw") or ""
+            ),
+        )
+        for verification in verifications
+    ]
+    return VerifierAgent(StoredProviderNaverClient(candidates), NoPermitClient()).verify(row)
+
+
 def existing_provider_evidence_decision(
     conn: Any,
     candidate_id: int,
@@ -322,33 +450,156 @@ def existing_provider_evidence_decision(
     ).fetchone()
     if task is not None and "PERMIT_NOT_ACTIVE" in (task["reason"] or ""):
         return None
-    verification = conn.execute(
-        """
-        SELECT *
-        FROM place_verifications
-        WHERE candidate_id = ?
-          AND provider_place_id IS NOT NULL
-          AND is_coordinate_valid = 1
-        ORDER BY verified_at DESC, id DESC
-        LIMIT 1
-        """,
-        (candidate_id,),
-    ).fetchone()
-    if verification is None:
+    decision = stored_provider_evidence_review_decision(conn, candidate_id, row)
+    if decision is None:
         return None
-    candidate = PlaceCandidate(
-        provider_place_id=verification["provider_place_id"],
-        name=verification["provider_place_name"],
-        category=verification["provider_category"],
-        address=verification["provider_address"] or verification["provider_road_address"] or "",
-        road_address=verification["provider_road_address"] or verification["provider_address"] or "",
-        longitude=float(verification["longitude"]),
-        latitude=float(verification["latitude"]),
-    )
-    decision = VerifierAgent(StoredProviderNaverClient(candidate), NoPermitClient()).verify(row)
     if decision.decision in {"approved", "rejected"}:
         return decision
     return None
+
+
+def advisory_permit_resolution_decision(
+    row: NormalizedExpenseRow,
+    decision: VerificationDecision,
+    permit: PermitSnapshot,
+) -> VerificationDecision:
+    if (
+        decision.decision != "needs_review"
+        or permit.business_status != "active"
+        or permit.category not in FOOD_CATEGORIES
+        or not permit.address
+        or not is_food_context_purpose(row.purpose)
+    ):
+        return decision
+    matches: list[tuple[float, float, PlaceCandidate]] = []
+    for evidence in decision.evidence.get("candidate_evidence", []):
+        if not isinstance(evidence, dict):
+            continue
+        candidate = PlaceCandidate(
+            provider_place_id=str(evidence.get("provider_place_id") or ""),
+            name=str(evidence.get("name") or ""),
+            category=str(evidence.get("category") or "other"),
+            address=str(evidence.get("address") or ""),
+            road_address=str(evidence.get("road_address") or evidence.get("address") or ""),
+            longitude=float(evidence.get("longitude") or 0.0),
+            latitude=float(evidence.get("latitude") or 0.0),
+            provider_category_raw=str(evidence.get("provider_category_raw") or ""),
+        )
+        if (
+            not candidate.provider_place_id
+            or candidate.category not in FOOD_CATEGORIES
+            or not has_valid_provider_coordinates(candidate)
+        ):
+            continue
+        name_score = name_similarity_with_branch(row_name_for_matching(row), candidate.name)
+        address_score = candidate_address_similarity(permit.address, candidate)
+        if (
+            name_score < 0.55
+            or address_score < 0.72
+            or not candidate_structured_address_match(permit.address, candidate)
+        ):
+            continue
+        matches.append((address_score, name_score, candidate))
+    if not matches:
+        return decision
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best_address_score, best_name_score, best = matches[0]
+    competing_addresses = {
+        normalize_address(candidate.road_address or candidate.address)
+        for address_score, _, candidate in matches
+        if address_score >= best_address_score - 0.05
+    }
+    if len(competing_addresses) > 1:
+        return decision
+    evidence = dict(decision.evidence)
+    evidence.update(
+        {
+            "name_similarity": best_name_score,
+            "address_similarity": best_address_score,
+            "permit_id": permit.permit_id,
+            "permit_status": permit.business_status,
+            "permit_address": permit.address,
+        }
+    )
+    return VerificationDecision(
+        decision="approved",
+        confidence=min(0.98, 0.68 + best_name_score * 0.15 + best_address_score * 0.15),
+        approved_by="rule",
+        selected_candidate=best,
+        category=best.category,
+        reason_codes=[*decision.reason_codes, "PERMIT_ADVISORY_ACTIVE_ADDRESS_MATCH"],
+        evidence=evidence,
+    )
+
+
+def advisory_permit_conflict_decision(
+    row: NormalizedExpenseRow,
+    decision: VerificationDecision,
+    permit: PermitSnapshot,
+) -> VerificationDecision:
+    if (
+        decision.decision != "approved"
+        or row.normalized_address
+        or "NAVER_UNIQUE_EXACT_AMONG_MULTIPLE" not in decision.reason_codes
+        or permit.business_status != "active"
+        or permit.category not in FOOD_CATEGORIES
+        or not permit.address
+        or decision.selected_candidate is None
+        or candidate_structured_address_match(permit.address, decision.selected_candidate)
+    ):
+        return decision
+    alternatives: list[PlaceCandidate] = []
+    for item in decision.evidence.get("candidate_evidence", []):
+        if not isinstance(item, dict):
+            continue
+        candidate = PlaceCandidate(
+            provider_place_id=str(item.get("provider_place_id") or ""),
+            name=str(item.get("name") or ""),
+            category=str(item.get("category") or "other"),
+            address=str(item.get("address") or ""),
+            road_address=str(item.get("road_address") or item.get("address") or ""),
+            longitude=float(item.get("longitude") or 0.0),
+            latitude=float(item.get("latitude") or 0.0),
+            provider_category_raw=str(item.get("provider_category_raw") or ""),
+        )
+        if (
+            candidate.provider_place_id
+            and candidate.category in FOOD_CATEGORIES
+            and candidate_structured_address_match(permit.address, candidate)
+        ):
+            alternatives.append(candidate)
+    if not alternatives:
+        return decision
+    evidence = dict(decision.evidence)
+    evidence.update(
+        {
+            "permit_id": permit.permit_id,
+            "permit_status": permit.business_status,
+            "permit_address": permit.address,
+            "conflicting_candidate_ids": [candidate.provider_place_id for candidate in alternatives],
+        }
+    )
+    return VerificationDecision(
+        decision="needs_review",
+        confidence=0.88,
+        approved_by="rule",
+        selected_candidate=decision.selected_candidate,
+        category=decision.category,
+        reason_codes=[
+            *(
+                reason
+                for reason in decision.reason_codes
+                if reason
+                not in {
+                    "NAVER_UNIQUE_EXACT_AMONG_MULTIPLE",
+                    "PROVIDER_ADDRESS_AVAILABLE",
+                    "PERMIT_ACTIVE",
+                }
+            ),
+            "PERMIT_ADVISORY_CONFLICTING_CANDIDATE",
+        ],
+        evidence=evidence,
+    )
 
 
 class BusanFixtureAdapter:
@@ -742,12 +993,12 @@ class DailyPipeline:
         conn: Any,
         row: NormalizedExpenseRow,
         decision: VerificationDecision,
-    ) -> str:
+    ) -> tuple[str, VerificationDecision]:
         if self._should_skip_advisory_permit(decision):
-            return "skipped"
+            return "skipped", decision
         permit_client = self._build_advisory_permit_client(self.settings, conn)
         if permit_client is None:
-            return "skipped"
+            return "skipped", decision
         try:
             permit = permit_client.lookup(row)
         except Exception as exc:
@@ -756,11 +1007,11 @@ class DailyPipeline:
                 "status": "unavailable",
                 "error": str(exc)[:300],
             }
-            return "unavailable"
+            return "unavailable", decision
         if permit is None:
             decision.reason_codes.append("PERMIT_ADVISORY_MISSING")
             decision.evidence["permit_advisory"] = {"status": "missing"}
-            return "missing"
+            return "missing", decision
         advisory_payload = {
             "status": "found",
             "permit_id": permit.permit_id,
@@ -782,7 +1033,56 @@ class DailyPipeline:
             result = "found"
         decision.reason_codes.append(reason)
         decision.evidence["permit_advisory"] = advisory_payload
-        return result
+        decision = advisory_permit_conflict_decision(row, decision, permit)
+        resolved = advisory_permit_resolution_decision(row, decision, permit)
+        if resolved.decision == "approved":
+            return result, resolved
+        if (
+            decision.decision == "needs_review"
+            and permit.business_status == "active"
+            and permit.category in FOOD_CATEGORIES
+            and permit.address
+        ):
+            resolved = self._resolve_with_permit_address(conn, row, decision, permit)
+        return result, resolved
+
+    def _resolve_with_permit_address(
+        self,
+        conn: Any,
+        row: NormalizedExpenseRow,
+        decision: VerificationDecision,
+        permit: PermitSnapshot,
+    ) -> VerificationDecision:
+        enriched_row = replace(
+            row,
+            address=permit.address,
+            normalized_address=normalize_address(permit.address),
+        )
+        try:
+            naver_client = self._active_verifier(conn).naver_client
+            enriched = VerifierAgent(
+                naver_client=naver_client,
+                permit_client=StoredPermitClient(permit),
+            ).verify(enriched_row)
+        except Exception as exc:
+            decision.reason_codes.append("PERMIT_ADDRESS_SEARCH_UNAVAILABLE")
+            decision.evidence["permit_address_search_error"] = str(exc)[:300]
+            return decision
+        if enriched.decision != "approved":
+            enriched = advisory_permit_resolution_decision(enriched_row, enriched, permit)
+        if enriched.decision != "approved":
+            return decision
+        evidence = dict(enriched.evidence)
+        evidence["permit_advisory"] = decision.evidence.get("permit_advisory", {})
+        return VerificationDecision(
+            decision="approved",
+            confidence=enriched.confidence,
+            approved_by="rule",
+            selected_candidate=enriched.selected_candidate,
+            category=enriched.category,
+            reason_codes=[*enriched.reason_codes, "PERMIT_ADVISORY_ADDRESS_ENRICHED"],
+            evidence=evidence,
+        )
 
     def _should_skip_advisory_permit(self, decision: VerificationDecision) -> bool:
         if decision.selected_candidate is not None:
@@ -860,41 +1160,42 @@ class DailyPipeline:
                         continue
                     document_rows_seen = 0
                     document_rows_inserted = 0
-                    for raw_row in extracted_rows:
-                        summary["rows_seen"] += 1
-                        document_rows_seen += 1
-                        try:
-                            normalized = self._normalize(raw_row)
-                            expense_id, inserted_row = self._upsert_expense(
-                                conn, source, raw_document_id, raw_row, normalized
-                            )
-                            if inserted_row:
-                                summary["rows_inserted"] += 1
-                                document_rows_inserted += 1
-                            candidate_id = self._upsert_candidate(
-                                conn, source, expense_id, raw_row, normalized
-                            )
-                            if self._candidate_is_resolved(conn, candidate_id):
-                                continue
-                            if not self.verify_new_rows:
-                                self._defer_candidate_verification(conn, candidate_id)
-                                summary["needs_review"] += 1
-                                continue
-                            decision = (
-                                expense_scope_reject_decision(normalized)
-                                or non_food_purpose_decision(normalized)
-                                or alias_memory_decision(conn, normalized)
-                                or verifier.verify(normalized)
-                            )
-                            self._track_advisory_permit_summary(
-                                summary,
-                                self._annotate_advisory_permit(conn, normalized, decision),
-                            )
-                            self._persist_decision(conn, source, expense_id, candidate_id, decision)
-                            summary[decision.decision] += 1
-                        except Exception as exc:  # pragma: no cover - defensive DLQ guard
-                            summary["dlq"] += 1
-                            self._insert_dlq(conn, batch_id, "row", raw_row.__dict__, str(exc))
+                    for extracted_row in extracted_rows:
+                        for raw_row in split_raw_expense_row_places(extracted_row):
+                            summary["rows_seen"] += 1
+                            document_rows_seen += 1
+                            try:
+                                normalized = self._normalize(raw_row)
+                                expense_id, inserted_row = self._upsert_expense(
+                                    conn, source, raw_document_id, raw_row, normalized
+                                )
+                                if inserted_row:
+                                    summary["rows_inserted"] += 1
+                                    document_rows_inserted += 1
+                                candidate_id = self._upsert_candidate(
+                                    conn, source, expense_id, raw_row, normalized
+                                )
+                                if self._candidate_is_resolved(conn, candidate_id):
+                                    continue
+                                if not self.verify_new_rows:
+                                    self._defer_candidate_verification(conn, candidate_id)
+                                    summary["needs_review"] += 1
+                                    continue
+                                decision = (
+                                    expense_scope_reject_decision(normalized)
+                                    or non_food_purpose_decision(normalized)
+                                    or alias_memory_decision(conn, normalized)
+                                    or verifier.verify(normalized)
+                                )
+                                permit_result, decision = self._annotate_advisory_permit(
+                                    conn, normalized, decision
+                                )
+                                self._track_advisory_permit_summary(summary, permit_result)
+                                self._persist_decision(conn, source, expense_id, candidate_id, decision)
+                                summary[decision.decision] += 1
+                            except Exception as exc:  # pragma: no cover - defensive DLQ guard
+                                summary["dlq"] += 1
+                                self._insert_dlq(conn, batch_id, "row", raw_row.__dict__, str(exc))
                     self._mark_document_parsed(
                         conn,
                         raw_document_id,
@@ -916,12 +1217,22 @@ class DailyPipeline:
             sort=sort,
         )
 
-    def verify_collected(self, limit: int = 100, sort: str = "verification_oldest") -> dict[str, Any]:
+    def verify_collected(
+        self,
+        limit: int = 100,
+        sort: str = "verification_oldest",
+        plan_id: int | None = None,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> dict[str, Any]:
         return self._verify_pending(
             limit=limit,
             job_name="verify_collected",
             initial_only=True,
             sort=sort,
+            plan_id=plan_id,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     def create_collection_plan(
@@ -1332,22 +1643,23 @@ class DailyPipeline:
                     doc_rows_inserted = 0
                     try:
                         extracted_rows = self.adapter.extract(document)
-                        for raw_row in extracted_rows:
-                            doc_rows_seen += 1
-                            summary["rows_seen"] += 1
-                            normalized = self._normalize(raw_row)
-                            expense_id, inserted_row = self._upsert_expense(
-                                conn, source, int(row["raw_document_id"]), raw_row, normalized
-                            )
-                            candidate_id = self._upsert_candidate(
-                                conn, source, expense_id, raw_row, normalized
-                            )
-                            if inserted_row:
-                                doc_rows_inserted += 1
-                                summary["rows_inserted"] += 1
-                                if not self._candidate_is_resolved(conn, candidate_id):
-                                    self._defer_candidate_verification(conn, candidate_id)
-                                    summary["needs_review"] += 1
+                        for extracted_row in extracted_rows:
+                            for raw_row in split_raw_expense_row_places(extracted_row):
+                                doc_rows_seen += 1
+                                summary["rows_seen"] += 1
+                                normalized = self._normalize(raw_row)
+                                expense_id, inserted_row = self._upsert_expense(
+                                    conn, source, int(row["raw_document_id"]), raw_row, normalized
+                                )
+                                candidate_id = self._upsert_candidate(
+                                    conn, source, expense_id, raw_row, normalized
+                                )
+                                if inserted_row:
+                                    doc_rows_inserted += 1
+                                    summary["rows_inserted"] += 1
+                                    if not self._candidate_is_resolved(conn, candidate_id):
+                                        self._defer_candidate_verification(conn, candidate_id)
+                                        summary["needs_review"] += 1
                         parse_status = "parsed" if doc_rows_seen > 0 else "empty"
                         if parse_status == "parsed":
                             summary["documents_parsed"] += 1
@@ -1704,7 +2016,16 @@ class DailyPipeline:
             "id_asc": "c.id ASC",
         }.get(str(sort or "verification_oldest"), fallback)
 
-    def _verify_pending(self, limit: int, job_name: str, initial_only: bool, sort: str) -> dict[str, Any]:
+    def _verify_pending(
+        self,
+        limit: int,
+        job_name: str,
+        initial_only: bool,
+        sort: str,
+        plan_id: int | None = None,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> dict[str, Any]:
         self.database.prepare()
         capped_limit = max(1, min(limit, 500))
         with self.database.session() as conn:
@@ -1720,7 +2041,13 @@ class DailyPipeline:
                 "dlq": 0,
             }
             try:
-                summary["pending_before"] = self._verification_pending_count(conn, initial_only)
+                summary["pending_before"] = self._verification_pending_count(
+                    conn,
+                    initial_only,
+                    plan_id=plan_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 verifier = self._active_verifier(conn)
                 pending_filter = (
                     """
@@ -1734,6 +2061,28 @@ class DailyPipeline:
                     else "mrt.status = 'pending'"
                 )
                 order_sql = self._verification_order_sql(sort, initial_only)
+                scope_clauses: list[str] = []
+                scope_params: list[Any] = []
+                if plan_id is not None:
+                    scope_clauses.append(
+                        """
+                        EXISTS (
+                          SELECT 1
+                          FROM collection_plan_documents cpd
+                          WHERE cpd.plan_id = ?
+                            AND cpd.raw_document_id = rd.id
+                            AND cpd.status = 'collected'
+                        )
+                        """
+                    )
+                    scope_params.append(int(plan_id))
+                if start_date:
+                    scope_clauses.append("COALESCE(c.used_date, '') >= ?")
+                    scope_params.append(start_date)
+                if end_date:
+                    scope_clauses.append("COALESCE(c.used_date, '') <= ?")
+                    scope_params.append(end_date)
+                scope_sql = "".join(f" AND ({clause})" for clause in scope_clauses)
                 rows = conn.execute(
                     f"""
                     SELECT
@@ -1744,6 +2093,10 @@ class DailyPipeline:
                       c.original_address,
                       c.normalized_place_name,
                       c.normalized_address,
+                      c.review_place_name,
+                      c.review_address,
+                      c.review_normalized_place_name,
+                      c.review_normalized_address,
                       c.used_date,
                       c.amount,
                       er.source_row_number,
@@ -1754,10 +2107,11 @@ class DailyPipeline:
                     JOIN expense_records er ON er.id = c.expense_record_id
                     JOIN raw_documents rd ON rd.id = er.raw_document_id
                     WHERE {pending_filter}
+                    {scope_sql}
                     ORDER BY {order_sql}
                     LIMIT ?
                     """,
-                    (capped_limit,),
+                    (*scope_params, capped_limit),
                 ).fetchall()
                 self._emit_verification_progress(
                     {
@@ -1807,12 +2161,16 @@ class DailyPipeline:
                             row_number=int(row["source_row_number"] or 0),
                             department_name=row["department_name"] or "",
                             used_date=row["used_date"] or "",
-                            place_name=row["original_place_name"] or "",
-                            address=row["original_address"] or "",
+                            place_name=row["review_place_name"] or row["original_place_name"] or "",
+                            address=row["review_address"] or row["original_address"] or "",
                             purpose=row["purpose"] or "",
                             amount=int(row["amount"] or 0),
-                            normalized_place_name=row["normalized_place_name"] or normalize_text(row["original_place_name"]),
-                            normalized_address=row["normalized_address"] or normalize_address(row["original_address"]),
+                            normalized_place_name=row["review_normalized_place_name"]
+                            or row["normalized_place_name"]
+                            or normalize_text(row["review_place_name"] or row["original_place_name"]),
+                            normalized_address=row["review_normalized_address"]
+                            or row["normalized_address"]
+                            or normalize_address(row["review_address"] or row["original_address"]),
                         )
                         progress("expense_scope_rule", "업무추진비 범위 조건", 18)
                         decision = expense_scope_reject_decision(normalized)
@@ -1835,10 +2193,10 @@ class DailyPipeline:
                                 progress=lambda stage, label, percent: progress(stage, label, percent),
                             )
                         progress("persist_decision", "검증 결과 저장", 96)
-                        self._track_advisory_permit_summary(
-                            summary,
-                            self._annotate_advisory_permit(conn, normalized, decision),
+                        permit_result, decision = self._annotate_advisory_permit(
+                            conn, normalized, decision
                         )
+                        self._track_advisory_permit_summary(summary, permit_result)
                         self._persist_decision(
                             conn,
                             {"region_id": row["region_id"]},
@@ -1888,7 +2246,13 @@ class DailyPipeline:
                             str(exc),
                         )
                 summary["rows_processed"] = summary["rows_seen"]
-                summary["pending_after"] = self._verification_pending_count(conn, initial_only)
+                summary["pending_after"] = self._verification_pending_count(
+                    conn,
+                    initial_only,
+                    plan_id=plan_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 self._finish_batch(conn, batch_id, "success", summary)
                 self._emit_verification_progress(
                     {
@@ -1901,7 +2265,13 @@ class DailyPipeline:
                 )
                 return {"batch_id": batch_id, "status": "success", "summary": summary}
             except Exception as exc:
-                summary["pending_after"] = self._verification_pending_count(conn, initial_only)
+                summary["pending_after"] = self._verification_pending_count(
+                    conn,
+                    initial_only,
+                    plan_id=plan_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 self._finish_batch(conn, batch_id, "failed", summary, str(exc))
                 self._emit_verification_progress(
                     {
@@ -1914,20 +2284,53 @@ class DailyPipeline:
                 )
                 raise
 
-    def _verification_pending_count(self, conn: Any, initial_only: bool) -> int:
+    def _verification_pending_count(
+        self,
+        conn: Any,
+        initial_only: bool,
+        plan_id: int | None = None,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> int:
         if initial_only:
+            scope_clauses: list[str] = []
+            scope_params: list[Any] = []
+            if plan_id is not None:
+                scope_clauses.append(
+                    """
+                    EXISTS (
+                      SELECT 1
+                      FROM collection_plan_documents cpd
+                      WHERE cpd.plan_id = ?
+                        AND cpd.raw_document_id = rd.id
+                        AND cpd.status = 'collected'
+                    )
+                    """
+                )
+                scope_params.append(int(plan_id))
+            if start_date:
+                scope_clauses.append("COALESCE(c.used_date, '') >= ?")
+                scope_params.append(start_date)
+            if end_date:
+                scope_clauses.append("COALESCE(c.used_date, '') <= ?")
+                scope_params.append(end_date)
+            scope_sql = "".join(f" AND ({clause})" for clause in scope_clauses)
             return int(
                 conn.execute(
-                    """
+                    f"""
                     SELECT COUNT(*) AS count
                     FROM restaurant_candidates c
+                    JOIN expense_records er ON er.id = c.expense_record_id
+                    JOIN raw_documents rd ON rd.id = er.raw_document_id
                     LEFT JOIN manual_review_tasks mrt ON mrt.candidate_id = c.id
                     WHERE c.verification_status = 'not_requested'
                       AND c.review_note = 'PENDING_VERIFICATION'
                       AND c.status = 'needs_review'
                       AND c.manual_review_status = 'pending'
                       AND (mrt.id IS NULL OR mrt.status = 'pending')
-                    """
+                      {scope_sql}
+                    """,
+                    scope_params,
                 ).fetchone()["count"]
             )
         return int(
@@ -2040,33 +2443,62 @@ class DailyPipeline:
         source: Any,
         target: CollectionTarget,
     ) -> Any | None:
-        return conn.execute(
-            """
+        identity = source_document_identity(target.source_url)
+        parsed = urlparse(target.source_url)
+        document_ids = parse_qs(parsed.query).get("schIndx") or []
+        if document_ids and str(document_ids[0]).isdigit():
+            url_clause = "(rd.source_url = ? OR rd.source_url LIKE ?)"
+            url_params: list[Any] = [target.source_url, f"%schIndx={document_ids[0]}%"]
+        else:
+            url_clause = "rd.source_url = ?"
+            url_params = [target.source_url]
+        rows = conn.execute(
+            f"""
             SELECT
               rd.id,
+              rd.source_url,
               rd.parse_status,
               COUNT(er.id) AS expense_count
             FROM raw_documents rd
             LEFT JOIN expense_records er ON er.raw_document_id = rd.id
             WHERE rd.institution_id = ?
-              AND rd.source_url = ?
-            GROUP BY rd.id
+              AND {url_clause}
+            GROUP BY rd.id, rd.source_url, rd.parse_status
             ORDER BY rd.id DESC
-            LIMIT 1
             """,
-            (source["institution_id"], target.source_url),
-        ).fetchone()
+            (source["institution_id"], *url_params),
+        ).fetchall()
+        return next(
+            (
+                row
+                for row in rows
+                if source_document_identity(row["source_url"]) == identity
+            ),
+            None,
+        )
 
     def _upsert_document(
         self, conn: Any, source: Any, document: SourceDocument
     ) -> tuple[int, bool]:
+        existing_by_url = self._existing_document_for_target(
+            conn,
+            source,
+            CollectionTarget(
+                source_url=document.source_url,
+                source_title=document.source_title,
+                published_at=document.published_at,
+                department_name=document.department_name,
+            ),
+        )
+        if existing_by_url is not None:
+            return int(existing_by_url["id"]), False
         content_hash = stable_hash(document.content)
         existing = conn.execute(
             """
             SELECT id FROM raw_documents
-            WHERE institution_id = ? AND (source_url = ? OR content_hash = ?)
+            WHERE institution_id = ? AND content_hash = ?
             """,
-            (source["institution_id"], document.source_url, content_hash),
+            (source["institution_id"], content_hash),
         ).fetchone()
         if existing:
             return int(existing["id"]), False
@@ -2272,7 +2704,15 @@ class DailyPipeline:
                 raw_row.used_date,
                 raw_row.amount,
                 "other",
-                self.adapter.source_key,
+                (
+                    f"{self.adapter.source_key}:multi_place_split"
+                    if raw_row.split_count > 1
+                    else (
+                        f"{self.adapter.source_key}:place_suffix_cleaned"
+                        if raw_row.cleaned_from_place_name
+                        else self.adapter.source_key
+                    )
+                ),
             ),
         )
         return int(cur.lastrowid)
@@ -2448,6 +2888,7 @@ class DailyPipeline:
                 road_address=str(evidence.get("road_address") or evidence.get("address") or ""),
                 longitude=float(evidence.get("longitude") or 0.0),
                 latitude=float(evidence.get("latitude") or 0.0),
+                provider_category_raw=str(evidence.get("provider_category_raw") or ""),
             )
             candidate_decision = VerificationDecision(
                 decision=decision.decision,
@@ -2504,7 +2945,10 @@ class DailyPipeline:
         is_address_match = 1 if is_success or address_similarity >= 0.72 else 0
         is_category_valid = 1 if is_success and candidate.category in {"restaurant", "cafe", "bar"} else 0
         verification_reason = ",".join(decision.reason_codes)
-        raw_response_json = safe_json_dumps(decision.evidence)
+        raw_evidence = dict(decision.evidence)
+        if candidate.provider_category_raw:
+            raw_evidence["provider_category_raw"] = candidate.provider_category_raw
+        raw_response_json = safe_json_dumps(raw_evidence)
         existing = conn.execute(
             """
             SELECT id FROM place_verifications

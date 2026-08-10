@@ -8,8 +8,15 @@ from pathlib import Path
 from app.database import Database
 from app.pipeline import DailyPipeline
 from app.agents import PlaceCandidate
-from app.services import AppError, RequestContext, RestaurantService, naver_map_query
+from app.services import (
+    AppError,
+    RequestContext,
+    RestaurantService,
+    naver_map_query,
+    provider_detail_category,
+)
 from app.source_catalog import iter_source_catalog
+from app.utils import safe_json_dumps
 
 
 class FakeReviewSummaryClient:
@@ -192,7 +199,54 @@ class ServiceTests(unittest.TestCase):
             restaurant for restaurant in all_restaurants
             if restaurant["name"] == "부산돼지국밥 시청점"
         )
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                UPDATE place_verifications
+                SET raw_response_json = '{}'
+                WHERE id = (
+                  SELECT place_verification_id
+                  FROM restaurants
+                  WHERE id = ?
+                )
+                """,
+                (int(fixture_restaurant["id"]),),
+            )
+            conn.execute(
+                """
+                INSERT INTO place_verifications
+                  (candidate_id, provider, provider_place_id, provider_place_name,
+                   provider_category, verification_status, raw_response_json)
+                SELECT candidate_id, 'naver_history', provider_place_id, provider_place_name,
+                       provider_category, 'success', ?
+                FROM place_verifications
+                WHERE id = (
+                  SELECT place_verification_id
+                  FROM restaurants
+                  WHERE id = ?
+                )
+                """,
+                (
+                    safe_json_dumps({"provider_category_raw": "한식>국밥"}),
+                    int(fixture_restaurant["id"]),
+                ),
+            )
         detail = self.service.get_restaurant(int(fixture_restaurant["id"]))
+        self.assertEqual(detail["category_detail_label"], "국밥")
+        updated_map_restaurant = next(
+            restaurant
+            for restaurant in self.service.list_map_restaurants()
+            if int(restaurant["id"]) == int(fixture_restaurant["id"])
+        )
+        updated_ranking_restaurant = next(
+            restaurant
+            for restaurant in self.service.rankings()
+            if int(restaurant["id"]) == int(fixture_restaurant["id"])
+        )
+        self.assertEqual(updated_map_restaurant["category_detail_label"], "국밥")
+        self.assertEqual(updated_ranking_restaurant["category_detail_label"], "국밥")
+        self.assertEqual(fixture_restaurant["source_place_names"], ["부산돼지국밥 시청점"])
+        self.assertEqual(detail["source_place_names"], ["부산돼지국밥 시청점"])
         self.assertEqual(
             detail["visits"],
             [
@@ -200,6 +254,7 @@ class ServiceTests(unittest.TestCase):
                     "visited_at": "2026-01-14",
                     "institution_name": "부산광역시청",
                     "purpose": "현안 업무 협의 간담",
+                    "source_place_name": "부산돼지국밥 시청점",
                 }
             ],
         )
@@ -209,6 +264,63 @@ class ServiceTests(unittest.TestCase):
             self.assertIsNotNone(restaurant["longitude"])
             self.assertTrue(restaurant["naver_map_query"])
             self.assertTrue(restaurant["naver_map_url"].startswith("https://map.naver.com/p/search/"))
+
+    def test_provider_detail_category_uses_the_most_specific_path_segment(self) -> None:
+        self.assertEqual(
+            provider_detail_category(
+                safe_json_dumps({"provider_category_raw": "음식점>일식>덮밥"})
+            ),
+            "덮밥",
+        )
+        self.assertEqual(provider_detail_category("{}"), "")
+
+    def test_split_source_place_name_is_exposed_for_each_map_restaurant(self) -> None:
+        combined_source_name = "A식당, B카페"
+        with self.db.session() as conn:
+            links = conn.execute(
+                """
+                SELECT restaurant_id, expense_record_id
+                FROM restaurant_expense_links
+                ORDER BY restaurant_id
+                LIMIT 2
+                """
+            ).fetchall()
+            self.assertEqual(len(links), 2)
+            for index, link in enumerate(links, start=1):
+                conn.execute(
+                    """
+                    UPDATE expense_records
+                    SET place_name = ?,
+                        original_row_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        f"분리장소{index}",
+                        safe_json_dumps(
+                            {
+                                "place_name": f"분리장소{index}",
+                                "split_from_place_name": combined_source_name,
+                                "split_index": index,
+                                "split_count": 2,
+                            }
+                        ),
+                        int(link["expense_record_id"]),
+                    ),
+                )
+
+        restaurant_ids = [int(link["restaurant_id"]) for link in links]
+        map_rows = {
+            int(item["id"]): item
+            for item in self.service.list_map_restaurants()
+            if int(item["id"]) in restaurant_ids
+        }
+
+        self.assertEqual(set(map_rows), set(restaurant_ids))
+        for restaurant_id in restaurant_ids:
+            self.assertEqual(map_rows[restaurant_id]["source_place_names"], [combined_source_name])
+            detail = self.service.get_restaurant(restaurant_id)
+            self.assertEqual(detail["source_place_names"], [combined_source_name])
+            self.assertEqual(detail["visits"][0]["source_place_name"], combined_source_name)
 
     def test_map_region_search_excludes_name_only_matches(self) -> None:
         with self.db.session() as conn:
@@ -482,6 +594,94 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(restaurant["naver_place_id"], "naver-gaonbi-002")
         self.assertEqual(candidate["status"], "verified")
         self.assertEqual(candidate["review_note"], "카페가온비 후보 선택 승인")
+
+    def test_admin_can_explicitly_override_exact_other_provider_category(self) -> None:
+        context = RequestContext(actor_id="admin")
+        review_id = self._insert_manual_review_with_provider(
+            "category-override",
+            "온더보더 광화문D타워점",
+            83000,
+        )
+        with self.db.session() as conn:
+            candidate_id = int(
+                conn.execute(
+                    "SELECT candidate_id FROM manual_review_tasks WHERE id = ?",
+                    (review_id,),
+                ).fetchone()["candidate_id"]
+            )
+            exact_other = conn.execute(
+                """
+                INSERT INTO place_verifications
+                  (candidate_id, provider, provider_place_id, provider_place_name,
+                   provider_category, provider_address, provider_road_address,
+                   normalized_provider_name, normalized_provider_address,
+                   longitude, latitude, name_similarity, address_similarity,
+                   is_name_match, is_address_match, is_coordinate_valid,
+                   is_category_valid, verification_status, verification_reason,
+                   raw_response_json)
+                VALUES (?, 'naver', 'naver-ontheborder-001', '온더보더 광화문D타워점',
+                        'other', '서울특별시 종로구 청진동 246',
+                        '서울특별시 종로구 종로3길 17', '온더보더 광화문D타워점',
+                        '서울특별시 종로구 종로3길 17', 126.979, 37.571,
+                        1.0, 0.85, 1, 1, 1, 0, 'ambiguous',
+                        'CATEGORY_MISMATCH', '{}')
+                """,
+                (candidate_id,),
+            )
+
+        item = next(
+            row
+            for row in self.service.admin_candidates(limit=100)["groups"]["needs_review"]["items"]
+            if row["candidate_id"] == candidate_id
+        )
+        exact = item["provider_candidates"][0]
+        self.assertEqual(item["provider_place_name"], "온더보더 광화문D타워점")
+        self.assertEqual(exact["verification_id"], int(exact_other.lastrowid))
+        self.assertEqual(exact["is_approvable"], 0)
+        self.assertEqual(exact["can_admin_override"], 1)
+
+        with self.assertRaises(AppError):
+            self.service.update_admin_candidate(
+                candidate_id,
+                context,
+                review_place_name="온더보더 광화문D타워점",
+                review_address="서울특별시 종로구 종로3길 17",
+                review_major_category="restaurant",
+                target_status="verified",
+                verification_id=int(exact_other.lastrowid),
+            )
+
+        result = self.service.update_admin_candidate(
+            candidate_id,
+            context,
+            review_place_name="온더보더 광화문D타워점",
+            review_address="서울특별시 종로구 종로3길 17",
+            review_major_category="restaurant",
+            target_status="verified",
+            reviewer_note="네이버 기타 분류 범주 예외 확인",
+            verification_id=int(exact_other.lastrowid),
+            allow_category_override=True,
+        )
+
+        with self.db.session() as conn:
+            restaurant = conn.execute(
+                "SELECT major_category FROM restaurants WHERE id = ?",
+                (result["restaurant_id"],),
+            ).fetchone()
+            audit = conn.execute(
+                """
+                SELECT reason_codes_json
+                FROM decision_audit_logs
+                WHERE action = 'candidate_admin_update' AND target_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+
+        self.assertEqual(result["result"], "verified")
+        self.assertEqual(restaurant["major_category"], "restaurant")
+        self.assertIn("ADMIN_PROVIDER_CATEGORY_OVERRIDE", audit["reason_codes_json"])
 
     def test_manual_review_candidate_row_can_be_updated(self) -> None:
         context = RequestContext(actor_id="admin")
@@ -826,6 +1026,17 @@ class ServiceTests(unittest.TestCase):
                 """,
                 (first["candidate_id"],),
             ).fetchone()
+            aliases = {
+                row["normalized_alias"]
+                for row in conn.execute(
+                    """
+                    SELECT normalized_alias
+                    FROM alias_memory
+                    WHERE restaurant_id = ?
+                    """,
+                    (first_result["restaurant_id"],),
+                ).fetchall()
+            }
 
         self.assertEqual(first_result["restaurant_id"], second_result["restaurant_id"])
         self.assertEqual(restaurant["canonical_name"], "스타벅스 부산시청점")
@@ -837,6 +1048,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(first_candidate["review_place_name"], "스타벅스 부산시청점")
         self.assertEqual(first_candidate["review_address"], "부산광역시 연제구 중앙대로 1001")
         self.assertEqual(first_candidate["review_major_category"], "cafe")
+        self.assertIn("스타벅스", aliases)
+        self.assertIn("스타벅스커피", aliases)
 
     def test_admin_candidate_geocode_button_updates_coordinates_for_later_approval(self) -> None:
         service = RestaurantService(self.db, geocoding_client=FakeGeocodingClient())
@@ -934,7 +1147,7 @@ class ServiceTests(unittest.TestCase):
         self.assertAlmostEqual(restaurant["latitude"], 35.104, places=3)
         self.assertEqual(restaurant["road_address"], "부산광역시 사하구 낙동대로 521-1")
 
-    def test_admin_candidate_update_refreshes_naver_provider_candidates(self) -> None:
+    def test_admin_candidate_provider_refresh_uses_edited_values(self) -> None:
         service = RestaurantService(self.db, naver_client=FakeNaverProviderClient())
         context = RequestContext(actor_id="admin")
         review_id = self._insert_manual_review_with_provider("refresh-provider", "고향보리밥", 36000)
@@ -944,13 +1157,12 @@ class ServiceTests(unittest.TestCase):
                 (review_id,),
             ).fetchone()["candidate_id"]
 
-        result = service.update_admin_candidate(
+        result = service.refresh_admin_candidate_providers(
             candidate_id,
             context,
             review_place_name="고향보리밥",
             review_address="부산 사하구 낙동대로 521-1",
             review_major_category="restaurant",
-            target_status="needs_review",
         )
 
         item = next(
@@ -961,7 +1173,72 @@ class ServiceTests(unittest.TestCase):
         provider_names = [candidate["provider_place_name"] for candidate in item["provider_candidates"]]
 
         self.assertEqual(result["provider_refresh"]["status"], "success")
-        self.assertIn("고향보리밥", provider_names)
+        self.assertEqual(result["provider_refresh"]["removed_stale"], 1)
+        self.assertEqual(provider_names, ["고향보리밥"])
+
+    def test_admin_candidate_geocode_also_refreshes_latest_provider_candidates(self) -> None:
+        service = RestaurantService(
+            self.db,
+            geocoding_client=FakeGeocodingClient(),
+            naver_client=FakeNaverProviderClient(),
+        )
+        context = RequestContext(actor_id="admin")
+        review_id = self._insert_manual_review_with_provider("geocode-refresh-provider", "고향보리밥", 36000)
+        with self.db.session() as conn:
+            candidate_id = int(
+                conn.execute(
+                    "SELECT candidate_id FROM manual_review_tasks WHERE id = ?",
+                    (review_id,),
+                ).fetchone()["candidate_id"]
+            )
+
+        result = service.geocode_admin_candidate(
+            candidate_id,
+            context,
+            review_place_name="고향보리밥",
+            review_address="부산 사하구 낙동대로 521-1",
+            review_major_category="restaurant",
+        )
+
+        with self.db.session() as conn:
+            naver_rows = conn.execute(
+                """
+                SELECT provider_place_name
+                FROM place_verifications
+                WHERE candidate_id = ? AND provider = 'naver'
+                ORDER BY id
+                """,
+                (candidate_id,),
+            ).fetchall()
+
+        self.assertEqual(result["geocoding"]["status"], "success")
+        self.assertEqual(result["provider_refresh"]["status"], "success")
+        self.assertEqual(result["provider_refresh"]["removed_stale"], 1)
+        self.assertEqual([row["provider_place_name"] for row in naver_rows], ["고향보리밥"])
+
+    def test_admin_candidate_state_update_does_not_hide_provider_refresh(self) -> None:
+        context = RequestContext(actor_id="admin")
+        review_id = self._insert_manual_review_with_provider("split-provider-refresh", "고향보리밥", 36000)
+        with self.db.session() as conn:
+            candidate_id = conn.execute(
+                "SELECT candidate_id FROM manual_review_tasks WHERE id = ?",
+                (review_id,),
+            ).fetchone()["candidate_id"]
+
+        result = self.service.update_admin_candidate(
+            candidate_id,
+            context,
+            review_place_name="고향보리밥",
+            review_address="부산 사하구 낙동대로 521-1",
+            review_major_category="restaurant",
+            target_status="needs_review",
+        )
+
+        self.assertEqual(result["provider_refresh"]["status"], "skipped")
+        self.assertEqual(
+            result["provider_refresh"]["reason"],
+            "split_to_provider_refresh_button",
+        )
 
     def test_admin_candidate_can_move_approved_item_to_rejected(self) -> None:
         context = RequestContext(actor_id="admin")
@@ -1070,6 +1347,72 @@ class ServiceTests(unittest.TestCase):
         report = self.service.report_review(created[0]["id"], "spam_or_abuse", context)
         self.assertEqual(report["status"], "open")
         self.assertEqual(len(self.service.review_reports()), 1)
+
+    def test_restaurant_detail_counts_visible_reviews_by_user(self) -> None:
+        restaurant_ids = [
+            int(item["id"])
+            for item in self.service.list_map_restaurants()[:2]
+        ]
+        account = self.service.upsert_oauth_account(
+            "naver", "review-count-user", "리뷰 작성자"
+        )
+        user_id = int(account["user"]["id"])
+        context = RequestContext(
+            user_id=user_id,
+            ip="203.0.113.210",
+            actor_id=f"user:{user_id}",
+        )
+        for index, restaurant_id in enumerate(restaurant_ids, start=1):
+            self.service.add_review(
+                restaurant_id,
+                rating=5,
+                body=f"사용자 리뷰 {index}",
+                reviewer_label="리뷰 작성자",
+                context=context,
+            )
+
+        detail = self.service.get_restaurant(restaurant_ids[0])
+
+        self.assertEqual(detail["reviews"][0]["reviewer_review_count"], 2)
+
+    def test_review_reaction_toggles_and_switches_per_user(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        review = self.service.add_review(
+            restaurant_id,
+            rating=5,
+            body="추천 기능을 확인할 리뷰",
+            reviewer_label="리뷰 작성자",
+            context=RequestContext(ip="203.0.113.220"),
+        )
+        first = self.service.upsert_oauth_account(
+            "naver", "reaction-first", "첫 추천자"
+        )
+        second = self.service.upsert_oauth_account(
+            "naver", "reaction-second", "두 번째 추천자"
+        )
+        first_id = int(first["user"]["id"])
+        second_id = int(second["user"]["id"])
+
+        up = self.service.react_to_review(first_id, int(review["id"]), "up")
+        down = self.service.react_to_review(second_id, int(review["id"]), "down")
+        self.assertEqual(up["reaction"], "up")
+        self.assertEqual(down["recommendation_count"], 1)
+        self.assertEqual(down["not_recommended_count"], 1)
+
+        switched = self.service.react_to_review(first_id, int(review["id"]), "down")
+        self.assertEqual(switched["reaction"], "down")
+        self.assertEqual(switched["recommendation_count"], 0)
+        self.assertEqual(switched["not_recommended_count"], 2)
+        detail = self.service.get_restaurant(restaurant_id, user_id=first_id)
+        self.assertEqual(detail["reviews"][0]["current_reaction"], "down")
+
+        removed = self.service.react_to_review(first_id, int(review["id"]), "down")
+        self.assertEqual(removed["reaction"], "")
+        self.assertEqual(removed["not_recommended_count"], 1)
+
+        with self.assertRaises(AppError) as invalid:
+            self.service.react_to_review(first_id, int(review["id"]), "maybe")
+        self.assertEqual(invalid.exception.status, 400)
 
     def test_ai_summary_first_at_five_then_every_ten_reviews_after_one_hour(self) -> None:
         restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
@@ -1378,6 +1721,67 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(removed["images"], [])
 
+    def test_user_photo_is_public_and_only_its_owner_can_manage_it(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        owner = self.service.upsert_oauth_account(
+            "naver", "photo-owner", "사진 등록자"
+        )
+        other = self.service.upsert_oauth_account(
+            "naver", "photo-other", "다른 사용자"
+        )
+        owner_id = int(owner["user"]["id"])
+        other_id = int(other["user"]["id"])
+
+        saved = self.service.save_user_restaurant_image(
+            owner_id,
+            restaurant_id,
+            "음식사진.png",
+            self.PNG_1X1,
+            alt_text="점심 음식 사진",
+        )
+        detail = self.service.get_restaurant(restaurant_id)
+        self.assertEqual(len(detail["restaurant_images"]), 1)
+        photo = detail["restaurant_images"][0]
+        self.assertEqual(photo["id"], saved["image_id"])
+        self.assertEqual(photo["provider"], "user_upload")
+        self.assertEqual(photo["alt_text"], "점심 음식 사진")
+        photo_path = self.service._admin_image_file_path(
+            photo["source_url"].removeprefix("/media/restaurant-images/")
+        )
+        self.assertTrue(photo_path.exists())
+
+        my_page = self.service.my_page(owner_id)
+        self.assertEqual(my_page["counts"]["photos"], 1)
+        self.assertEqual(my_page["photos"][0]["restaurant_id"], restaurant_id)
+
+        with self.assertRaises(AppError) as update_error:
+            self.service.update_user_restaurant_image(
+                other_id,
+                int(photo["id"]),
+                alt_text="다른 사람이 수정",
+            )
+        self.assertEqual(update_error.exception.status, 404)
+        with self.assertRaises(AppError) as delete_error:
+            self.service.delete_user_restaurant_image(other_id, int(photo["id"]))
+        self.assertEqual(delete_error.exception.status, 404)
+
+        self.service.update_user_restaurant_image(
+            owner_id,
+            int(photo["id"]),
+            alt_text="수정한 사진 설명",
+        )
+        self.assertEqual(
+            self.service.get_restaurant(restaurant_id)["restaurant_images"][0]["alt_text"],
+            "수정한 사진 설명",
+        )
+
+        self.service.delete_user_restaurant_image(owner_id, int(photo["id"]))
+        self.assertEqual(
+            self.service.get_restaurant(restaurant_id)["restaurant_images"],
+            [],
+        )
+        self.assertFalse(photo_path.exists())
+
     def test_admin_image_rejects_unsupported_file_content(self) -> None:
         restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
 
@@ -1485,7 +1889,10 @@ class ServiceTests(unittest.TestCase):
 
         self.assertTrue(saved["is_saved"])
         self.assertTrue(self.service.get_restaurant(restaurant_id, user_id=user_id)["is_saved"])
-        self.assertEqual(page["counts"], {"reviews": 1, "saved_restaurants": 1})
+        self.assertEqual(
+            page["counts"],
+            {"reviews": 1, "saved_restaurants": 1, "photos": 0},
+        )
         self.assertEqual(page["reviews"][0]["id"], review["id"])
         self.assertEqual(page["saved_restaurants"][0]["id"], restaurant_id)
 
@@ -1505,7 +1912,10 @@ class ServiceTests(unittest.TestCase):
         self.service.delete_own_review(user_id, int(review["id"]))
         self.service.unsave_restaurant(user_id, restaurant_id)
         emptied = self.service.my_page(user_id)
-        self.assertEqual(emptied["counts"], {"reviews": 0, "saved_restaurants": 0})
+        self.assertEqual(
+            emptied["counts"],
+            {"reviews": 0, "saved_restaurants": 0, "photos": 0},
+        )
         with self.db.session() as conn:
             summary = conn.execute(
                 "SELECT * FROM restaurant_ai_summaries WHERE restaurant_id = ?",
@@ -1534,6 +1944,18 @@ class ServiceTests(unittest.TestCase):
             actor_id=f"user:{user_id}",
         )
         self.service.save_restaurant(user_id, restaurant_id)
+        saved_photo = self.service.save_user_restaurant_image(
+            user_id,
+            restaurant_id,
+            "탈퇴-사진.png",
+            self.PNG_1X1,
+            alt_text="탈퇴 시 삭제할 사진",
+        )
+        photo = self.service.get_restaurant(restaurant_id)["restaurant_images"][0]
+        self.assertEqual(photo["id"], saved_photo["image_id"])
+        photo_path = self.service._admin_image_file_path(
+            photo["source_url"].removeprefix("/media/restaurant-images/")
+        )
         review = self.service.add_review(
             restaurant_id,
             5,
@@ -1560,10 +1982,12 @@ class ServiceTests(unittest.TestCase):
                 "result": "deleted",
                 "oauth_accounts_deleted": 1,
                 "saved_restaurants_deleted": 1,
+                "photos_deleted": 1,
                 "reviews_anonymized": 1,
                 "reports_anonymized": 1,
             },
         )
+        self.assertFalse(photo_path.exists())
         self.assertIsNone(self.service.get_active_user(user_id))
         with self.db.session() as conn:
             user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()

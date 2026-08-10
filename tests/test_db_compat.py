@@ -10,10 +10,25 @@ from app.config import load_settings
 from app.database import Database, postgres_schema_statements
 from app.db_compat import postgres_sql
 from database.migrations.m0001_app_compatible import expected_schema_signature
-from scripts.db_transfer import fingerprint, require_sqlite_copy, transfer, transfer_succeeded
+from scripts.db_transfer import (
+    fingerprint,
+    require_sqlite_copy,
+    transfer,
+    transfer_key_columns,
+    transfer_succeeded,
+)
 
 
 class DatabaseCompatibilityTests(unittest.TestCase):
+    def test_review_reaction_uses_composite_transfer_key(self) -> None:
+        self.assertEqual(
+            transfer_key_columns(
+                "review_reactions",
+                ["review_id", "user_id", "reaction"],
+            ),
+            ["review_id", "user_id"],
+        )
+
     def test_postgres_sql_translation(self) -> None:
         translated = postgres_sql(
             "INSERT OR IGNORE INTO items (name) VALUES (?)"

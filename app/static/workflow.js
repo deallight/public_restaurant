@@ -119,6 +119,9 @@ const workflowState = {
   localLogs: loadStoredLocalLogs(),
   verificationProgress: null,
   verificationProgressTimer: null,
+  verificationRequestPending: false,
+  verificationRequestedTotal: 0,
+  verificationRequestedAt: "",
   syncedPlanPeriod: false,
 };
 
@@ -126,8 +129,36 @@ function periodPayload() {
   return {
     start_date: select("#workflow-start-date")?.value || "",
     end_date: select("#workflow-end-date")?.value || "",
-    batch_size: Number(select("#workflow-batch-size")?.value || 20),
+    batch_size: selectedBatchSize(),
   };
+}
+
+function selectedBatchMode() {
+  return select("#workflow-batch-mode")?.value === "custom" ? "custom" : "all";
+}
+
+function selectedBatchSize() {
+  const value = Number(select("#workflow-batch-size")?.value || 100);
+  if (!Number.isFinite(value)) return 100;
+  return Math.max(1, Math.min(Math.trunc(value), 200));
+}
+
+function batchExecutionPayload() {
+  const repeat = selectedBatchMode() === "all";
+  return {
+    batch_size: selectedBatchSize(),
+    repeat,
+    max_batches: repeat ? 100 : 1,
+  };
+}
+
+function syncBatchControls() {
+  const field = select("#workflow-batch-size-field");
+  const input = select("#workflow-batch-size");
+  const custom = selectedBatchMode() === "custom";
+  if (field) field.hidden = !custom;
+  if (input) input.disabled = !custom;
+  updateStepsAndSummary();
 }
 
 function verifyLimit() {
@@ -241,13 +272,17 @@ function updateStepsAndSummary() {
   const parseEmpty = Number(summary.parse_empty || 0);
   const totals = candidateTotals();
   const candidateTotal = totals.needs_review + totals.verified + totals.rejected;
-  const batchSize = Number(period.batch_size || 20);
+  const batchSize = Number(period.batch_size || 100);
+  const batchMode = selectedBatchMode();
   const verifyBatchSize = verifyLimit();
 
   setText("#workflow-range-label", `${period.start_date} ~ ${period.end_date}`);
   setText("#workflow-step-period", `${period.start_date} ~ ${period.end_date}`);
   setText("#workflow-step-list", `문서 ${formatNumber(documentTotal)}건`);
-  setText("#workflow-step-collect-batch", `${formatNumber(batchSize)}건`);
+  setText(
+    "#workflow-step-collect-batch",
+    batchMode === "all" ? "전체" : `${formatNumber(batchSize)}건`
+  );
   setText(
     "#workflow-step-collect",
     failed ? `실패 ${formatNumber(failed)}건` : `수집 ${formatNumber(collected)}건`
@@ -392,6 +427,21 @@ function evidencePercent(item, meta) {
 function verificationProgressItem(candidateId) {
   const items = workflowState.verificationProgress?.items || [];
   return items.find((item) => Number(item.candidate_id) === Number(candidateId)) || null;
+}
+
+function verificationIsRunning() {
+  return Boolean(workflowState.verificationRequestPending || workflowState.verificationProgress?.active);
+}
+
+function renderVerificationActivity() {
+  const running = verificationIsRunning();
+  const status = select("#workflow-verification-running");
+  const button = select("#workflow-run-verification");
+  if (status) status.hidden = !running;
+  if (button) {
+    button.disabled = running;
+    button.setAttribute("aria-busy", running ? "true" : "false");
+  }
 }
 
 function progressStatusMeta(item, progress) {
@@ -596,10 +646,37 @@ function persistedLogEntries() {
   return [...batches, ...dlq];
 }
 
+function verificationProgressLogEntry() {
+  const progress = workflowState.verificationProgress || {};
+  const running = verificationIsRunning();
+  if (!running && !progress.batch_id) return null;
+
+  const waitingForStart = workflowState.verificationRequestPending && !progress.active;
+  const counts = waitingForStart
+    ? { approved: 0, needs_review: 0, rejected: 0, failed: 0 }
+    : { approved: 0, needs_review: 0, rejected: 0, failed: 0, ...(progress.classifications || {}) };
+  const total = waitingForStart
+    ? workflowState.verificationRequestedTotal
+    : Number(progress.total || 0);
+  const processed = waitingForStart ? 0 : Number(progress.processed || 0);
+  const label = running ? "검증 진행 중" : "최근 검증 완료";
+  return {
+    time: waitingForStart ? workflowState.verificationRequestedAt : progress.updated_at,
+    message: `${label}: ${formatNumber(processed)}/${formatNumber(total)}건 완료 · 분류 승인 ${formatNumber(counts.approved)} · 수동검토 ${formatNumber(counts.needs_review)} · 반려 ${formatNumber(counts.rejected)} · 실패 ${formatNumber(counts.failed)}`,
+    tone: running ? "info" : "success",
+    className: "verification-progress",
+  };
+}
+
 function renderLogPanel() {
   const node = document.querySelector("#workflow-log-list");
   if (!node) return;
-  const entries = [...workflowState.localLogs, ...persistedLogEntries()]
+  const progressEntry = verificationProgressLogEntry();
+  const entries = [
+    ...(progressEntry ? [progressEntry] : []),
+    ...workflowState.localLogs,
+    ...persistedLogEntries(),
+  ]
     .sort((a, b) => String(b.time || "").localeCompare(String(a.time || "")))
     .slice(0, 40);
   if (!entries.length) {
@@ -607,7 +684,7 @@ function renderLogPanel() {
     return;
   }
   node.innerHTML = entries.map((entry) => `
-    <p class="workflow-log-entry ${escapeHtml(entry.tone || "info")}">
+    <p class="workflow-log-entry ${escapeHtml(entry.tone || "info")} ${escapeHtml(entry.className || "")}">
       <span>${escapeHtml(formatLogTime(entry.time))}</span>${escapeHtml(entry.message)}
     </p>
   `).join("");
@@ -649,6 +726,7 @@ function renderAll() {
   renderDocumentPagination();
   renderCandidateRows();
   renderCandidatePagination();
+  renderVerificationActivity();
   renderLogPanel();
   updateStepsAndSummary();
 }
@@ -676,6 +754,9 @@ async function loadWorkflowData() {
   workflowState.candidates = candidates;
   workflowState.verificationProgress = progress;
   renderAll();
+  if (progress.active && !workflowState.verificationProgressTimer) {
+    startVerificationProgressPolling();
+  }
 }
 
 async function refreshVerificationProgress() {
@@ -683,7 +764,10 @@ async function refreshVerificationProgress() {
   const progress = await fetchJson("/ops/verification-progress");
   workflowState.verificationProgress = progress;
   renderCandidateRows();
+  renderVerificationActivity();
+  renderLogPanel();
   updateStepsAndSummary();
+  if (!verificationIsRunning()) stopVerificationProgressPolling();
   return progress;
 }
 
@@ -738,6 +822,11 @@ async function runWorkflowAction(button, label, action, options = {}) {
   button.textContent = "실행 중";
   appendLog(`${label} 시작`, "info");
   if (options.trackVerificationProgress) {
+    workflowState.verificationRequestPending = true;
+    workflowState.verificationRequestedTotal = verifyLimit();
+    workflowState.verificationRequestedAt = new Date().toISOString();
+    renderVerificationActivity();
+    renderLogPanel();
     startVerificationProgressPolling();
   }
   try {
@@ -756,10 +845,15 @@ async function runWorkflowAction(button, label, action, options = {}) {
     showToast(`${label} 실패: ${error.message}`, true);
   } finally {
     if (options.trackVerificationProgress) {
-      stopVerificationProgressPolling();
+      workflowState.verificationRequestPending = false;
+      if (!workflowState.verificationProgress?.active) stopVerificationProgressPolling();
     }
     button.disabled = false;
     button.textContent = original;
+    if (options.trackVerificationProgress) {
+      renderVerificationActivity();
+      renderLogPanel();
+    }
   }
 }
 
@@ -806,11 +900,7 @@ on("#workflow-run-collection", "click", (event) => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/run`, {
       method: "POST",
-      body: JSON.stringify({
-        batch_size: Number(select("#workflow-batch-size")?.value || 20),
-        repeat: true,
-        max_batches: 100,
-      }),
+      body: JSON.stringify(batchExecutionPayload()),
     });
   }, { scrollTo: ".workflow-log-panel" });
 });
@@ -820,10 +910,7 @@ on("#workflow-run-parse", "click", (event) => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/parse`, {
       method: "POST",
-      body: JSON.stringify({
-        batch_size: Number(select("#workflow-batch-size")?.value || 20),
-        max_batches: 100,
-      }),
+      body: JSON.stringify(batchExecutionPayload()),
     });
   }, { scrollTo: ".workflow-log-panel" });
 });
@@ -833,10 +920,7 @@ on("#workflow-retry-parse", "click", (event) => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/retry-parse-failed`, {
       method: "POST",
-      body: JSON.stringify({
-        batch_size: Number(select("#workflow-batch-size")?.value || 20),
-        max_batches: 100,
-      }),
+      body: JSON.stringify(batchExecutionPayload()),
     });
   }, { scrollTo: ".workflow-log-panel" });
 });
@@ -846,10 +930,7 @@ on("#workflow-retry-collection", "click", (event) => {
     const planId = await ensurePlanId();
     return fetchJson(`/ops/collection-plans/${planId}/retry-failed`, {
       method: "POST",
-      body: JSON.stringify({
-        batch_size: Number(select("#workflow-batch-size")?.value || 20),
-        max_batches: 100,
-      }),
+      body: JSON.stringify(batchExecutionPayload()),
     });
   }, { scrollTo: ".workflow-log-panel" });
 });
@@ -923,6 +1004,7 @@ on("#workflow-candidate-search", "keydown", (event) => {
 });
 
 on("#workflow-batch-size", "input", updateStepsAndSummary);
+on("#workflow-batch-mode", "change", syncBatchControls);
 on("#workflow-verify-limit", "input", updateStepsAndSummary);
 on("#workflow-start-date", "change", () => {
   workflowState.currentPlanId = null;
@@ -936,6 +1018,7 @@ on("#workflow-end-date", "change", () => {
 });
 
 applyWorkflowMode();
+syncBatchControls();
 loadWorkflowData().catch((error) => {
   appendLog(`초기 조회 실패: ${error.message}`, "error");
   showToast(error.message, true);

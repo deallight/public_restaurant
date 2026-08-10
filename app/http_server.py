@@ -47,6 +47,7 @@ from .views import (
     public_index,
     login_index,
     mypage_index,
+    restaurant_photo_upload_index,
     privacy_index,
     terms_index,
 )
@@ -230,6 +231,14 @@ class PublicRestaurantApplication:
             batch_size=batch_size,
             max_batches=max_batches,
         )
+
+    def parse_collection_plan_batch(self, plan_id: int, batch_size: int | None = None) -> dict:
+        return DailyPipeline(
+            self.database,
+            adapter=BusanCityLiveAdapter(),
+            settings=self.settings,
+            verify_new_rows=False,
+        ).parse_collection_plan_batch(plan_id=plan_id, batch_size=batch_size)
 
     def retry_collection_plan_parse_failures(
         self,
@@ -534,6 +543,27 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                                 account_error=str(query.get("account_error", "")),
                             )
                         )
+                elif path.startswith("/restaurants/") and path.endswith("/photos/add"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4:
+                        raise AppError(404, "not found")
+                    current_user = self._current_user()
+                    restaurant_id = int(parts[1])
+                    if current_user is None:
+                        self._redirect(
+                            f"/login?return_to={quote(path, safe='/')}",
+                            status=302,
+                        )
+                    else:
+                        self._html(
+                            restaurant_photo_upload_index(
+                                app.settings.app_name,
+                                app.service.user_photo_upload_page(
+                                    int(current_user["id"]),
+                                    restaurant_id,
+                                ),
+                            )
+                        )
                 elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
                 elif path == "/admin/accounts":
@@ -805,6 +835,18 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     )
                 elif path.startswith("/ops/collection-plans/") and path.endswith("/parse"):
                     plan_id = int(path.split("/")[3])
+                    repeat = bool(payload.get("repeat", True))
+                    if not repeat:
+                        self._json(
+                            app.parse_collection_plan_batch(
+                                plan_id,
+                                batch_size=int(payload["batch_size"])
+                                if payload.get("batch_size")
+                                else None,
+                            ),
+                            status=201,
+                        )
+                        return
                     self._json(
                         app.parse_collection_plan_batches(
                             plan_id,
@@ -884,6 +926,42 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                     else:
                         raise AppError(404, "not found")
+                elif path.startswith("/api/restaurants/") and path.endswith("/photos"):
+                    restaurant_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    if str(payload.get("rights_confirmed", "")).lower() not in {"1", "true", "on", "yes"}:
+                        raise AppError(400, "photo rights confirmation is required")
+                    image = payload.get("image")
+                    if not isinstance(image, dict) or not isinstance(image.get("content"), bytes):
+                        raise AppError(400, "image file is required")
+                    app.service.save_user_restaurant_image(
+                        int(current_user["id"]),
+                        restaurant_id,
+                        str(image.get("filename") or "image"),
+                        image["content"],
+                        alt_text=str(payload.get("alt_text", "")),
+                    )
+                    self._redirect(f"/?restaurant_id={restaurant_id}", status=303)
+                elif path.startswith("/api/photos/") and path.endswith("/update"):
+                    image_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    image = payload.get("image")
+                    app.service.update_user_restaurant_image(
+                        int(current_user["id"]),
+                        image_id,
+                        alt_text=str(payload.get("alt_text", "")),
+                        filename=str(image.get("filename") or "") if isinstance(image, dict) else "",
+                        image_bytes=image.get("content") if isinstance(image, dict) else None,
+                    )
+                    self._redirect("/mypage", status=303)
+                elif path.startswith("/api/photos/") and path.endswith("/delete"):
+                    image_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    app.service.delete_user_restaurant_image(
+                        int(current_user["id"]),
+                        image_id,
+                    )
+                    self._redirect("/mypage", status=303)
                 elif path.startswith("/api/restaurants/") and path.endswith("/save"):
                     restaurant_id = int(path.split("/")[3])
                     current_user = self._authenticated_user()
@@ -925,6 +1003,16 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         ai_processing_consent=ai_processing_consent,
                     )
                     self._json(review, status=201)
+                elif path.startswith("/api/reviews/") and path.endswith("/reaction"):
+                    review_id = int(path.split("/")[3])
+                    current_user = self._authenticated_user()
+                    self._json(
+                        app.service.react_to_review(
+                            int(current_user["id"]),
+                            review_id,
+                            str(payload.get("reaction", "")),
+                        )
+                    )
                 elif path.startswith("/api/reviews/") and path.endswith("/report"):
                     review_id = int(path.split("/")[3])
                     report = app.service.report_review(
@@ -986,6 +1074,18 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             reviewer_note=str(payload.get("reviewer_note", "")),
                         )
                     )
+                elif path.startswith("/admin/candidates/") and path.endswith("/refresh"):
+                    candidate_id = int(path.split("/")[3])
+                    self._json(
+                        app.service.refresh_admin_candidate_providers(
+                            candidate_id,
+                            context,
+                            review_place_name=str(payload.get("review_place_name", payload.get("original_place_name", ""))),
+                            review_address=str(payload.get("review_address", payload.get("original_address", ""))),
+                            review_major_category=str(payload.get("review_major_category", payload.get("place_major_category", "restaurant"))),
+                            reviewer_note=str(payload.get("reviewer_note", "")),
+                        )
+                    )
                 elif path.startswith("/admin/candidates/") and path.endswith("/geocode"):
                     candidate_id = int(path.split("/")[3])
                     self._json(
@@ -1013,6 +1113,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             verification_id=int(payload["selected_verification_id"])
                             if payload.get("selected_verification_id")
                             else None,
+                            allow_category_override=payload.get("allow_category_override") is True,
                         )
                     )
                 elif path == "/account/delete":

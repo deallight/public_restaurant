@@ -90,6 +90,9 @@ NON_FOOD_PURPOSE_RULES = (
 HARD_REJECT_PLACE_RULES = (
     ("구입", "PURCHASE_WORD_IN_PLACE_NAME"),
     ("쿠팡", "COUPANG_PLACE_NAME"),
+    ("매점", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+    ("편의점", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+    ("슈퍼마켓", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
 )
 HARD_REJECT_PURPOSE_RULES = (
     ("경조사", "CEREMONIAL_EVENT_EXPENSE"),
@@ -108,9 +111,10 @@ FOOD_PURCHASE_PURPOSE_TOKENS = (
     "급식",
 )
 MANUAL_FEEDBACK_REJECT_PATTERNS = (
-    ("신화케이푸드", "MANUAL_FEEDBACK_LEGAL_ENTITY_INSUFFICIENT_INFO"),
     ("선과홍티하우스", "MANUAL_FEEDBACK_CLOSED_OR_NOT_OPERATING"),
     ("포도나무면가", "MANUAL_FEEDBACK_CLOSED_OR_NOT_OPERATING"),
+    ("연제지역자활센터", "MANUAL_FEEDBACK_NON_RESTAURANT_ORGANIZATION"),
+    ("연제지역자할센터", "MANUAL_FEEDBACK_NON_RESTAURANT_ORGANIZATION"),
 )
 PAYMENT_PROCESSOR_PLACE_TOKENS = (
     "부산동백전",
@@ -158,6 +162,15 @@ GENERIC_PLACE_PREFIXES = ("카페", "cafe", "커피")
 
 
 @dataclass(frozen=True)
+class PlaceNameParts:
+    original: str
+    base_name: str
+    branch_name: str
+    combined_name: str
+    is_generic: bool
+
+
+@dataclass(frozen=True)
 class PlaceCandidate:
     provider_place_id: str
     name: str
@@ -166,6 +179,7 @@ class PlaceCandidate:
     road_address: str
     longitude: float
     latitude: float
+    provider_category_raw: str = ""
 
 
 @dataclass(frozen=True)
@@ -236,11 +250,73 @@ def similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left_normalized, right_normalized).ratio()
 
 
+def parse_place_name(value: str) -> PlaceNameParts:
+    original = str(value or "").strip()
+    parenthetical = [
+        re.sub(r"\s+", " ", hint).strip()
+        for hint in re.findall(r"\(([^)]{1,40})\)", original)
+    ]
+    branch_name = next(
+        (
+            hint
+            for hint in parenthetical
+            if re.search(r"(?:본점|직영점|\d+호점|점)$", hint, flags=re.IGNORECASE)
+            and normalize_text(hint) not in NON_BRANCH_HINTS
+        ),
+        "",
+    )
+    without_parenthetical = re.sub(r"\([^)]*\)", " ", original)
+    without_company = re.sub(r"(주식회사|유한회사|㈜|\(주\))", " ", without_parenthetical)
+    without_companion = re.sub(r"\s*외\s*\d+\s*(?:개소|개|곳)?\s*.*$", " ", without_company)
+    without_companion = re.sub(r"\s*(?:일원|등)\s*$", " ", without_companion)
+    base_name = re.sub(r"\s+", " ", without_companion).strip(" ,/_·-")
+    combined_name = " ".join(part for part in [base_name, branch_name] if part).strip()
+    generic_key = normalize_text(base_name).replace(" ", "")
+    generic_names = {
+        normalize_text(name).replace(" ", "")
+        for name in (*NON_BRANCH_HINTS, "카페", "커피숍", "주점", "식당")
+    }
+    return PlaceNameParts(
+        original=original,
+        base_name=base_name,
+        branch_name=branch_name,
+        combined_name=combined_name,
+        is_generic=bool(generic_key and generic_key in generic_names),
+    )
+
+
+def generic_parenthetical_place_name(value: str) -> str:
+    """Extract a usable merchant name from labels such as ``음식점 (이레옥)``.
+
+    A parenthetical value that only looks like a branch (for example
+    ``광화문점``) is intentionally not treated as a complete merchant name.
+    It is still searched, but it cannot by itself unlock auto approval.
+    """
+    parsed = parse_place_name(value)
+    if not parsed.is_generic:
+        return ""
+    generic_names = {
+        normalize_text(name).replace(" ", "")
+        for name in (*NON_BRANCH_HINTS, "카페", "커피숍", "주점", "식당")
+    }
+    for hint in re.findall(r"\(([^)]{1,80})\)", value or ""):
+        cleaned = re.sub(r"\s+", " ", hint).strip(" ,/_·-")
+        compact = normalize_text(cleaned).replace(" ", "")
+        if len(compact) < 3 or compact in generic_names:
+            continue
+        branch_only = bool(re.search(r"(?:본점|직영점|\d+호점|점)$", cleaned, flags=re.IGNORECASE))
+        if branch_only and " " not in cleaned and len(compact) < 9 and not franchise_brand(cleaned):
+            continue
+        return cleaned
+    return ""
+
+
 def clean_place_name_for_matching(value: str) -> str:
-    text = normalize_text(value)
+    parsed = parse_place_name(value)
+    text = generic_parenthetical_place_name(value) or parsed.combined_name or normalize_text(value)
     text = re.sub(r"\s*외\s*\d+.*$", " ", text)
     text = re.sub(r"\b(일원|등)$", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return normalize_text(re.sub(r"\s+", " ", text).strip())
 
 
 def brand_alias_variants(value: str) -> list[str]:
@@ -341,8 +417,24 @@ def non_food_purpose_decision(row: NormalizedExpenseRow) -> VerificationDecision
 
 
 def expense_scope_reject_decision(row: NormalizedExpenseRow) -> VerificationDecision | None:
-    compact_name = normalize_text(row.place_name or row.normalized_place_name).replace(" ", "")
+    raw_name = row.place_name or row.normalized_place_name
+    compact_name = normalize_text(raw_name).replace(" ", "")
     compact_purpose = normalize_text(row.purpose).replace(" ", "")
+    place_parts = [
+        normalize_text(part)
+        for part in re.split(r"[,;]+", row.place_name or "")
+        if normalize_text(part)
+    ]
+    if len(place_parts) >= 2 and len({part.replace(" ", "") for part in place_parts}) >= 2:
+        return VerificationDecision(
+            decision="rejected",
+            confidence=0.99,
+            approved_by="rule",
+            selected_candidate=None,
+            category="other",
+            reason_codes=["MULTIPLE_PLACE_NAMES_UNSUPPORTED"],
+            evidence={"place_count": len(place_parts), "place_name": row.place_name},
+        )
     for token, reason in HARD_REJECT_PLACE_RULES:
         if token in compact_name:
             return VerificationDecision(
@@ -465,7 +557,10 @@ def has_franchise_branch_hint(value: str) -> bool:
     return bool(franchise_branch_hint(value))
 
 
-def franchise_addressless_without_branch_decision(row: NormalizedExpenseRow) -> VerificationDecision | None:
+def franchise_addressless_without_branch_decision(
+    row: NormalizedExpenseRow,
+    candidates: list[PlaceCandidate],
+) -> VerificationDecision | None:
     brand = franchise_brand(row.place_name or row.normalized_place_name)
     if not brand:
         return None
@@ -473,14 +568,25 @@ def franchise_addressless_without_branch_decision(row: NormalizedExpenseRow) -> 
         return None
     if row.normalized_address:
         return None
+    matching = [
+        candidate
+        for candidate in candidates
+        if same_franchise_brand(row.place_name or row.normalized_place_name, candidate.name)
+        and candidate.category in FOOD_CATEGORIES
+        and has_valid_provider_coordinates(candidate)
+    ]
     return VerificationDecision(
-        decision="rejected",
-        confidence=0.98,
+        decision="needs_review",
+        confidence=0.84 if matching else 0.62,
         approved_by="rule",
-        selected_candidate=None,
+        selected_candidate=matching[0] if matching else None,
         category=franchise_category(brand),
         reason_codes=["FRANCHISE_ADDRESSLESS_NO_BRANCH"],
-        evidence={"brand": brand, "place_name": row.place_name},
+        evidence={
+            "brand": brand,
+            "place_name": row.place_name,
+            "candidate_evidence": candidate_evidence_payload(row, matching or candidates),
+        },
     )
 
 
@@ -488,10 +594,35 @@ def provider_address_in_busan(candidate: PlaceCandidate) -> bool:
     return "부산" in normalize_address(candidate.road_address or candidate.address)
 
 
+def unspecified_companion_place_decision(
+    row: NormalizedExpenseRow,
+    candidates: list[PlaceCandidate],
+) -> VerificationDecision | None:
+    if row.normalized_address:
+        return None
+    raw_name = row.place_name or row.normalized_place_name
+    if not re.search(r"(?:외\s*\d+\s*(?:개소|개|곳)?|등)\s*$", raw_name or ""):
+        return None
+    best = candidates[0] if candidates else None
+    return VerificationDecision(
+        decision="needs_review",
+        confidence=0.82 if best else 0.6,
+        approved_by="rule",
+        selected_candidate=best,
+        category=best.category if best else category_from_text(raw_name),
+        reason_codes=["UNSPECIFIED_COMPANION_PLACES"],
+        evidence={"candidate_evidence": candidate_evidence_payload(row, candidates)},
+    )
+
+
 def is_addressless_exact_food_candidate(row: NormalizedExpenseRow, candidate: PlaceCandidate | None) -> bool:
     if candidate is None or row.normalized_address:
         return False
-    row_name = compact_place_name(row.normalized_place_name or row.place_name)
+    parsed = parse_place_name(row.place_name or row.normalized_place_name)
+    generic_identity = generic_parenthetical_place_name(row.place_name or row.normalized_place_name)
+    if parsed.is_generic and not generic_identity:
+        return False
+    row_name = compact_place_name(generic_identity or clean_place_name_for_matching(row.place_name or row.normalized_place_name))
     candidate_name = compact_place_name(candidate.name)
     if any(token in row_name for token in ["미상", "불명", "없음", "무기재"]):
         return False
@@ -499,10 +630,113 @@ def is_addressless_exact_food_candidate(row: NormalizedExpenseRow, candidate: Pl
         len(row_name) >= 3
         and row_name == candidate_name
         and candidate.category in FOOD_CATEGORIES
-        and provider_address_in_busan(candidate)
         and bool(candidate.longitude)
         and bool(candidate.latitude)
         and is_food_context_purpose(row.purpose)
+    )
+
+
+def unique_addressless_exact_food_decision(
+    row: NormalizedExpenseRow,
+    candidates: list[PlaceCandidate],
+    permit: PermitSnapshot | None,
+) -> VerificationDecision | None:
+    if row.normalized_address or len(candidates) < 2:
+        return None
+    if permit is not None and permit.business_status in {"closed", "moved", "non_food"}:
+        return None
+    exact = [candidate for candidate in candidates if is_addressless_exact_food_candidate(row, candidate)]
+    exact_addresses = {
+        normalize_address(candidate.road_address or candidate.address)
+        for candidate in exact
+        if normalize_address(candidate.road_address or candidate.address)
+    }
+    if len(exact_addresses) != 1:
+        return None
+    selected = exact[0]
+    return VerificationDecision(
+        decision="approved",
+        confidence=0.94,
+        approved_by="rule",
+        selected_candidate=selected,
+        category=selected.category,
+        reason_codes=[
+            "NAVER_UNIQUE_EXACT_AMONG_MULTIPLE",
+            "PROVIDER_ADDRESS_AVAILABLE",
+            *(["PERMIT_ACTIVE"] if permit is not None and permit.is_active_food_business else []),
+        ],
+        evidence={
+            "exact_candidate_count": len(exact),
+            "total_candidate_count": len(candidates),
+            "selected_address": selected.road_address or selected.address,
+            "candidate_evidence": candidate_evidence_payload(row, candidates),
+        },
+    )
+
+
+def has_competing_addressless_food_candidate(
+    row: NormalizedExpenseRow,
+    candidates: list[PlaceCandidate],
+) -> bool:
+    if row.normalized_address:
+        return False
+    strong: list[PlaceCandidate] = []
+    for candidate in candidates:
+        if candidate.category not in FOOD_CATEGORIES or not has_valid_provider_coordinates(candidate):
+            continue
+        if has_conflicting_branch_hint(row.place_name, candidate.name):
+            continue
+        if name_similarity_with_branch(row_name_for_matching(row), candidate.name) >= 0.9:
+            strong.append(candidate)
+    distinct_addresses = {
+        normalize_address(candidate.road_address or candidate.address)
+        for candidate in strong
+        if normalize_address(candidate.road_address or candidate.address)
+    }
+    return len(distinct_addresses) > 1
+
+
+def addressless_too_many_matches_decision(
+    row: NormalizedExpenseRow,
+    candidates: list[PlaceCandidate],
+    permit: PermitSnapshot | None,
+) -> VerificationDecision | None:
+    if row.normalized_address or parse_place_name(row.place_name).branch_name:
+        return None
+    strong = [
+        candidate
+        for candidate in candidates
+        if candidate.category in FOOD_CATEGORIES
+        and has_valid_provider_coordinates(candidate)
+        and name_similarity_with_branch(row_name_for_matching(row), candidate.name) >= 0.90
+    ]
+    distinct_addresses = {
+        normalize_address(candidate.road_address or candidate.address)
+        for candidate in strong
+        if normalize_address(candidate.road_address or candidate.address)
+    }
+    if len(distinct_addresses) < 3:
+        return None
+    if permit is not None and permit.is_active_food_business:
+        permit_matches = [
+            candidate
+            for candidate in strong
+            if candidate_address_similarity(permit.address, candidate) >= 0.72
+        ]
+        if len(permit_matches) == 1:
+            return None
+    return VerificationDecision(
+        decision="needs_review",
+        confidence=0.86,
+        approved_by="rule",
+        selected_candidate=strong[0],
+        category=strong[0].category,
+        reason_codes=["ADDRESSLESS_TOO_MANY_MATCHES"],
+        evidence={
+            "strong_candidate_count": len(strong),
+            "distinct_address_count": len(distinct_addresses),
+            "candidate_evidence": candidate_evidence_payload(row, strong),
+        },
     )
 
 
@@ -549,7 +783,13 @@ def permit_address_conflicts_with_candidate(permit: PermitSnapshot, candidate: P
 
 
 def alias_keys_for_place(value: str) -> list[str]:
-    aliases = [normalize_text(value), clean_place_name_for_matching(value)]
+    parsed = parse_place_name(value)
+    aliases = [
+        normalize_text(value),
+        clean_place_name_for_matching(value),
+        normalize_text(parsed.base_name),
+        normalize_text(parsed.combined_name),
+    ]
     forced_aliases: set[str] = set()
     for alias in list(aliases):
         aliases.extend(brand_alias_variants(alias))
@@ -575,8 +815,11 @@ def branch_hints(value: str) -> set[str]:
     text = re.sub(r"\s+", " ", (value or "").lower()).strip()
     compact = re.sub(r"[^0-9a-z가-힣]+", "", text)
     hints = {hint for hint in BRANCH_HINTS if hint in compact}
-    hints.update(re.findall(r"\(([^)]{1,10}(?:본점|직영점|호점|점))\)", text))
-    hints.update(re.findall(r"(?:^|\s)([가-힣A-Za-z0-9]{1,10}(?:본점|직영점|호점|점))(?=$|\s)", text))
+    parsed_branch = parse_place_name(value).branch_name
+    if parsed_branch:
+        hints.add(parsed_branch)
+    hints.update(re.findall(r"\(([^)]{1,40}(?:본점|직영점|호점|점))\)", text))
+    hints.update(re.findall(r"(?:^|\s)([가-힣A-Za-z0-9]{1,40}(?:본점|직영점|호점|점))(?=$|\s)", text))
     hints.update(re.findall(r"[0-9]+호점", compact))
     return {hint for hint in hints if hint not in NON_BRANCH_HINTS}
 
@@ -665,6 +908,9 @@ def is_addressless_fuzzy_food_candidate(
     if not is_verifiable_place_name(row.normalized_place_name or row.place_name):
         return False
     source_name = row.place_name or row.normalized_place_name
+    parsed = parse_place_name(source_name)
+    if parsed.is_generic and not generic_parenthetical_place_name(source_name):
+        return False
     row_name = compact_place_name(clean_place_name_for_matching(source_name))
     candidate_name = compact_place_name(clean_place_name_for_matching(candidate.name))
     if len(row_name) < 3:
@@ -677,7 +923,8 @@ def is_addressless_fuzzy_food_candidate(
 
 
 def row_name_for_matching(row: NormalizedExpenseRow) -> str:
-    return row.place_name if branch_hints(row.place_name) else row.normalized_place_name or row.place_name
+    source_name = row.place_name if branch_hints(row.place_name) else row.normalized_place_name or row.place_name
+    return clean_place_name_for_matching(source_name)
 
 
 def candidate_address_similarity(reference_address: str, candidate: PlaceCandidate) -> float:
@@ -702,6 +949,7 @@ def candidate_evidence_payload(row: NormalizedExpenseRow, candidates: list[Place
                 "provider_place_id": candidate.provider_place_id,
                 "name": candidate.name,
                 "category": candidate.category,
+                "provider_category_raw": candidate.provider_category_raw,
                 "address": candidate.address,
                 "road_address": candidate.road_address,
                 "longitude": candidate.longitude,
@@ -890,10 +1138,6 @@ class VerifierAgent:
         feedback_reject_decision = manual_feedback_reject_decision(row)
         if feedback_reject_decision is not None:
             return feedback_reject_decision
-        franchise_decision = franchise_addressless_without_branch_decision(row)
-        if franchise_decision is not None:
-            return franchise_decision
-
         if progress:
             progress("naver_search", "네이버 장소 검색 API", 82)
         candidates = self.naver_client.search_local(row)
@@ -902,6 +1146,18 @@ class VerifierAgent:
         permit = self.permit_client.lookup(row)
         if progress:
             progress("rule_decision", "검색 결과 조건 판단", 92)
+        companion_decision = unspecified_companion_place_decision(row, candidates)
+        if companion_decision is not None:
+            return companion_decision
+        franchise_decision = franchise_addressless_without_branch_decision(row, candidates)
+        if franchise_decision is not None:
+            return franchise_decision
+        unique_exact_decision = unique_addressless_exact_food_decision(row, candidates, permit)
+        if unique_exact_decision is not None:
+            return unique_exact_decision
+        too_many_matches = addressless_too_many_matches_decision(row, candidates, permit)
+        if too_many_matches is not None:
+            return too_many_matches
         best = candidates[0] if candidates else None
         unknown_mismatch_decision = unknown_place_address_mismatch_decision(row, best)
         if unknown_mismatch_decision is not None:
@@ -912,6 +1168,19 @@ class VerifierAgent:
             and category_from_text(row.place_name) == "other"
             and not is_food_context_purpose(row.purpose)
         ):
+            if any(
+                token in compact_place_name(row.place_name or row.normalized_place_name)
+                for token in ("호텔", "리조트", "대사관", "영사관")
+            ):
+                return VerificationDecision(
+                    decision="needs_review",
+                    confidence=0.78,
+                    approved_by="rule",
+                    selected_candidate=best,
+                    category="other",
+                    reason_codes=["NAVER_OTHER_AMBIGUOUS_VENUE"],
+                    evidence={"candidate_evidence": candidate_evidence_payload(row, candidates)},
+                )
             return VerificationDecision(
                 decision="rejected",
                 confidence=0.9,
@@ -929,8 +1198,15 @@ class VerifierAgent:
                     "permit_status": permit.business_status if permit else None,
                 },
             )
-        exact_addressless_food = is_addressless_exact_food_candidate(row, best)
-        base_addressless_food = is_addressless_base_food_candidate(row, best)
+        has_competing_addressless_food = has_competing_addressless_food_candidate(row, candidates)
+        exact_addressless_food = (
+            is_addressless_exact_food_candidate(row, best)
+            and not has_competing_addressless_food
+        )
+        base_addressless_food = (
+            is_addressless_base_food_candidate(row, best)
+            and not has_competing_addressless_food
+        )
 
         if permit and permit.business_status in {"closed", "moved", "non_food"}:
             name_score = name_similarity_with_branch(row_name_for_matching(row), best.name) if best else 0.0
@@ -1179,13 +1455,18 @@ class VerifierAgent:
                 )
             if (
                 not row.normalized_address
+                and not has_competing_addressless_food
                 and best.category in FOOD_CATEGORIES
                 and name_score >= 0.9
-                and "부산" in provider_address
                 and (
-                    is_distinctive_place_name(row.normalized_place_name)
-                    or exact_addressless_food
-                    or base_addressless_food
+                    exact_addressless_food
+                    or (
+                        "부산" in provider_address
+                        and (
+                            is_distinctive_place_name(row.normalized_place_name)
+                            or base_addressless_food
+                        )
+                    )
                 )
             ):
                 reason = (
@@ -1201,10 +1482,19 @@ class VerifierAgent:
                     approved_by="rule",
                     selected_candidate=best,
                     category=best.category,
-                    reason_codes=[reason, "BUSAN_PROVIDER_ADDRESS", "PERMIT_MISSING_ALLOWED"],
+                    reason_codes=[
+                        reason,
+                        "BUSAN_PROVIDER_ADDRESS"
+                        if "부산" in provider_address
+                        else "PROVIDER_ADDRESS_AVAILABLE",
+                        "PERMIT_MISSING_ALLOWED",
+                    ],
                     evidence={"name_similarity": name_score, "address_similarity": 0.0},
                 )
-            if is_addressless_fuzzy_food_candidate(row, best, name_score):
+            if (
+                not has_competing_addressless_food
+                and is_addressless_fuzzy_food_candidate(row, best, name_score)
+            ):
                 return VerificationDecision(
                     decision="approved",
                     confidence=min(0.88, 0.56 + name_score * 0.28),

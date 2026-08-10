@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -131,10 +132,17 @@ class HttpServerTests(unittest.TestCase):
         admin_headers = self.session_headers("admin")
         index = urlopen(f"{self.base_url}/", timeout=5).read().decode("utf-8")
         self.assertIn("공기밥", index)
+        self.assertIn('/static/naver-login-logo-140.png', index)
         self.assertIn("filter-index", index)
         self.assertIn("visit-filter-toggle", index)
         self.assertIn("visit-filter-label", index)
         self.assertIn('data-filter="min_visit_count"', index)
+        search_form_end = index.index("</form>", index.index('id="search-form"'))
+        visit_filter_position = index.index('id="visit-filter-toggle"')
+        ranking_panel_position = index.index('class="ranking-panel"')
+        self.assertIn('class="ranking-panel-tools"', index)
+        self.assertGreater(visit_filter_position, search_form_end)
+        self.assertGreater(visit_filter_position, ranking_panel_position)
         self.assertIn('data-filter="saved"', index)
         self.assertIn("관심 가게", index)
         self.assertIn("10회 이상", index)
@@ -169,6 +177,10 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("/admin/parsing", collection)
         self.assertIn("workflow-fetch-list", collection)
         self.assertIn("workflow-run-collection", collection)
+        self.assertIn("workflow-batch-mode", collection)
+        self.assertIn("수집 실행 범위", collection)
+        self.assertIn('<option value="all" selected>전체</option>', collection)
+        self.assertIn('<option value="custom">직접 입력</option>', collection)
         self.assertIn("수집 배치 크기", collection)
         self.assertNotIn("검증 배치 크기", collection)
         self.assertNotIn("parsing-run", collection)
@@ -179,6 +191,8 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("workflow-run-parse", parsing)
         self.assertIn("workflow-retry-parse", parsing)
         self.assertIn("workflow-document-rows", parsing)
+        self.assertIn("workflow-batch-mode", parsing)
+        self.assertIn("파싱 실행 범위", parsing)
         self.assertIn("파싱 배치 크기", parsing)
         self.assertNotIn("수집 배치 크기", parsing)
         self.assertNotIn("검증 배치 크기", parsing)
@@ -192,6 +206,57 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("publicRestaurant.workflow.localLogs", workflow_js)
         self.assertIn("sessionStorage", workflow_js)
         self.assertIn("retry-parse-failed", workflow_js)
+        self.assertIn("batchExecutionPayload", workflow_js)
+        app_js = urlopen(f"{self.base_url}/static/app.js", timeout=5).read().decode("utf-8")
+        self.assertNotIn('class="rank-source-name"', app_js)
+        self.assertNotIn('class="detail-source-names"', app_js)
+        self.assertIn("visit.source_place_name", app_js)
+        self.assertIn("원문 상호명", app_js)
+        self.assertIn('class="detail-panel-controls"', app_js)
+        self.assertIn('aria-label="${restaurant.is_saved ? "관심 가게 저장 해제" : "관심 가게 저장"}"', app_js)
+        controls_start = app_js.index('class="detail-panel-controls"')
+        heart_position = app_js.index('class="save-restaurant-button', controls_start)
+        expand_position = app_js.index('class="detail-expand-toggle"', controls_start)
+        close_position = app_js.index('class="panel-close"', controls_start)
+        self.assertLess(heart_position, expand_position)
+        self.assertLess(expand_position, close_position)
+        self.assertIn('class="detail-title-line"', app_js)
+        self.assertEqual(app_js.count('class="detail-stat-divider"'), 2)
+        self.assertEqual(
+            app_js.count("restaurant.category_detail_label || restaurant.category_label"),
+            3,
+        )
+        self.assertIn("여러분의 밥상을 등록해 주세요", app_js)
+        self.assertIn("restaurantImages.map", app_js)
+        self.assertIn("/photos/add", app_js)
+        self.assertIn('class="restaurant-photo-add"', app_js)
+        self.assertIn('requestedUrl.searchParams.delete("restaurant_id")', app_js)
+        self.assertIn("window.history.replaceState", app_js)
+        self.assertIn('panel.classList.add("detail-resetting", "detail-entering")', app_js)
+        self.assertIn('panel.classList.add("detail-closing")', app_js)
+        self.assertIn("event.propertyName === \"transform\"", app_js)
+        self.assertIn("switchingRestaurant", app_js)
+        self.assertIn("waitForDetailPanelSlide(panel)", app_js)
+        self.assertIn("slideDetailPanelSnapshotOut(panel, stage)", app_js)
+        self.assertIn('snapshot.classList.add("detail-closing")', app_js)
+        self.assertIn("const restoreExpanded = options.expanded === true", app_js)
+        self.assertIn("selectRestaurant(id, { expanded: keepExpanded })", app_js)
+        self.assertIn('class="review-author"', app_js)
+        self.assertIn('class="review-rating-select"', app_js)
+        self.assertIn('<option value="5">★ × 5</option>', app_js)
+        self.assertIn("window.CURRENT_USER_DISPLAY_NAME", app_js)
+        self.assertNotIn("로그인 이름으로 등록", app_js)
+        self.assertIn("reviewStars(review.rating)", app_js)
+        self.assertIn("review.reviewer_review_count", app_js)
+        self.assertIn('class="review-actions"', app_js)
+        self.assertIn('data-reaction="up"', app_js)
+        self.assertIn('data-reaction="down"', app_js)
+        self.assertIn('class="review-reaction-count"', app_js)
+        self.assertIn("result.recommendation_count", app_js)
+        mypage_js = urlopen(f"{self.base_url}/static/mypage.js", timeout=5).read().decode("utf-8")
+        self.assertIn('event.preventDefault()', mypage_js)
+        self.assertIn('headers: { Accept: "application/json" }', mypage_js)
+        self.assertIn("card.remove()", mypage_js)
         documents_admin = self.get_text("/admin/documents", admin_headers)
         self.assertIn("기관별 수집 문서", documents_admin)
         self.assertIn("document-board-list", documents_admin)
@@ -203,6 +268,8 @@ class HttpServerTests(unittest.TestCase):
         review_admin = self.get_text("/admin/review", admin_headers)
         self.assertIn("검토 작업판", review_admin)
         self.assertIn("workflow-run-verification", review_admin)
+        self.assertIn("workflow-verification-running", review_admin)
+        self.assertIn("검증 실행 중", review_admin)
         self.assertIn("검증 항목", review_admin)
         self.assertIn('<option value="pending">검증 대기</option>', review_admin)
         self.assertIn('<option value="needs_review">수동검토</option>', review_admin)
@@ -235,10 +302,12 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(batch["status"], "success")
         restaurants = self.get_json("/api/map/restaurants")
         self.assertEqual(len(restaurants["restaurants"]), 3)
+        self.assertIn("source_place_names", restaurants["restaurants"][0])
         restaurant_detail = self.get_json(
             f"/api/restaurants/{restaurants['restaurants'][0]['id']}"
         )
         self.assertEqual(len(restaurant_detail["visits"]), 1)
+        self.assertIn("source_place_names", restaurant_detail)
         self.assertEqual(
             set(restaurant_detail["ai_summary"]),
             {
@@ -254,7 +323,7 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(restaurant_detail["ai_summary"]["next_summary_review_count"], 5)
         self.assertEqual(
             set(restaurant_detail["visits"][0]),
-            {"visited_at", "institution_name", "purpose"},
+            {"visited_at", "institution_name", "purpose", "source_place_name"},
         )
         visit_filtered = self.get_json("/api/map/restaurants?min_visit_count=10")
         self.assertEqual(visit_filtered["restaurants"], [])
@@ -302,11 +371,73 @@ class HttpServerTests(unittest.TestCase):
         progress = self.get_json("/ops/verification-progress", admin_headers)
         self.assertIn("active", progress)
         self.assertIn("items", progress)
+        self.assertEqual(
+            set(progress["classifications"]),
+            {"approved", "needs_review", "rejected", "failed"},
+        )
+        self.assertEqual(sum(progress["classifications"].values()), progress["processed"])
         candidates = self.get_json(
             "/admin/candidates?start_date=2026-01-01&end_date=2026-12-31&limit=5",
             headers=admin_headers,
         )
         self.assertIn("needs_review", candidates["groups"])
+        manual_items = candidates["groups"]["needs_review"]["items"]
+        self.assertTrue(manual_items)
+        manual = manual_items[0]
+        refreshed = self.post_json(
+            f"/admin/candidates/{manual['candidate_id']}/refresh",
+            {
+                "review_place_name": manual["effective_place_name"],
+                "review_address": manual["effective_address"],
+                "review_major_category": manual["effective_major_category"],
+            },
+            admin_headers,
+        )
+        self.assertEqual(refreshed["result"], "provider_refreshed")
+        self.assertEqual(refreshed["provider_refresh"]["status"], "skipped")
+        self.assertEqual(
+            refreshed["provider_refresh"]["reason"],
+            "naver_search_not_configured",
+        )
+
+    def test_collection_and_parsing_routes_support_all_or_single_batch(self) -> None:
+        admin_headers = self.session_headers("admin")
+        result = {"status": "success", "summary": {"documents_seen": 17}}
+        with (
+            patch.object(self.app, "run_collection_plan_batch", return_value=result) as collect_one,
+            patch.object(self.app, "run_collection_plan_batches", return_value=result) as collect_all,
+            patch.object(self.app, "parse_collection_plan_batch", return_value=result) as parse_one,
+            patch.object(self.app, "parse_collection_plan_batches", return_value=result) as parse_all,
+        ):
+            self.post_json(
+                "/ops/collection-plans/42/run",
+                {"batch_size": 17, "repeat": False, "max_batches": 1},
+                admin_headers,
+            )
+            collect_one.assert_called_once_with(42, batch_size=17)
+            collect_all.assert_not_called()
+
+            self.post_json(
+                "/ops/collection-plans/42/parse",
+                {"batch_size": 19, "repeat": False, "max_batches": 1},
+                admin_headers,
+            )
+            parse_one.assert_called_once_with(42, batch_size=19)
+            parse_all.assert_not_called()
+
+            self.post_json(
+                "/ops/collection-plans/42/run",
+                {"batch_size": 20, "repeat": True, "max_batches": 100},
+                admin_headers,
+            )
+            collect_all.assert_called_once_with(42, batch_size=20, max_batches=100)
+
+            self.post_json(
+                "/ops/collection-plans/42/parse",
+                {"batch_size": 20, "repeat": True, "max_batches": 100},
+                admin_headers,
+            )
+            parse_all.assert_called_once_with(42, batch_size=20, max_batches=100)
 
     def test_api_usage_warning_explains_timeout_reason(self) -> None:
         warning_app = PublicRestaurantApplication(

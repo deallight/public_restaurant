@@ -104,14 +104,15 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 - 같은 위치 또는 가까운 위치의 음식점은 지도 확대 수준에 따라 하나의 군집 핀으로 묶고, 목록에서 개별 가게를 선택할 수 있습니다.
 - 상세 화면에서 기관 방문 이력, 방문 횟수, 금액, 리뷰, 평점, AI 리뷰 요약을 확인할 수 있습니다.
 - 로그인 사용자는 가게를 저장하거나 해제하고, 마이페이지에서 저장 가게와 본인 리뷰를 관리할 수 있습니다.
-- 저작권 확인 전까지 공개 음식점 사진은 비활성화되어 있습니다. 상세 API는 호환성을 위해 사진 필드를 유지하지만 빈 값으로 응답하며, 공개 화면은 사진을 렌더링하거나 네이버 이미지 검색을 호출하지 않습니다.
+- 외부 음식점 사진과 관리자 보관 사진은 공개하지 않으며 네이버 이미지 검색도 호출하지 않습니다. 로그인 사용자가 직접 등록하고 게시 권한을 확인한 음식 사진만 상세 화면에 표시합니다.
+- 상세 화면의 간단히 보기에는 사용자 사진을 최대 3장, 방문 정보 펼치기에는 2열로 표시합니다. 사진이 없으면 사진 등록 화면으로 이동하는 안내를 표시합니다.
 
 ### 사용자·인증
 
 - 네이버 OAuth 로그인과 자동 회원가입을 지원합니다.
 - HMAC 서명 세션 쿠키를 사용하며 운영 환경에서는 `Secure`, `HttpOnly`, `SameSite=Lax` 정책을 적용합니다.
-- 리뷰 작성, 리뷰 신고, 본인 리뷰 삭제, 저장 가게 관리, 계정 탈퇴를 제공합니다.
-- 계정 탈퇴 시 OAuth 연결과 저장 목록을 삭제하고 기존 리뷰의 사용자·IP 식별값을 익명화합니다.
+- 리뷰 작성, 추천·비추천, 리뷰 신고, 본인 리뷰 삭제, 저장 가게 관리, 사용자 사진 등록·수정·삭제, 계정 탈퇴를 제공합니다.
+- 계정 탈퇴 시 OAuth 연결, 저장 목록, 등록 사진을 삭제하고 기존 리뷰의 사용자·IP 식별값을 익명화합니다.
 - Google OAuth 클라이언트와 라우트도 유지하지만 현재 공개 로그인 UI의 기본 흐름은 네이버 로그인입니다.
 
 ### 관리자·운영
@@ -169,7 +170,7 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 | `APP_ENV` | `development` 또는 `production` |
 | `DATABASE_URL` | PostgreSQL 접속 URL. 운영 환경에서는 필수 |
 | `APP_DB_PATH` | `DATABASE_URL`이 없을 때 사용하는 SQLite 경로 |
-| `RESTAURANT_IMAGE_UPLOAD_DIR` | 관리자 음식점 사진 저장 경로 |
+| `RESTAURANT_IMAGE_UPLOAD_DIR` | 관리자 보관 사진과 사용자 등록 사진 저장 경로 |
 | `APP_SESSION_SECRET` | 로그인 세션 서명 키 |
 | `PRIVACY_CONTACT_EMAIL` | 개인정보처리방침·이용약관 문의 이메일. 운영 환경에서는 필수 |
 | `NAVER_MAP_KEY` | Naver Maps JavaScript API Client ID |
@@ -228,9 +229,10 @@ raw_documents
 - `decision_audit_logs`: 승인·병합·반려 감사 로그
 - `dead_letter_queue`: 파싱·검증 실패 항목
 - `users`, `oauth_accounts`: 사용자와 OAuth 연결
-- `restaurant_reviews`, `review_reports`: 리뷰와 신고
+- `restaurant_reviews`, `review_reactions`, `review_reports`: 리뷰, 사용자별 추천·비추천, 신고
 - `user_saved_restaurants`: 사용자 저장 가게
 - `restaurant_ai_summaries`: 리뷰 AI 요약 캐시
+- `restaurant_user_images`: 사용자 등록 사진과 소유자 정보
 - `restaurant_admin_images`: 관리자 업로드 사진 정보
 
 ## 수집·파싱·검증 실행
@@ -325,6 +327,11 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `/admin/photos`: 사진 관리
 - `/admin/logs`: 운영 로그
 
+### 사용자 사진
+
+- `/restaurants/{id}/photos/add`: 로그인 사용자의 사진 등록 화면
+- `/mypage`: 본인이 등록한 사진의 설명·파일 수정 및 삭제
+
 ### 주요 운영 API
 
 - `POST /ops/run-daily`
@@ -393,18 +400,20 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 - 공개 지도, 검색, 랭킹, 핀 군집화, 상세 응답
 - 리뷰 제한, 신고, AI 요약, 저장 가게, 마이페이지, 계정 탈퇴
 - 관리자 인증·권한과 운영 API 라우팅
-- 공개 사진 비노출과 관리자 사진 관리
+- 외부·관리자 사진 비노출, 사용자 사진 소유권과 등록·수정·삭제
 - SQLite/PostgreSQL SQL 호환 및 운영 환경의 PostgreSQL 강제
 
 ## 운영 시 확인할 사항
 
+- GitHub `main` 병합 후 N150 업데이트는 `sudo /srv/app/bin/deploy-public-restaurant`로 실행합니다. 최초 설치와 복구용 수동 절차는 [N150 자가 운영 절차서](database/N150_SELF_SERVICE_RUNBOOK.md)를 따릅니다.
+- 배포 스크립트는 테스트, 운영 스키마 검사, PostgreSQL 백업, 별도 포트 사전 점검, 원자적 release 전환, HTTP 검증과 실패 시 코드 롤백을 수행합니다. 스키마 변경은 자동 적용하지 않습니다.
 - 운영 URL은 <https://gonggibap.com>이며 `APP_ENV=production`을 사용합니다.
 - 운영 환경은 PostgreSQL `DATABASE_URL`과 유효한 `PRIVACY_CONTACT_EMAIL` 없이는 시작하지 않습니다.
 - DB 비밀번호, OAuth secret, API 키, 세션 키는 배포 환경의 secret으로만 주입합니다.
 - PostgreSQL 스키마 변경은 서버 시작과 분리되어 있습니다. 먼저 스키마 점검, 마이그레이션 검토·적용, 호환 결과 확인, HTTP 상태 확인 순서로 진행합니다.
 - 라이브 수집은 부산시 게시판 구조와 첨부 포맷에 의존합니다. 지원하지 않는 XLS, DRM, HWP, PDF는 DLQ에 남겨 parser 확장 대상으로 관리합니다.
 - 자동 검증은 근거가 부족한 후보를 공개하지 않고 관리자 검토로 넘깁니다.
-- 공개 사진 기능은 사용 권한 검토가 끝날 때까지 다시 활성화하지 않습니다.
+- 외부·관리자 사진은 공개하지 않습니다. 사용자 사진은 직접 촬영 또는 게시 권한 확인을 거쳐 등록하도록 안내합니다.
 
 ## 현재 제한과 다음 단계
 
@@ -413,4 +422,4 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 - 계정 병합과 사용자 운영 도구 고도화
 - 관리자 작업의 CSRF 방어와 세부 권한 분리 강화
 - 선택적 PostGIS 도입과 공간 검색 고도화
-- 사진 출처·사용 권한 검증 정책을 마련한 뒤 공개 사진 기능 재검토
+- 사용자 사진 신고·관리자 숨김 처리와 이미지 최적화 고도화

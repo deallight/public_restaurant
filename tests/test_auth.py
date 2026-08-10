@@ -71,6 +71,7 @@ class AuthViewTests(unittest.TestCase):
 
         self.assertIn('href="/login"', anonymous)
         self.assertIn("테스터", signed_in)
+        self.assertIn('window.CURRENT_USER_DISPLAY_NAME = "테스터";', signed_in)
         self.assertIn('action="/auth/logout"', signed_in)
 
 
@@ -122,6 +123,36 @@ class NaverAuthHttpTests(unittest.TestCase):
 
     def cookie_header(self, values: dict[str, str]) -> str:
         return "; ".join(f"{name}={value}" for name, value in values.items())
+
+    def multipart_photo(
+        self,
+        fields: dict[str, str],
+        *,
+        filename: str = "table.png",
+        content: bytes,
+    ) -> tuple[str, bytes]:
+        boundary = "----public-restaurant-user-photo-test"
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.extend(
+                [
+                    f"--{boundary}\r\n".encode(),
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                    value.encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'.encode(),
+                b"Content-Type: image/png\r\n\r\n",
+                content,
+                b"\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+        return f"multipart/form-data; boundary={boundary}", b"".join(parts)
 
     def test_signup_path_redirects_to_single_login_page(self) -> None:
         status, headers, _ = self.request("GET", "/signup")
@@ -264,6 +295,15 @@ class NaverAuthHttpTests(unittest.TestCase):
         review = json.loads(review_body)
         self.assertEqual(review["reviewer_label"], "마이페이지 테스터")
 
+        reaction_status, _, reaction_body = self.request(
+            "POST",
+            f"/api/reviews/{review['id']}/reaction",
+            headers=auth_headers,
+            body=json.dumps({"reaction": "up"}).encode("utf-8"),
+        )
+        self.assertEqual(reaction_status, 200)
+        self.assertEqual(json.loads(reaction_body)["reaction"], "up")
+
         page_status, _, page_body = self.request(
             "GET",
             "/mypage",
@@ -274,6 +314,8 @@ class NaverAuthHttpTests(unittest.TestCase):
         self.assertIn("마이페이지 테스터님의 맛집 기록", page)
         self.assertIn("로그인 사용자의 마이페이지 리뷰", page)
         self.assertIn("저장 해제", page)
+        self.assertIn('class="mypage-review-delete"', page)
+        self.assertIn('src="/static/mypage.js"', page)
 
         delete_status, _, delete_body = self.request(
             "POST",
@@ -283,6 +325,109 @@ class NaverAuthHttpTests(unittest.TestCase):
         )
         self.assertEqual(delete_status, 200)
         self.assertEqual(json.loads(delete_body)["status"], "deleted")
+
+    def test_user_can_upload_manage_and_delete_own_restaurant_photo(self) -> None:
+        self.app.run_daily()
+        restaurant_id = int(self.app.service.list_map_restaurants()[0]["id"])
+        upload_path = f"/restaurants/{restaurant_id}/photos/add"
+
+        anonymous_status, anonymous_headers, _ = self.request("GET", upload_path)
+        self.assertEqual(anonymous_status, 302)
+        self.assertEqual(
+            anonymous_headers["Location"],
+            f"/login?return_to={upload_path}",
+        )
+
+        owner = self.app.service.upsert_oauth_account(
+            "naver", "photo-http-owner", "사진 등록자"
+        )
+        owner_id = int(owner["user"]["id"])
+        owner_session = self.app.issue_session(owner_id)
+        owner_cookie = {"Cookie": f"{SESSION_COOKIE}={owner_session}"}
+
+        page_status, _, page_body = self.request(
+            "GET", upload_path, headers=owner_cookie
+        )
+        page = page_body.decode("utf-8")
+        self.assertEqual(page_status, 200)
+        self.assertIn("사진 추가", page)
+        self.assertIn("직접 촬영했거나 게시 권한이 있는 사진", page)
+
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+            b"\x1f\x15\xc4\x89"
+        )
+        content_type, body = self.multipart_photo(
+            {"alt_text": "사용자가 등록한 점심", "rights_confirmed": "1"},
+            filename="점심.png",
+            content=png,
+        )
+        upload_status, upload_headers, _ = self.request(
+            "POST",
+            f"/api/restaurants/{restaurant_id}/photos",
+            headers=owner_cookie | {"Content-Type": content_type},
+            body=body,
+        )
+        self.assertEqual(upload_status, 303)
+        self.assertEqual(upload_headers["Location"], f"/?restaurant_id={restaurant_id}")
+
+        detail_status, _, detail_body = self.request(
+            "GET", f"/api/restaurants/{restaurant_id}"
+        )
+        self.assertEqual(detail_status, 200)
+        detail = json.loads(detail_body)
+        self.assertEqual(len(detail["restaurant_images"]), 1)
+        photo = detail["restaurant_images"][0]
+        self.assertEqual(photo["provider"], "user_upload")
+        self.assertEqual(photo["alt_text"], "사용자가 등록한 점심")
+
+        media_status, media_headers, media_body = self.request(
+            "GET", photo["source_url"]
+        )
+        self.assertEqual(media_status, 200)
+        self.assertEqual(media_headers.get_content_type(), "image/png")
+        self.assertEqual(media_body, png)
+
+        mypage_status, _, mypage_body = self.request(
+            "GET", "/mypage", headers=owner_cookie
+        )
+        mypage = mypage_body.decode("utf-8")
+        self.assertEqual(mypage_status, 200)
+        self.assertIn("내가 등록한 사진", mypage)
+        self.assertIn("사용자가 등록한 점심", mypage)
+
+        other = self.app.service.upsert_oauth_account(
+            "naver", "photo-http-other", "다른 사용자"
+        )
+        other_session = self.app.issue_session(int(other["user"]["id"]))
+        forbidden_status, _, _ = self.request(
+            "POST",
+            f"/api/photos/{photo['id']}/delete",
+            headers={"Cookie": f"{SESSION_COOKIE}={other_session}"},
+        )
+        self.assertEqual(forbidden_status, 404)
+
+        update_status, update_headers, _ = self.request(
+            "POST",
+            f"/api/photos/{photo['id']}/update",
+            headers=owner_cookie | {"Content-Type": "application/x-www-form-urlencoded"},
+            body=urlencode({"alt_text": "수정한 사진 설명"}).encode("utf-8"),
+        )
+        self.assertEqual(update_status, 303)
+        self.assertEqual(update_headers["Location"], "/mypage")
+
+        delete_status, delete_headers, _ = self.request(
+            "POST",
+            f"/api/photos/{photo['id']}/delete",
+            headers=owner_cookie,
+        )
+        self.assertEqual(delete_status, 303)
+        self.assertEqual(delete_headers["Location"], "/mypage")
+        after_delete = json.loads(
+            self.request("GET", f"/api/restaurants/{restaurant_id}")[2]
+        )
+        self.assertEqual(after_delete["restaurant_images"], [])
 
     def test_account_delete_requires_csrf_and_confirmation_then_invalidates_session(self) -> None:
         self.app.run_daily()
