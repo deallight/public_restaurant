@@ -21,6 +21,8 @@ from .utils import safe_json_dumps, utc_now
 SQLITE_TABLES = [
     "review_moderation_logs",
     "review_reports",
+    "review_reactions",
+    "restaurant_user_images",
     "restaurant_admin_images",
     "restaurant_ai_summaries",
     "restaurant_reviews",

@@ -11,7 +11,13 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from .alias_memory import remember_aliases
-from .agents import NormalizedExpenseRow, PlaceCandidate, similarity
+from .agents import (
+    NormalizedExpenseRow,
+    PlaceCandidate,
+    name_similarity_with_branch,
+    row_name_for_matching,
+    similarity,
+)
 from .database import Database
 from .integrations import IntegrationError
 from .utils import (
@@ -58,6 +64,27 @@ def first_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def expense_source_place_name(expense: Any | dict[str, Any]) -> str:
+    metadata = safe_json_loads(row_value(expense, "original_row_json") or "{}", {})
+    return first_text(
+        metadata.get("split_from_place_name"),
+        metadata.get("cleaned_from_place_name"),
+        metadata.get("place_name"),
+        row_value(expense, "place_name"),
+    )
+
+
+def provider_detail_category(raw_response_json: str | None) -> str:
+    metadata = safe_json_loads(raw_response_json, {})
+    if not isinstance(metadata, dict):
+        return ""
+    raw_category = first_text(metadata.get("provider_category_raw"))
+    if not raw_category:
+        return ""
+    category_path = [part.strip() for part in raw_category.split(">") if part.strip()]
+    return category_path[-1] if category_path else raw_category
 
 
 def candidate_effective_place_name(candidate: Any | dict[str, Any]) -> str:
@@ -112,6 +139,7 @@ class RestaurantService:
     AI_SUMMARY_MAX_SOURCE_REVIEWS = 100
     ADMIN_IMAGE_LIMIT = 4
     ADMIN_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+    USER_IMAGE_LIMIT_PER_RESTAURANT = 12
 
     def __init__(
         self,
@@ -236,6 +264,7 @@ class RestaurantService:
               r.id,
               r.canonical_name AS name,
               r.major_category,
+              r.place_verification_id,
               r.address,
               r.road_address,
               r.longitude,
@@ -254,7 +283,18 @@ class RestaurantService:
             ORDER BY visit_count DESC, average_rating DESC, r.id ASC
         """
         with self.database.session() as conn:
-            return [self._restaurant_payload(dict(row)) for row in conn.execute(sql, params)]
+            rows = [dict(row) for row in conn.execute(sql, params)]
+            self._add_restaurant_detail_categories(conn, rows)
+            source_names = self._restaurant_source_place_names(
+                conn,
+                [int(row["id"]) for row in rows],
+            )
+            payloads = []
+            for row in rows:
+                payload = self._restaurant_payload(row)
+                payload["source_place_names"] = source_names.get(int(row["id"]), [])
+                payloads.append(payload)
+            return payloads
 
     def get_restaurant(self, restaurant_id: int, user_id: int | None = None) -> dict[str, Any]:
         try:
@@ -302,23 +342,57 @@ class RestaurantService:
             ).fetchone()
             if row is None:
                 raise AppError(404, "restaurant not found")
+            restaurant_row = dict(row)
+            self._add_restaurant_detail_categories(conn, [restaurant_row])
             reviews = [
                 dict(review)
                 for review in conn.execute(
                     """
-                    SELECT id, rating, body, reviewer_label, created_at
-                    FROM restaurant_reviews
-                    WHERE restaurant_id = ? AND status = 'visible'
-                    ORDER BY created_at DESC
+                    SELECT rv.id, rv.rating, rv.body, rv.reviewer_label, rv.created_at,
+                           CASE
+                             WHEN rv.user_id IS NOT NULL THEN (
+                               SELECT COUNT(*)
+                               FROM restaurant_reviews owned
+                               WHERE owned.user_id = rv.user_id
+                                 AND owned.status = 'visible'
+                             )
+                             ELSE (
+                               SELECT COUNT(*)
+                               FROM restaurant_reviews anonymous
+                               WHERE anonymous.user_id IS NULL
+                                 AND anonymous.reviewer_label = rv.reviewer_label
+                                 AND anonymous.status = 'visible'
+                             )
+                           END AS reviewer_review_count,
+                           (
+                             SELECT COUNT(*)
+                             FROM review_reactions positive
+                             WHERE positive.review_id = rv.id
+                               AND positive.reaction = 'up'
+                           ) AS recommendation_count,
+                           (
+                             SELECT COUNT(*)
+                             FROM review_reactions negative
+                             WHERE negative.review_id = rv.id
+                               AND negative.reaction = 'down'
+                           ) AS not_recommended_count,
+                           COALESCE((
+                             SELECT mine.reaction
+                             FROM review_reactions mine
+                             WHERE mine.review_id = rv.id AND mine.user_id = ?
+                           ), '') AS current_reaction
+                    FROM restaurant_reviews rv
+                    WHERE rv.restaurant_id = ? AND rv.status = 'visible'
+                    ORDER BY rv.created_at DESC
                     LIMIT 20
                     """,
-                    (restaurant_id,),
+                    (user_id, restaurant_id),
                 )
             ]
             visible_review_count = int(row["review_count"] or 0)
-            visits = [
-                dict(visit)
-                for visit in conn.execute(
+            visits = []
+            source_place_names: list[str] = []
+            for visit_row in conn.execute(
                     """
                     SELECT
                       COALESCE(
@@ -327,7 +401,9 @@ class RestaurantService:
                         NULLIF(TRIM(er.used_date), '')
                       ) AS visited_at,
                       i.name AS institution_name,
-                      er.purpose
+                      er.purpose,
+                      er.place_name,
+                      er.original_row_json
                     FROM restaurant_expense_links rel
                     JOIN expense_records er ON er.id = rel.expense_record_id
                     JOIN institutions i ON i.id = er.institution_id
@@ -335,8 +411,15 @@ class RestaurantService:
                     ORDER BY visited_at DESC, rel.id DESC
                     """,
                     (restaurant_id,),
-                )
-            ]
+                ):
+                visit = dict(visit_row)
+                source_place_name = expense_source_place_name(visit)
+                visit["source_place_name"] = source_place_name
+                visit.pop("place_name", None)
+                visit.pop("original_row_json", None)
+                visits.append(visit)
+                if source_place_name and source_place_name not in source_place_names:
+                    source_place_names.append(source_place_name)
             ai_summary = conn.execute(
                 """
                 SELECT summary_text, summarized_review_count, status,
@@ -346,10 +429,11 @@ class RestaurantService:
                 """,
                 (restaurant_id,),
             ).fetchone()
-            payload = self._restaurant_payload(dict(row))
+            payload = self._restaurant_payload(restaurant_row)
             payload["review_count"] = visible_review_count
             payload["reviews"] = reviews
             payload["visits"] = visits
+            payload["source_place_names"] = source_place_names
             payload["ai_summary"] = self._ai_summary_payload(
                 row_to_dict(ai_summary),
                 visible_review_count,
@@ -365,11 +449,105 @@ class RestaurantService:
                     (user_id, restaurant_id),
                 ).fetchone()
             )
-        # Public restaurant photos are intentionally disabled until image usage
-        # rights can be verified. Keep the response fields for API compatibility.
-        payload["restaurant_images"] = []
-        payload["restaurant_image"] = None
+        payload["restaurant_images"] = self._user_restaurant_images_payload(
+            restaurant_id,
+            str(payload["name"]),
+        )
+        payload["restaurant_image"] = (
+            payload["restaurant_images"][0] if payload["restaurant_images"] else None
+        )
         return payload
+
+    def _restaurant_source_place_names(
+        self,
+        conn: Any,
+        restaurant_ids: list[int],
+    ) -> dict[int, list[str]]:
+        if not restaurant_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in restaurant_ids)
+        rows = conn.execute(
+            f"""
+            SELECT rel.restaurant_id, er.place_name, er.original_row_json
+            FROM restaurant_expense_links rel
+            JOIN expense_records er ON er.id = rel.expense_record_id
+            WHERE rel.restaurant_id IN ({placeholders})
+            ORDER BY rel.restaurant_id, rel.id
+            """,
+            restaurant_ids,
+        ).fetchall()
+        result: dict[int, list[str]] = {}
+        for row in rows:
+            restaurant_id = int(row["restaurant_id"])
+            source_place_name = expense_source_place_name(row)
+            names = result.setdefault(restaurant_id, [])
+            if source_place_name and source_place_name not in names:
+                names.append(source_place_name)
+        return result
+
+    def _add_restaurant_detail_categories(
+        self,
+        conn: Any,
+        restaurants: list[dict[str, Any]],
+    ) -> None:
+        verification_ids = sorted(
+            {
+                int(row["place_verification_id"])
+                for row in restaurants
+                if row.get("place_verification_id") is not None
+            }
+        )
+        if not verification_ids:
+            return
+        verification_placeholders = ", ".join("?" for _ in verification_ids)
+        linked_verifications = {
+            int(row["id"]): dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT id, provider_place_id, raw_response_json
+                FROM place_verifications
+                WHERE id IN ({verification_placeholders})
+                """,
+                verification_ids,
+            )
+        }
+        provider_place_ids = sorted(
+            {
+                str(row["provider_place_id"])
+                for row in linked_verifications.values()
+                if row.get("provider_place_id")
+            }
+        )
+        historical_categories: dict[str, str] = {}
+        if provider_place_ids:
+            provider_placeholders = ", ".join("?" for _ in provider_place_ids)
+            for row in conn.execute(
+                f"""
+                SELECT provider_place_id, raw_response_json
+                FROM place_verifications
+                WHERE provider_place_id IN ({provider_placeholders})
+                ORDER BY verified_at DESC, id DESC
+                """,
+                provider_place_ids,
+            ):
+                provider_place_id = str(row["provider_place_id"])
+                category = provider_detail_category(row["raw_response_json"])
+                if category and provider_place_id not in historical_categories:
+                    historical_categories[provider_place_id] = category
+        for restaurant in restaurants:
+            verification = linked_verifications.get(
+                int(restaurant["place_verification_id"])
+            ) if restaurant.get("place_verification_id") is not None else None
+            current_category = provider_detail_category(
+                verification.get("raw_response_json") if verification else None
+            )
+            provider_place_id = str(
+                verification.get("provider_place_id") or ""
+            ) if verification else ""
+            restaurant["provider_category_detail"] = (
+                current_category
+                or historical_categories.get(provider_place_id, "")
+            )
 
     def _restaurant_images_payload(self, restaurant: dict[str, Any]) -> list[dict[str, Any]]:
         restaurant_id = int(restaurant.get("id") or 0)
@@ -443,6 +621,206 @@ class RestaurantService:
                 }
             )
         return payloads
+
+    def _user_restaurant_images_payload(
+        self,
+        restaurant_id: int,
+        restaurant_name: str,
+        *,
+        user_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["restaurant_id = ?"]
+        params: list[Any] = [restaurant_id]
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        params.append(limit or self.USER_IMAGE_LIMIT_PER_RESTAURANT)
+        with self.database.session() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, restaurant_id, user_id, storage_key, original_filename,
+                       content_type, alt_text, sort_order, created_at, updated_at
+                FROM restaurant_user_images
+                WHERE {' AND '.join(clauses)}
+                ORDER BY sort_order ASC, created_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._user_image_payload(dict(row), restaurant_name) for row in rows]
+
+    def _user_image_payload(
+        self,
+        image: dict[str, Any],
+        restaurant_name: str,
+    ) -> dict[str, Any]:
+        storage_key = str(image.get("storage_key") or "")
+        media_url = f"/media/restaurant-images/{quote(storage_key, safe='/')}"
+        return {
+            "id": int(image["id"]),
+            "restaurant_id": int(image["restaurant_id"]),
+            "user_id": int(image["user_id"]),
+            "thumbnail_url": media_url,
+            "source_url": media_url,
+            "title": str(image.get("alt_text") or restaurant_name or "사용자 등록 사진"),
+            "alt_text": str(image.get("alt_text") or ""),
+            "original_filename": str(image.get("original_filename") or ""),
+            "content_type": str(image.get("content_type") or ""),
+            "sort_order": int(image.get("sort_order") or 0),
+            "provider": "user_upload",
+            "provider_label": "사용자 등록",
+            "created_at": image.get("created_at"),
+            "updated_at": image.get("updated_at"),
+        }
+
+    def user_photo_upload_page(self, user_id: int, restaurant_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            if conn.execute(
+                "SELECT id FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone() is None:
+                raise AppError(401, "login required")
+            restaurant = conn.execute(
+                """
+                SELECT id, canonical_name AS name, address, road_address
+                FROM restaurants
+                WHERE id = ? AND map_exposure_status = 'visible'
+                """,
+                (restaurant_id,),
+            ).fetchone()
+        if restaurant is None:
+            raise AppError(404, "restaurant not found")
+        payload = dict(restaurant)
+        payload["images"] = self._user_restaurant_images_payload(
+            restaurant_id,
+            str(payload["name"]),
+            user_id=user_id,
+        )
+        payload["image_limit"] = self.USER_IMAGE_LIMIT_PER_RESTAURANT
+        return payload
+
+    def save_user_restaurant_image(
+        self,
+        user_id: int,
+        restaurant_id: int,
+        filename: str,
+        image_bytes: bytes,
+        *,
+        alt_text: str = "",
+    ) -> dict[str, Any]:
+        content_type, extension = self._validated_admin_image(image_bytes)
+        safe_alt_text = self._validated_admin_image_alt_text(alt_text)
+        original_filename = Path(str(filename or "image")).name[:255] or f"image.{extension}"
+        with self.database.session() as conn:
+            if conn.execute(
+                "SELECT id FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone() is None:
+                raise AppError(401, "login required")
+            if conn.execute(
+                "SELECT id FROM restaurants WHERE id = ? AND map_exposure_status = 'visible'",
+                (restaurant_id,),
+            ).fetchone() is None:
+                raise AppError(404, "restaurant not found")
+            count = int(conn.execute(
+                "SELECT COUNT(*) AS c FROM restaurant_user_images WHERE user_id = ? AND restaurant_id = ?",
+                (user_id, restaurant_id),
+            ).fetchone()["c"])
+            if count >= self.USER_IMAGE_LIMIT_PER_RESTAURANT:
+                raise AppError(409, "user restaurant image limit reached")
+            sort_order = int(conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM restaurant_user_images WHERE restaurant_id = ?",
+                (restaurant_id,),
+            ).fetchone()["next_order"])
+        storage_key = f"user-{user_id}/restaurant-{restaurant_id}/{secrets.token_hex(16)}.{extension}"
+        target_path = self._admin_image_file_path(storage_key)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = target_path.with_suffix(f"{target_path.suffix}.upload")
+        temporary_path.write_bytes(image_bytes)
+        temporary_path.replace(target_path)
+        try:
+            with self.database.session() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO restaurant_user_images
+                      (restaurant_id, user_id, storage_key, original_filename,
+                       content_type, alt_text, sort_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (restaurant_id, user_id, storage_key, original_filename, content_type,
+                     safe_alt_text, sort_order, utc_now(), utc_now()),
+                )
+                image_id = int(cursor.lastrowid)
+        except Exception:
+            target_path.unlink(missing_ok=True)
+            raise
+        return {"image_id": image_id, "restaurant_id": restaurant_id}
+
+    def update_user_restaurant_image(
+        self,
+        user_id: int,
+        image_id: int,
+        *,
+        alt_text: str,
+        filename: str = "",
+        image_bytes: bytes | None = None,
+    ) -> dict[str, Any]:
+        safe_alt_text = self._validated_admin_image_alt_text(alt_text)
+        with self.database.session() as conn:
+            existing = conn.execute(
+                "SELECT * FROM restaurant_user_images WHERE id = ? AND user_id = ?",
+                (image_id, user_id),
+            ).fetchone()
+        if existing is None:
+            raise AppError(404, "restaurant image not found")
+        new_storage_key = str(existing["storage_key"])
+        new_filename = str(existing["original_filename"])
+        new_content_type = str(existing["content_type"])
+        new_path: Path | None = None
+        if image_bytes:
+            new_content_type, extension = self._validated_admin_image(image_bytes)
+            new_filename = Path(str(filename or "image")).name[:255] or f"image.{extension}"
+            new_storage_key = f"user-{user_id}/restaurant-{int(existing['restaurant_id'])}/{secrets.token_hex(16)}.{extension}"
+            new_path = self._admin_image_file_path(new_storage_key)
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = new_path.with_suffix(f"{new_path.suffix}.upload")
+            temporary_path.write_bytes(image_bytes)
+            temporary_path.replace(new_path)
+        try:
+            with self.database.session() as conn:
+                conn.execute(
+                    """
+                    UPDATE restaurant_user_images
+                    SET storage_key = ?, original_filename = ?, content_type = ?,
+                        alt_text = ?, updated_at = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (new_storage_key, new_filename, new_content_type, safe_alt_text,
+                     utc_now(), image_id, user_id),
+                )
+        except Exception:
+            if new_path is not None:
+                new_path.unlink(missing_ok=True)
+            raise
+        if new_path is not None:
+            self._admin_image_file_path(str(existing["storage_key"])).unlink(missing_ok=True)
+        return {"image_id": image_id, "restaurant_id": int(existing["restaurant_id"])}
+
+    def delete_user_restaurant_image(self, user_id: int, image_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            image = conn.execute(
+                "SELECT restaurant_id, storage_key FROM restaurant_user_images WHERE id = ? AND user_id = ?",
+                (image_id, user_id),
+            ).fetchone()
+            if image is None:
+                raise AppError(404, "restaurant image not found")
+            conn.execute(
+                "DELETE FROM restaurant_user_images WHERE id = ? AND user_id = ?",
+                (image_id, user_id),
+            )
+        self._admin_image_file_path(str(image["storage_key"])).unlink(missing_ok=True)
+        return {"image_id": image_id, "restaurant_id": int(image["restaurant_id"])}
 
     def _admin_restaurant_images_payload(
         self,
@@ -1011,6 +1389,7 @@ class RestaurantService:
               r.id,
               r.canonical_name AS name,
               r.major_category,
+              r.place_verification_id,
               r.address,
               r.road_address,
               r.longitude,
@@ -1031,7 +1410,9 @@ class RestaurantService:
             LIMIT 50
         """
         with self.database.session() as conn:
-            return [self._restaurant_payload(dict(row)) for row in conn.execute(sql, params)]
+            rows = [dict(row) for row in conn.execute(sql, params)]
+            self._add_restaurant_detail_categories(conn, rows)
+            return [self._restaurant_payload(row) for row in rows]
 
     def search(self, q: str, category: str = "", bounds: str = "") -> list[dict[str, Any]]:
         return self.list_map_restaurants(q=q, category=category, bounds=bounds)[:20]
@@ -1139,6 +1520,68 @@ class RestaurantService:
             )
             return report
 
+    def react_to_review(
+        self,
+        user_id: int,
+        review_id: int,
+        reaction: str,
+    ) -> dict[str, Any]:
+        safe_reaction = str(reaction or "").strip().lower()
+        if safe_reaction not in {"up", "down"}:
+            raise AppError(400, "review reaction must be up or down")
+        with self.database.session() as conn:
+            if conn.execute(
+                "SELECT id FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone() is None:
+                raise AppError(401, "login required")
+            if conn.execute(
+                "SELECT id FROM restaurant_reviews WHERE id = ? AND status = 'visible'",
+                (review_id,),
+            ).fetchone() is None:
+                raise AppError(404, "review not found")
+            existing = conn.execute(
+                "SELECT reaction FROM review_reactions WHERE review_id = ? AND user_id = ?",
+                (review_id, user_id),
+            ).fetchone()
+            current_reaction = str(existing["reaction"]) if existing else ""
+            if current_reaction == safe_reaction:
+                conn.execute(
+                    "DELETE FROM review_reactions WHERE review_id = ? AND user_id = ?",
+                    (review_id, user_id),
+                )
+                current_reaction = ""
+            else:
+                now = utc_now()
+                conn.execute(
+                    """
+                    INSERT INTO review_reactions
+                      (review_id, user_id, reaction, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(review_id, user_id) DO UPDATE SET
+                      reaction = excluded.reaction,
+                      updated_at = excluded.updated_at
+                    """,
+                    (review_id, user_id, safe_reaction, now, now),
+                )
+                current_reaction = safe_reaction
+            counts = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN reaction = 'up' THEN 1 ELSE 0 END) AS recommendation_count,
+                  SUM(CASE WHEN reaction = 'down' THEN 1 ELSE 0 END) AS not_recommended_count
+                FROM review_reactions
+                WHERE review_id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+        return {
+            "review_id": review_id,
+            "reaction": current_reaction,
+            "recommendation_count": int(counts["recommendation_count"] or 0),
+            "not_recommended_count": int(counts["not_recommended_count"] or 0),
+        }
+
     def save_restaurant(self, user_id: int, restaurant_id: int) -> dict[str, Any]:
         with self.database.session() as conn:
             if conn.execute(
@@ -1188,6 +1631,10 @@ class RestaurantService:
                 WHERE id = ? AND user_id = ?
                 """,
                 (utc_now(), review_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM review_reactions WHERE review_id = ?",
+                (review_id,),
             )
             conn.execute(
                 """
@@ -1288,13 +1735,35 @@ class RestaurantService:
                     (user_id,),
                 )
             ]
+            photo_rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT ui.*, r.canonical_name AS restaurant_name,
+                           COALESCE(NULLIF(r.road_address, ''), r.address) AS address
+                    FROM restaurant_user_images ui
+                    JOIN restaurants r ON r.id = ui.restaurant_id
+                    WHERE ui.user_id = ?
+                    ORDER BY ui.updated_at DESC, ui.id DESC
+                    """,
+                    (user_id,),
+                )
+            ]
+            photos = []
+            for row in photo_rows:
+                photo = self._user_image_payload(row, str(row["restaurant_name"]))
+                photo["restaurant_name"] = row["restaurant_name"]
+                photo["address"] = row["address"]
+                photos.append(photo)
         return {
             "user": dict(user),
             "reviews": reviews,
             "saved_restaurants": saved_restaurants,
+            "photos": photos,
             "counts": {
                 "reviews": len(reviews),
                 "saved_restaurants": len(saved_restaurants),
+                "photos": len(photos),
             },
         }
 
@@ -1377,6 +1846,13 @@ class RestaurantService:
                 (user_id,),
             ).fetchone()["count"]
         )
+        photo_storage_keys = [
+            str(row["storage_key"])
+            for row in conn.execute(
+                "SELECT storage_key FROM restaurant_user_images WHERE user_id = ?",
+                (user_id,),
+            )
+        ]
 
         conn.execute(
             "DELETE FROM account_merge_requests WHERE source_user_id = ? OR target_user_id = ?",
@@ -1384,6 +1860,10 @@ class RestaurantService:
         )
         conn.execute("DELETE FROM oauth_accounts WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM user_saved_restaurants WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM review_reactions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM restaurant_user_images WHERE user_id = ?", (user_id,))
+        for storage_key in photo_storage_keys:
+            self._admin_image_file_path(storage_key).unlink(missing_ok=True)
         conn.execute(
             """
             UPDATE review_reports
@@ -1417,6 +1897,7 @@ class RestaurantService:
             "result": "deleted",
             "oauth_accounts_deleted": oauth_count,
             "saved_restaurants_deleted": saved_count,
+            "photos_deleted": len(photo_storage_keys),
             "reviews_anonymized": len(review_ids),
             "reports_anonymized": len(report_ids),
         }
@@ -1521,7 +2002,18 @@ class RestaurantService:
                       SELECT id
                       FROM place_verifications
                       WHERE candidate_id = c.id
-                      ORDER BY verified_at DESC, id DESC
+                      ORDER BY
+                        CASE WHEN is_coordinate_valid = 1 THEN 0 ELSE 1 END,
+                        name_similarity DESC,
+                        address_similarity DESC,
+                        CASE
+                          WHEN provider_category IN ('restaurant', 'cafe', 'bar')
+                           AND is_coordinate_valid = 1
+                          THEN 0 ELSE 1
+                        END,
+                        CASE verification_status WHEN 'success' THEN 0 ELSE 1 END,
+                        verified_at DESC,
+                        id DESC
                       LIMIT 1
                     )
                     WHERE mrt.status = 'pending'
@@ -1728,7 +2220,18 @@ class RestaurantService:
                           SELECT id
                           FROM place_verifications
                           WHERE candidate_id = c.id
-                          ORDER BY verified_at DESC, id DESC
+                          ORDER BY
+                            CASE WHEN is_coordinate_valid = 1 THEN 0 ELSE 1 END,
+                            name_similarity DESC,
+                            address_similarity DESC,
+                            CASE
+                              WHEN provider_category IN ('restaurant', 'cafe', 'bar')
+                               AND is_coordinate_valid = 1
+                              THEN 0 ELSE 1
+                            END,
+                            CASE verification_status WHEN 'success' THEN 0 ELSE 1 END,
+                            verified_at DESC,
+                            id DESC
                           LIMIT 1
                         )
                         WHERE {group_row_clause}
@@ -1823,7 +2326,18 @@ class RestaurantService:
                       SELECT id
                       FROM place_verifications
                       WHERE candidate_id = c.id
-                      ORDER BY verified_at DESC, id DESC
+                      ORDER BY
+                        CASE WHEN is_coordinate_valid = 1 THEN 0 ELSE 1 END,
+                        name_similarity DESC,
+                        address_similarity DESC,
+                        CASE
+                          WHEN provider_category IN ('restaurant', 'cafe', 'bar')
+                           AND is_coordinate_valid = 1
+                          THEN 0 ELSE 1
+                        END,
+                        CASE verification_status WHEN 'success' THEN 0 ELSE 1 END,
+                        verified_at DESC,
+                        id DESC
                       LIMIT 1
                     )
                     WHERE 1 = 1
@@ -1943,7 +2457,18 @@ class RestaurantService:
                       SELECT id
                       FROM place_verifications
                       WHERE candidate_id = c.id
-                      ORDER BY verified_at DESC, id DESC
+                      ORDER BY
+                        CASE WHEN is_coordinate_valid = 1 THEN 0 ELSE 1 END,
+                        name_similarity DESC,
+                        address_similarity DESC,
+                        CASE
+                          WHEN provider_category IN ('restaurant', 'cafe', 'bar')
+                           AND is_coordinate_valid = 1
+                          THEN 0 ELSE 1
+                        END,
+                        CASE verification_status WHEN 'success' THEN 0 ELSE 1 END,
+                        verified_at DESC,
+                        id DESC
                       LIMIT 1
                     )
                     WHERE c.status = 'verified'
@@ -2053,6 +2578,7 @@ class RestaurantService:
         rejection_reason: str = "manual_reject",
         reviewer_note: str = "",
         verification_id: int | None = None,
+        allow_category_override: bool = False,
     ) -> dict[str, Any]:
         name = re.sub(r"\s+", " ", str(review_place_name or "")).strip()
         address = re.sub(r"\s+", " ", str(review_address or "")).strip()
@@ -2070,23 +2596,67 @@ class RestaurantService:
             if before is None:
                 raise AppError(404, "candidate not found")
             self._update_candidate_review_values(conn, candidate_id, name, address, category, note)
-            provider_refresh = self._refresh_provider_candidates(conn, candidate_id)
+            provider_refresh = {"status": "skipped", "reason": "split_to_provider_refresh_button"}
             geocoding_result = {"status": "skipped", "reason": "split_to_geocode_button"}
+            category_override_applied = False
             if status == "verified":
                 updated = conn.execute("SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)).fetchone()
                 self._unlink_candidate_from_restaurants(conn, candidate_id)
                 verification = (
-                    self._food_verification_by_id(conn, candidate_id, int(verification_id))
+                    self._admin_verification_by_id(
+                        conn,
+                        candidate_id,
+                        int(verification_id),
+                        review_category=category,
+                        allow_category_override=allow_category_override,
+                    )
                     if verification_id
                     else None
                 )
                 if verification is not None:
-                    self._apply_provider_verification_to_candidate(conn, candidate_id, verification, note)
+                    category_override = (
+                        category
+                        if verification["provider_category"] == "other" and allow_category_override
+                        else None
+                    )
+                    category_override_applied = category_override is not None
+                    self._apply_provider_verification_to_candidate(
+                        conn,
+                        candidate_id,
+                        verification,
+                        note,
+                        category_override=category_override,
+                    )
                     updated = conn.execute("SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)).fetchone()
-                    restaurant_id = self._restaurant_from_provider_verification(conn, updated, verification)
+                    restaurant_id = self._restaurant_from_provider_verification(
+                        conn,
+                        updated,
+                        verification,
+                        category_override=category_override,
+                    )
                     self._link_candidate_expense(conn, restaurant_id, candidate_id, "admin_selected_provider")
                 else:
                     restaurant_id = self._restaurant_from_candidate_override(conn, updated)
+                approved_candidate = conn.execute(
+                    "SELECT * FROM restaurant_candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                restaurant = conn.execute(
+                    "SELECT canonical_name FROM restaurants WHERE id = ?",
+                    (restaurant_id,),
+                ).fetchone()
+                remember_aliases(
+                    conn,
+                    restaurant_id,
+                    [
+                        before["original_place_name"],
+                        name,
+                        candidate_effective_place_name(approved_candidate),
+                        restaurant["canonical_name"] if restaurant is not None else "",
+                    ],
+                    source="admin_candidate_approved",
+                    confidence=1.0,
+                )
                 self._set_candidate_approved(conn, candidate_id, context, note)
                 result = "verified"
             elif status == "rejected":
@@ -2114,9 +2684,17 @@ class RestaurantService:
                     "provider_refresh": provider_refresh,
                     "geocoding": geocoding_result,
                     "verification_id": verification_id,
+                    "category_override": category_override_applied,
                     "candidate": dict(after),
                 },
-                reason_codes=["ADMIN_CANDIDATE_STATE_EDIT"],
+                reason_codes=[
+                    "ADMIN_CANDIDATE_STATE_EDIT",
+                    *(
+                        ["ADMIN_PROVIDER_CATEGORY_OVERRIDE"]
+                        if category_override_applied
+                        else []
+                    ),
+                ],
             )
             return {
                 "result": result,
@@ -2124,6 +2702,55 @@ class RestaurantService:
                 "restaurant_id": restaurant_id,
                 "provider_refresh": provider_refresh,
                 "geocoding": geocoding_result,
+                "candidate": dict(after),
+            }
+
+    def refresh_admin_candidate_providers(
+        self,
+        candidate_id: int,
+        context: RequestContext,
+        review_place_name: str,
+        review_address: str = "",
+        review_major_category: str = "restaurant",
+        reviewer_note: str = "",
+    ) -> dict[str, Any]:
+        name = re.sub(r"\s+", " ", str(review_place_name or "")).strip()
+        address = re.sub(r"\s+", " ", str(review_address or "")).strip()
+        category = str(review_major_category or "restaurant").strip()
+        if not name:
+            raise AppError(400, "place name is required")
+        if category not in {"restaurant", "cafe", "bar", "other"}:
+            raise AppError(400, "unsupported category")
+        note = str(reviewer_note or "").strip()
+        with self.database.session() as conn:
+            before = conn.execute(
+                "SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if before is None:
+                raise AppError(404, "candidate not found")
+            self._update_candidate_review_values(conn, candidate_id, name, address, category, note)
+            provider_refresh = self._refresh_provider_candidates(conn, candidate_id)
+            after = conn.execute(
+                "SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            self._audit(
+                conn,
+                "admin",
+                "candidate_admin_provider_refresh",
+                "restaurant_candidate",
+                candidate_id,
+                before=dict(before),
+                after={
+                    "actor_id": context.actor_id,
+                    "provider_refresh": provider_refresh,
+                    "candidate": dict(after),
+                },
+                reason_codes=["ADMIN_PROVIDER_REFRESH"],
+            )
+            return {
+                "result": "provider_refreshed",
+                "candidate_id": candidate_id,
+                "provider_refresh": provider_refresh,
                 "candidate": dict(after),
             }
 
@@ -2150,6 +2777,11 @@ class RestaurantService:
                 raise AppError(404, "candidate not found")
             self._update_candidate_review_values(conn, candidate_id, name, address, category, note)
             geocoding_result = self._geocode_candidate_override(conn, candidate_id)
+            provider_refresh = (
+                self._refresh_provider_candidates(conn, candidate_id)
+                if geocoding_result.get("status") == "success"
+                else {"status": "skipped", "reason": "geocoding_not_successful"}
+            )
             after = conn.execute("SELECT * FROM restaurant_candidates WHERE id = ?", (candidate_id,)).fetchone()
             self._audit(
                 conn,
@@ -2161,14 +2793,19 @@ class RestaurantService:
                 after={
                     "actor_id": context.actor_id,
                     "geocoding": geocoding_result,
+                    "provider_refresh": provider_refresh,
                     "candidate": dict(after),
                 },
-                reason_codes=["ADMIN_CANDIDATE_GEOCODE"],
+                reason_codes=[
+                    "ADMIN_CANDIDATE_GEOCODE",
+                    *(["ADMIN_PROVIDER_REFRESH"] if provider_refresh.get("status") == "success" else []),
+                ],
             )
             return {
                 "result": "geocoded",
                 "candidate_id": candidate_id,
                 "geocoding": geocoding_result,
+                "provider_refresh": provider_refresh,
                 "candidate": dict(after),
             }
 
@@ -2478,10 +3115,11 @@ class RestaurantService:
         candidate_id: int,
         verification: Any,
         note: str,
+        category_override: str | None = None,
     ) -> None:
         name = verification["provider_place_name"] or ""
         address = verification["provider_road_address"] or verification["provider_address"] or ""
-        category = verification["provider_category"] or "other"
+        category = category_override or verification["provider_category"] or "other"
         self._update_candidate_review_values(conn, candidate_id, name, address, category, note)
 
     def _geocode_candidate_override(self, conn: Any, candidate_id: int) -> dict[str, Any]:
@@ -2640,11 +3278,26 @@ class RestaurantService:
             return {"status": "failed", "reason": str(exc)}
         except Exception as exc:
             return {"status": "failed", "reason": str(exc)}
+        removed_result = conn.execute(
+            """
+            DELETE FROM place_verifications
+            WHERE candidate_id = ?
+              AND provider = 'naver'
+              AND verification_status <> 'success'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM restaurants r
+                WHERE r.place_verification_id = place_verifications.id
+              )
+            """,
+            (candidate_id,),
+        )
+        removed = int(removed_result.rowcount or 0)
         stored = 0
         for place in places[:10]:
             self._upsert_admin_provider_candidate(conn, candidate_id, row, place)
             stored += 1
-        return {"status": "success", "stored": stored}
+        return {"status": "success", "stored": stored, "removed_stale": removed}
 
     def _upsert_admin_provider_candidate(
         self,
@@ -2653,7 +3306,7 @@ class RestaurantService:
         row: NormalizedExpenseRow,
         place: PlaceCandidate,
     ) -> None:
-        name_score = similarity(row.normalized_place_name, normalize_text(place.name))
+        name_score = name_similarity_with_branch(row_name_for_matching(row), place.name)
         provider_address = place.road_address or place.address
         address_score = similarity(row.normalized_address, normalize_address(provider_address)) if row.normalized_address else 0.0
         conn.execute(
@@ -2703,7 +3356,12 @@ class RestaurantService:
                 1 if name_score >= 0.78 else 0,
                 1 if address_score >= 0.72 else 0,
                 1 if place.category in {"restaurant", "cafe", "bar"} else 0,
-                safe_json_dumps({"source": "admin_provider_refresh"}),
+                safe_json_dumps(
+                    {
+                        "source": "admin_provider_refresh",
+                        "provider_category_raw": place.provider_category_raw,
+                    }
+                ),
             ),
         )
 
@@ -3350,6 +4008,20 @@ class RestaurantService:
                 raise AppError(404, "user not found")
             conn.execute("UPDATE oauth_accounts SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
             conn.execute("UPDATE restaurant_reviews SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
+            conn.execute(
+                """
+                INSERT INTO review_reactions
+                  (review_id, user_id, reaction, created_at, updated_at)
+                SELECT review_id, ?, reaction, created_at, ?
+                FROM review_reactions
+                WHERE user_id = ?
+                ON CONFLICT(review_id, user_id) DO UPDATE SET
+                  reaction = excluded.reaction,
+                  updated_at = excluded.updated_at
+                """,
+                (target_user_id, utc_now(), user_id),
+            )
+            conn.execute("DELETE FROM review_reactions WHERE user_id = ?", (user_id,))
             conn.execute(
                 """
                 DELETE FROM user_saved_restaurants
@@ -4534,6 +5206,39 @@ class RestaurantService:
             raise AppError(400, "selected provider candidate is not approvable")
         return verification
 
+    def _admin_verification_by_id(
+        self,
+        conn: Any,
+        candidate_id: int,
+        verification_id: int,
+        review_category: str,
+        allow_category_override: bool,
+    ) -> Any:
+        verification = conn.execute(
+            """
+            SELECT *
+            FROM place_verifications
+            WHERE id = ?
+              AND candidate_id = ?
+              AND provider_place_id IS NOT NULL
+              AND is_coordinate_valid = 1
+            """,
+            (verification_id, candidate_id),
+        ).fetchone()
+        if verification is None:
+            raise AppError(400, "selected provider candidate is not approvable")
+        if verification["provider_category"] in {"restaurant", "cafe", "bar"}:
+            return verification
+        can_override = (
+            allow_category_override
+            and verification["provider_category"] == "other"
+            and float(verification["name_similarity"] or 0) >= 0.90
+            and review_category in {"restaurant", "cafe", "bar"}
+        )
+        if not can_override:
+            raise AppError(400, "selected provider candidate requires category override")
+        return verification
+
     def _provider_candidates(self, conn: Any, candidate_id: int) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -4556,15 +5261,21 @@ class RestaurantService:
                     WHEN provider_category IN ('restaurant', 'cafe', 'bar')
                      AND is_coordinate_valid = 1
                     THEN 1 ELSE 0
-                  END AS is_approvable
+                  END AS is_approvable,
+                  CASE
+                    WHEN provider_category = 'other'
+                     AND is_coordinate_valid = 1
+                     AND name_similarity >= 0.90
+                    THEN 1 ELSE 0
+                  END AS can_admin_override
                 FROM place_verifications
                 WHERE candidate_id = ?
                   AND provider_place_id IS NOT NULL
                   AND is_coordinate_valid = 1
                 ORDER BY
-                  is_approvable DESC,
                   name_similarity DESC,
                   address_similarity DESC,
+                  is_approvable DESC,
                   verified_at DESC,
                   id DESC
                 LIMIT 10
@@ -4578,9 +5289,11 @@ class RestaurantService:
         conn: Any,
         candidate: Any,
         verification: Any,
+        category_override: str | None = None,
     ) -> int:
         address = verification["provider_address"] or verification["provider_road_address"] or "주소 미확인"
         road_address = verification["provider_road_address"] or verification["provider_address"] or ""
+        provider_category = category_override or verification["provider_category"]
         existing = conn.execute(
             "SELECT id FROM restaurants WHERE naver_place_id = ?",
             (verification["provider_place_id"],),
@@ -4609,7 +5322,7 @@ class RestaurantService:
                     verification["id"],
                     verification["provider_place_name"],
                     normalize_text(verification["provider_place_name"]),
-                    verification["provider_category"],
+                    provider_category,
                     address,
                     road_address,
                     normalize_address(address),
@@ -4634,7 +5347,7 @@ class RestaurantService:
                 verification["id"],
                 verification["provider_place_name"],
                 normalize_text(verification["provider_place_name"]),
-                verification["provider_category"],
+                provider_category,
                 verification["provider_place_id"],
                 address,
                 road_address,
@@ -4721,16 +5434,22 @@ class RestaurantService:
     def _restaurant_payload(self, row: dict[str, Any]) -> dict[str, Any]:
         name = row.get("name") or row.get("canonical_name")
         query = naver_map_query(name, row.get("road_address") or row["address"])
+        category_label = {
+            "restaurant": "음식점",
+            "cafe": "카페",
+            "bar": "주점",
+            "other": "기타",
+        }.get(row["major_category"], "기타")
+        provider_category_detail = first_text(
+            row.get("provider_category_detail"),
+            provider_detail_category(row.get("verification_raw_response_json")),
+        )
         return {
             "id": row["id"],
             "name": name,
             "category": row["major_category"],
-            "category_label": {
-                "restaurant": "음식점",
-                "cafe": "카페",
-                "bar": "주점",
-                "other": "기타",
-            }.get(row["major_category"], "기타"),
+            "category_label": category_label,
+            "category_detail_label": provider_category_detail or category_label,
             "address": row["address"],
             "road_address": row.get("road_address"),
             "longitude": row["longitude"],

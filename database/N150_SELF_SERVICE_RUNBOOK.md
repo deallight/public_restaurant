@@ -9,7 +9,8 @@ Mac 개발 PC
   └─ GitHub main
        └─ N150 /srv/app/releases/<새 릴리스>
             ├─ deploy 계정으로 앱 실행
-            ├─ Nginx (외부 HTTP 요청 처리: 추후 연결)
+            ├─ systemd public-restaurant.service (127.0.0.1:8001)
+            ├─ Nginx + HTTPS (https://gonggibap.com)
             └─ PostgreSQL 127.0.0.1:5432
                  ├─ public_restaurant_test  배포 검증용
                  └─ public_restaurant       실제 서비스용
@@ -22,11 +23,8 @@ Mac 개발 PC
 - `deploy` 계정, GitHub 읽기 전용 배포 키, `/srv/app` 경로 준비
 - `public_restaurant_test` PostgreSQL 스키마·실제 수집·외부 API·관리자 UI 검증
 - `main` 브랜치에 PostgreSQL 전환 코드 병합
-
-아직 하지 않은 항목:
-
-- 운영 DB `public_restaurant`의 스키마 적용과 실제 수집
-- systemd 서비스 등록, Nginx reverse proxy 연결, 도메인/HTTPS 공개
+- 운영 DB `public_restaurant`, systemd 서비스, Nginx reverse proxy, 도메인/HTTPS 공개
+- release별 배포와 `/srv/app/current`, `/srv/app/shared/var` 분리
 
 > **가장 중요한 원칙**
 >
@@ -99,6 +97,68 @@ sudo -u deploy psql \
   -d public_restaurant_test \
   -c 'SELECT current_user, current_database();'
 ```
+
+## 자동 배포 (권장)
+
+일반적인 코드 업데이트는 아래 명령 하나로 배포한다.
+
+```bash
+sudo /srv/app/bin/deploy-public-restaurant
+```
+
+스크립트는 다음 순서로 작업한다.
+
+1. 동시에 두 배포가 실행되지 않도록 잠근다.
+2. 현재 systemd 프로세스만 `127.0.0.1:8001`을 점유하는지 확인한다.
+3. GitHub `main`의 정확한 커밋으로 새 release를 만든다.
+4. release 전용 `.venv`를 만들고 의존성을 설치한다.
+5. `public_restaurant_test`에서 전체 테스트를 실행한다.
+6. 운영 DB 스키마가 코드와 호환되는지 읽기 전용으로 검사한다.
+7. 운영 PostgreSQL 백업을 만들고 `pg_restore --list`로 검증한다.
+8. 운영 환경을 사용하되 별도 포트 `18001`에서 사전 HTTP 점검한다.
+9. `/srv/app/current` 링크를 원자적으로 바꾸고 systemd를 재시작한다.
+10. 내부·외부 HTTP와 실제 프로세스 release를 검사한다.
+11. 전환 이후 검사에 실패하면 이전 release로 자동 롤백한다.
+
+스크립트는 운영 DB에 DDL을 자동 적용하지 않는다. `scripts.check_db_schema`가
+`compatible`이 아니면 배포를 중단하고, 검토된 마이그레이션을 별도로 적용해야
+한다. 이전 release와 백업도 자동 삭제하지 않는다.
+
+격리된 테스트 DB가 일시적으로 준비되지 않은 경우에만 위험을 인지하고 다음
+옵션을 사용할 수 있다.
+
+```bash
+sudo /srv/app/bin/deploy-public-restaurant --skip-tests
+```
+
+### 최초 1회 설치
+
+배포 스크립트가 `main`에 병합된 뒤 N150에서 한 번만 설치한다. 실행 중인
+release의 작업 트리는 수정하지 않는다.
+
+```bash
+cd /tmp
+DEPLOY_INSTALLER=$(mktemp /tmp/deploy-public-restaurant.XXXXXX)
+sudo -u deploy -H git -C /srv/app/current fetch origin main
+sudo -u deploy -H \
+  git -C /srv/app/current show origin/main:scripts/deploy_n150.sh \
+  > "$DEPLOY_INSTALLER"
+sudo install -d -o root -g root -m 755 /srv/app/bin
+sudo install -o root -g root -m 755 \
+  "$DEPLOY_INSTALLER" \
+  /srv/app/bin/deploy-public-restaurant
+rm "$DEPLOY_INSTALLER"
+```
+
+설치 확인:
+
+```bash
+sudo /srv/app/bin/deploy-public-restaurant --help
+```
+
+정상 배포가 끝날 때마다 새 release에 포함된 스크립트로 설치본도 자동
+갱신된다. 아래의 기존 수동 절차는 자동 배포가 중단됐을 때 원인을 확인하거나
+복구할 때만 사용한다.
 
 ---
 
@@ -241,7 +301,7 @@ sudo -u deploy bash -lc '
   cd /srv/app/releases/main-<short-sha>
   nohup .venv/bin/python -u -m app.server \
     --host 127.0.0.1 \
-    --port 8001 \
+    --port 18001 \
     > /srv/app/shared/postgres-test-server.log 2>&1 &
   echo "PID=$!"
 '
@@ -250,7 +310,7 @@ sudo -u deploy bash -lc '
 서버가 실제 설정을 읽었는지 확인한다.
 
 ```bash
-curl -sS http://127.0.0.1:8001/ops/verification-status
+curl -sS http://127.0.0.1:18001/ops/verification-status
 ```
 
 `naver_search`, `naver_maps_geocoding`, `data_go_kr_permit`가 모두 `true`여야 실제 외부 API 검증을 할 수 있다.
@@ -261,7 +321,7 @@ curl -sS http://127.0.0.1:8001/ops/verification-status
 ssh -i ~/develop/server_pc/.ssh/n150_codex \
   -o IdentitiesOnly=yes \
   -N \
-  -L 18001:127.0.0.1:8001 \
+  -L 18001:127.0.0.1:18001 \
   deallight@100.76.123.43
 ```
 
@@ -285,7 +345,7 @@ sudo -u deploy kill <PID>
 값을 출력하지 않고 설정 여부만 검사한다.
 
 ```bash
-curl -sS http://127.0.0.1:8001/ops/verification-status
+curl -sS http://127.0.0.1:18001/ops/verification-status
 ```
 
 ### API 호출 로그
@@ -471,10 +531,12 @@ sudo -u deploy ls -lh /srv/app/shared/backups/
 sudo systemctl status nginx --no-pager
 sudo ss -ltnp '( sport = :8000 )'
 sudo ss -ltnp '( sport = :8001 )'
+sudo ss -ltnp '( sport = :18001 )'
 tail -n 100 /srv/app/shared/postgres-test-server.log
 ```
 
-임시 테스트 서버는 `127.0.0.1:8001`만 사용하므로, 맥에서 보려면 SSH 터널이 필요하다.
+운영 서버는 `127.0.0.1:8001`, 임시 테스트 서버는 `127.0.0.1:18001`을
+사용한다. 임시 서버를 맥에서 보려면 SSH 터널이 필요하다.
 
 ### PostgreSQL 연결이 안 될 때
 
@@ -493,7 +555,7 @@ sudo -u deploy psql -h 127.0.0.1 -U restaurant_app -d public_restaurant_test -c 
 ### 모든 후보가 수동 검토로 갈 때
 
 ```bash
-curl -sS http://127.0.0.1:8001/ops/verification-status
+curl -sS http://127.0.0.1:18001/ops/verification-status
 ```
 
 - `naver_search: false`이면 API 키가 실행 중인 서버에 반영되지 않은 것이다.

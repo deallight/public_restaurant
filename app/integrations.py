@@ -8,7 +8,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
-from .agents import NormalizedExpenseRow, PermitSnapshot, PlaceCandidate, category_from_text, similarity
+from .agents import (
+    FOOD_CATEGORIES,
+    NormalizedExpenseRow,
+    PermitSnapshot,
+    PlaceCandidate,
+    category_from_text,
+    generic_parenthetical_place_name,
+    name_similarity_with_branch,
+    parse_place_name,
+    similarity,
+)
 from .utils import normalize_address, normalize_text, strip_address_detail
 
 
@@ -102,7 +112,25 @@ def _category_from_naver(value: str) -> str:
         return "cafe"
     if any(token in text for token in ["주점", "호프", "맥주", "포차", "술집", "바"]):
         return "bar"
-    if any(token in text for token in ["음식점", "한식", "중식", "일식", "분식", "고기", "요리"]):
+    if any(
+        token in text
+        for token in [
+            "음식점",
+            "한식",
+            "중식",
+            "일식",
+            "분식",
+            "고기",
+            "요리",
+            "양식",
+            "멕시코",
+            "남미음식",
+            "패밀리레스토랑",
+            "뷔페",
+            "샤브샤브",
+            "해산물",
+        ]
+    ):
         return "restaurant"
     return category_from_text(value)
 
@@ -143,12 +171,20 @@ def _place_query_variants(value: str) -> list[str]:
     raw = (value or "").strip()
     cleaned = _clean_place_query(raw)
     variants: list[str] = []
-    parenthetical_hints = [hint.strip() for hint in re.findall(r"\(([^)]*점)\)", raw) if hint.strip()]
-    if parenthetical_hints and cleaned:
-        for hint in parenthetical_hints:
-            variants.append(f"{cleaned} {hint}")
-            if hint == "명륜점":
-                variants.append(f"{cleaned} 동래명륜점")
+    parsed = parse_place_name(raw)
+    if parsed.is_generic:
+        variants.extend(
+            re.sub(r"\s+", " ", hint).strip()
+            for hint in re.findall(r"\(([^)]{1,80})\)", raw)
+            if re.sub(r"\s+", " ", hint).strip()
+        )
+        identity = generic_parenthetical_place_name(raw)
+        if identity:
+            variants.insert(0, identity)
+    if parsed.branch_name and parsed.base_name:
+        variants.append(parsed.combined_name)
+        if parsed.branch_name == "명륜점":
+            variants.append(f"{parsed.base_name} 동래명륜점")
     variants.extend(_specific_place_aliases(raw))
     variants.extend(_specific_place_aliases(cleaned))
     split_parts: list[str] = []
@@ -191,10 +227,12 @@ def _search_queries(row: NormalizedExpenseRow) -> list[str]:
     for place in place_values:
         if address_values:
             queries.extend(f"{place} {address}" for address in address_values)
-            queries.append(f"{place} 부산")
+            queries.append(place)
+            if not any("부산" in normalize_address(address) for address in address_values):
+                queries.append(f"{place} 부산")
         else:
+            queries.append(place)
             queries.append(f"{place} 부산")
-        queries.append(place)
     queries.extend(address_values)
     seen: set[str] = set()
     deduped: list[str] = []
@@ -206,13 +244,14 @@ def _search_queries(row: NormalizedExpenseRow) -> list[str]:
     return deduped
 
 
-def _place_rank(row: NormalizedExpenseRow, place: PlaceCandidate) -> tuple[float, int, float]:
+def _place_rank(row: NormalizedExpenseRow, place: PlaceCandidate) -> tuple[float, float, int, int]:
     row_address = normalize_address(strip_address_detail(row.address or ""))
     place_address = normalize_address(place.road_address or place.address)
     address_score = similarity(row_address, place_address) if row_address else 0.0
-    busan_bonus = 1 if "부산" in (place.road_address or place.address) else 0
-    name_score = similarity(normalize_text(row.place_name), normalize_text(place.name))
-    return (address_score, busan_bonus, name_score)
+    name_score = name_similarity_with_branch(row.place_name, place.name)
+    food_category = 1 if place.category in FOOD_CATEGORIES else 0
+    busan_tiebreaker = 1 if "부산" in (place.road_address or place.address) else 0
+    return (address_score, name_score, food_category, busan_tiebreaker)
 
 
 @dataclass(frozen=True)
@@ -257,6 +296,7 @@ class NaverSearchLocalClient:
                         road_address=road_address,
                         longitude=longitude,
                         latitude=latitude,
+                        provider_category_raw=str(item.get("category", "")),
                     )
                 )
         places.sort(key=lambda place: _place_rank(row, place), reverse=True)
@@ -639,6 +679,7 @@ class GeocodingNaverClient:
                     road_address=geocoded.get("roadAddress") or place.road_address,
                     longitude=float(x) if x else place.longitude,
                     latitude=float(y) if y else place.latitude,
+                    provider_category_raw=place.provider_category_raw,
                 )
             )
         return refined

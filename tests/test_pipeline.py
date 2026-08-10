@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,25 +12,31 @@ from app.agents import (
     NormalizedExpenseRow,
     PermitSnapshot,
     PlaceCandidate,
+    VerificationDecision,
     VerifierAgent,
     alias_keys_for_place,
     expense_scope_reject_decision,
     non_food_purpose_reason,
+    parse_place_name,
 )
 from app.config import Settings
 from app.database import Database
-from app.integrations import DataGoKrPermitClient, _search_queries
+from app.integrations import DataGoKrPermitClient, _category_from_naver, _place_rank, _search_queries
 from app.pipeline import (
     CachedPermitClient,
     CollectionTarget,
     DailyPipeline,
     RawExpenseRow,
     SourceDocument,
+    advisory_permit_conflict_decision,
+    advisory_permit_resolution_decision,
+    clean_parsed_place_name,
     existing_provider_evidence_decision,
+    split_raw_expense_row_places,
 )
 from app.services import RestaurantService
 from app.source_catalog import iter_source_catalog
-from app.utils import normalized_address_similarity, strip_address_detail, structured_address_match
+from app.utils import normalize_text, normalized_address_similarity, strip_address_detail, structured_address_match
 
 
 class PipelineTests(unittest.TestCase):
@@ -405,6 +412,102 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(remaining, 0)
         self.assertEqual(remaining_parse, 0)
 
+    def test_collection_parse_splits_multiple_place_names_into_verification_candidates(self) -> None:
+        class MultiplePlaceAdapter(PlanningAdapter):
+            def discover_targets(self) -> list[CollectionTarget]:
+                return super().discover_targets()[:1]
+
+            def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
+                return [
+                    RawExpenseRow(
+                        row_number=1,
+                        department_name=document.department_name,
+                        used_date="2026-02-01",
+                        place_name="만객당 외 1, 히얼이즈커피 등",
+                        address="",
+                        purpose="다과 구입",
+                        amount=100000,
+                    )
+                ]
+
+        pipeline = DailyPipeline(self.db, adapter=MultiplePlaceAdapter(), verify_new_rows=False)
+        plan = pipeline.create_collection_plan(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            max_documents=1,
+            batch_size=1,
+        )
+
+        collection = pipeline.run_collection_plan_batch(plan["plan_id"], batch_size=1)
+        parsing = pipeline.parse_collection_plan_batch(plan["plan_id"], batch_size=1)
+
+        with self.db.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT er.place_name, er.amount, er.original_row_json,
+                       c.extraction_reason, c.verification_status, c.review_note
+                FROM expense_records er
+                JOIN restaurant_candidates c ON c.expense_record_id = er.id
+                ORDER BY er.place_name ASC
+                """
+            ).fetchall()
+
+        self.assertEqual(collection["summary"]["rows_inserted"], 0)
+        self.assertEqual(parsing["summary"]["rows_seen"], 2)
+        self.assertEqual(parsing["summary"]["rows_inserted"], 2)
+        self.assertEqual([row["place_name"] for row in rows], ["만객당", "히얼이즈커피"])
+        self.assertEqual([row["amount"] for row in rows], [0, 0])
+        self.assertTrue(all(row["extraction_reason"].endswith(":multi_place_split") for row in rows))
+        self.assertTrue(all(row["verification_status"] == "not_requested" for row in rows))
+        self.assertTrue(all(row["review_note"] == "PENDING_VERIFICATION" for row in rows))
+        original_payloads = [json.loads(row["original_row_json"]) for row in rows]
+        self.assertTrue(
+            all(
+                payload["split_from_place_name"] == "만객당 외 1, 히얼이즈커피 등"
+                for payload in original_payloads
+            )
+        )
+        self.assertEqual(
+            [payload["cleaned_from_place_name"] for payload in original_payloads],
+            ["만객당 외 1", "히얼이즈커피 등"],
+        )
+        self.assertEqual([payload["split_index"] for payload in original_payloads], [1, 2])
+        self.assertTrue(all(payload["split_count"] == 2 for payload in original_payloads))
+        self.assertTrue(all(payload["source_amount"] == 100000 for payload in original_payloads))
+
+    def test_split_place_names_deduplicates_delimited_values(self) -> None:
+        raw_row = RawExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-02-01",
+            place_name="만객당; 만객당，히얼이즈커피",
+            address="",
+            purpose="다과 구입",
+            amount=100000,
+        )
+
+        split_rows = split_raw_expense_row_places(raw_row)
+
+        self.assertEqual([row.place_name for row in split_rows], ["만객당", "히얼이즈커피"])
+        self.assertEqual([row.split_index for row in split_rows], [1, 2])
+        self.assertTrue(all(row.amount == 0 for row in split_rows))
+        self.assertTrue(all(row.source_amount == 100000 for row in split_rows))
+
+    def test_parse_removes_only_trailing_companion_suffixes(self) -> None:
+        cases = {
+            "해운대식당 등": "해운대식당",
+            "해운대식당등": "해운대식당",
+            "해운대식당 외 1": "해운대식당",
+            "해운대식당외1개소": "해운대식당",
+            "해운대식당 외 2곳 등": "해운대식당",
+            "등촌샤브칼국수": "등촌샤브칼국수",
+            "해운대등대횟집": "해운대등대횟집",
+        }
+
+        for original, expected in cases.items():
+            with self.subTest(original=original):
+                self.assertEqual(clean_parsed_place_name(original), expected)
+
     def test_collection_plan_skips_previously_collected_documents(self) -> None:
         adapter = PlanningAdapter()
         pipeline = DailyPipeline(self.db, adapter=adapter, verify_new_rows=False)
@@ -477,6 +580,108 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(first_plan_pending["total"], 0)
         self.assertEqual(second_plan_pending["total"], 1)
         self.assertEqual(second_plan_pending["items"][0]["plan_id"], second_plan["plan_id"])
+
+    def test_collection_plan_skips_same_busan_document_when_cur_page_changes(self) -> None:
+        class PageVariantAdapter(PlanningAdapter):
+            def __init__(self, page: int) -> None:
+                super().__init__()
+                self.page = page
+
+            def discover_targets(self) -> list[CollectionTarget]:
+                return [
+                    CollectionTarget(
+                        source_url=(
+                            "https://www.busan.go.kr/ghopen12/view?"
+                            f"schCommand=Expense&schIndx=21753&curPage={self.page}&"
+                        ),
+                        source_title="2026년 2분기 업무추진비 내역(생활체육과)",
+                        published_at="2026-07-12",
+                        department_name="생활체육과",
+                    )
+                ]
+
+            def extract(self, document: SourceDocument) -> list[RawExpenseRow]:
+                return [
+                    RawExpenseRow(
+                        row_number=1,
+                        department_name="생활체육과",
+                        used_date="2026-06-05",
+                        place_name="중복검증식당",
+                        address="",
+                        purpose="간담회",
+                        amount=30000,
+                    )
+                ]
+
+        first_pipeline = DailyPipeline(
+            self.db,
+            adapter=PageVariantAdapter(1),
+            verify_new_rows=False,
+        )
+        first_plan = first_pipeline.create_collection_plan(
+            "2026-05-05",
+            "2026-08-05",
+        )
+        first_pipeline.run_collection_plan_batch(first_plan["plan_id"])
+        first_pipeline.parse_collection_plan_batch(first_plan["plan_id"])
+
+        second_pipeline = DailyPipeline(
+            self.db,
+            adapter=PageVariantAdapter(6),
+            verify_new_rows=False,
+        )
+        second_plan = second_pipeline.create_collection_plan("2026-05-05", "2026-08-05")
+        duplicate_scope_verification = second_pipeline.verify_collected(
+            limit=10,
+            plan_id=second_plan["plan_id"],
+            start_date="2026-05-05",
+            end_date="2026-08-05",
+        )
+
+        with self.db.session() as conn:
+            planned = conn.execute(
+                """
+                SELECT status, parse_status, raw_document_id
+                FROM collection_plan_documents
+                WHERE plan_id = ?
+                """,
+                (second_plan["plan_id"],),
+            ).fetchone()
+
+        self.assertEqual(second_plan["summary"]["documents_skipped_collected"], 1)
+        self.assertEqual(planned["status"], "duplicate")
+        self.assertEqual(planned["parse_status"], "parsed")
+        self.assertIsNotNone(planned["raw_document_id"])
+        self.assertEqual(duplicate_scope_verification["summary"]["rows_seen"], 0)
+        self.assertEqual(duplicate_scope_verification["summary"]["pending_before"], 0)
+
+    def test_verify_collected_can_limit_to_plan_and_used_date_range(self) -> None:
+        pipeline = DailyPipeline(
+            self.db,
+            adapter=PlanningAdapter(),
+            verifier=VerifierAgent(),
+            verify_new_rows=False,
+        )
+        plan = pipeline.create_collection_plan(
+            start_date="2026-05-05",
+            end_date="2026-08-05",
+            max_pages=1,
+            max_documents=1,
+        )
+        pipeline.run_collection_plan_batch(plan["plan_id"])
+        pipeline.parse_collection_plan_batch(plan["plan_id"])
+
+        scoped = pipeline.verify_collected(
+            limit=10,
+            plan_id=plan["plan_id"],
+            start_date="2026-05-05",
+            end_date="2026-08-05",
+        )
+        unscoped = pipeline.verify_collected(limit=10, plan_id=plan["plan_id"])
+
+        self.assertEqual(scoped["summary"]["rows_seen"], 0)
+        self.assertEqual(scoped["summary"]["pending_before"], 0)
+        self.assertEqual(unscoped["summary"]["rows_seen"], 1)
 
     def test_parse_failed_document_is_not_treated_as_completed_duplicate(self) -> None:
         adapter = FailingParsePlanningAdapter()
@@ -945,6 +1150,221 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(verification["verification_status"], "success")
         self.assertIn("PERMIT_ADVISORY_NOT_ACTIVE", verification["verification_reason"])
 
+    def test_active_permit_address_resolves_one_matching_food_candidate(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="공원도시과",
+            used_date="2026-04-21",
+            place_name="메이리",
+            address="",
+            purpose="관계기관 간담회 개최",
+            amount=100000,
+            normalized_place_name="메이리",
+            normalized_address="",
+        )
+        decision = VerificationDecision(
+            decision="needs_review",
+            confidence=0.58,
+            approved_by="ai",
+            selected_candidate=None,
+            category="restaurant",
+            reason_codes=["AI_BOUNDARY_SCORE", "PERMIT_ADVISORY_ACTIVE_FOOD"],
+            evidence={
+                "candidate_evidence": [
+                    {
+                        "provider_place_id": "matching",
+                        "name": "메이리 대한민국 조리기능장의집",
+                        "category": "restaurant",
+                        "address": "부산광역시 연제구 연산동 579-64",
+                        "road_address": "부산광역시 연제구 거제시장로 3",
+                        "longitude": 129.08,
+                        "latitude": 35.18,
+                    },
+                    {
+                        "provider_place_id": "different",
+                        "name": "메이리연 대한민국 조리기능장의집",
+                        "category": "restaurant",
+                        "address": "부산광역시 연제구 거제동 1",
+                        "road_address": "부산광역시 연제구 거제천로 93",
+                        "longitude": 129.07,
+                        "latitude": 35.19,
+                    },
+                ]
+            },
+        )
+        permit = PermitSnapshot(
+            permit_id="permit-meiri",
+            category="restaurant",
+            business_status="active",
+            address="부산광역시 연제구 거제시장로 3, 1,2층",
+        )
+
+        resolved = advisory_permit_resolution_decision(row, decision, permit)
+
+        self.assertEqual(resolved.decision, "approved")
+        self.assertEqual(resolved.selected_candidate.provider_place_id, "matching")
+        self.assertIn("PERMIT_ADVISORY_ACTIVE_ADDRESS_MATCH", resolved.reason_codes)
+
+    def test_active_permit_requires_same_structured_address_not_similar_district(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="도미노피자",
+            address="",
+            purpose="노고 격려 간식 구입",
+            amount=100000,
+            normalized_place_name="도미노피자",
+            normalized_address="",
+        )
+        candidate = PlaceCandidate(
+            provider_place_id="domino-busandae",
+            name="도미노피자 부산대점",
+            category="restaurant",
+            address="부산광역시 금정구 금정로 54",
+            road_address="부산광역시 금정구 금정로 54",
+            longitude=129.08,
+            latitude=35.23,
+        )
+        decision = VerificationDecision(
+            decision="needs_review",
+            confidence=0.8,
+            approved_by="rule",
+            selected_candidate=candidate,
+            category="restaurant",
+            reason_codes=["ADDRESSLESS_TOO_MANY_MATCHES"],
+            evidence={
+                "candidate_evidence": [
+                    {
+                        "provider_place_id": candidate.provider_place_id,
+                        "name": candidate.name,
+                        "category": candidate.category,
+                        "address": candidate.address,
+                        "road_address": candidate.road_address,
+                        "longitude": candidate.longitude,
+                        "latitude": candidate.latitude,
+                    }
+                ]
+            },
+        )
+        permit = PermitSnapshot(
+            permit_id="permit-domino-different-road",
+            category="restaurant",
+            business_status="active",
+            address="부산광역시 금정구 금샘로 377",
+        )
+
+        resolved = advisory_permit_resolution_decision(row, decision, permit)
+
+        self.assertEqual(resolved.decision, "needs_review")
+
+    def test_active_permit_matching_alternative_downgrades_unique_exact_approval(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="꽃다림",
+            address="",
+            purpose="만찬 간담회",
+            amount=100000,
+            normalized_place_name="꽃다림",
+            normalized_address="",
+        )
+        candidates = [
+            PlaceCandidate(
+                provider_place_id="exact",
+                name="꽃다림",
+                category="restaurant",
+                address="부산광역시 동래구 중앙대로1367번길 26",
+                road_address="부산광역시 동래구 중앙대로1367번길 26",
+                longitude=129.08,
+                latitude=35.2,
+            ),
+            PlaceCandidate(
+                provider_place_id="permit-match",
+                name="꽃다림 국밥전문점",
+                category="restaurant",
+                address="부산광역시 해운대구 반송로 812",
+                road_address="부산광역시 해운대구 반송로 812",
+                longitude=129.15,
+                latitude=35.23,
+            ),
+        ]
+        approved = VerifierAgent(
+            type("StaticNaver", (), {"search_local": lambda self, ignored: candidates})(),
+            EmptyPermitClient(),
+        ).verify(row)
+        permit = PermitSnapshot(
+            permit_id="permit-flower",
+            category="restaurant",
+            business_status="active",
+            address="부산광역시 해운대구 반송로 812, 1층",
+        )
+
+        resolved = advisory_permit_conflict_decision(row, approved, permit)
+        permit_selected = advisory_permit_resolution_decision(row, resolved, permit)
+
+        self.assertEqual(approved.decision, "approved")
+        self.assertEqual(resolved.decision, "needs_review")
+        self.assertIn("PERMIT_ADVISORY_CONFLICTING_CANDIDATE", resolved.reason_codes)
+        self.assertEqual(permit_selected.decision, "approved")
+        self.assertEqual(permit_selected.selected_candidate.provider_place_id, "permit-match")
+
+    def test_active_permit_address_can_trigger_one_enriched_naver_search(self) -> None:
+        class PermitAddressNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                if not row.address:
+                    return []
+                return [
+                    PlaceCandidate(
+                        provider_place_id="naver-permit-address",
+                        name="제일옥곰탕",
+                        category="restaurant",
+                        address="부산광역시 연제구 연산동 1",
+                        road_address="부산광역시 연제구 진연로 30-9",
+                        longitude=129.09,
+                        latitude=35.18,
+                    )
+                ]
+
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="맑은물정책과",
+            used_date="2026-05-22",
+            place_name="제일옥곰탕",
+            address="",
+            purpose="수질개선 관련 간담회 개최",
+            amount=100000,
+            normalized_place_name="제일옥곰탕",
+            normalized_address="",
+        )
+        decision = VerificationDecision(
+            decision="needs_review",
+            confidence=0.5,
+            approved_by="ai",
+            selected_candidate=None,
+            category="restaurant",
+            reason_codes=["AI_NO_MAP_CANDIDATE", "PERMIT_ADVISORY_ACTIVE_FOOD"],
+            evidence={"candidate_evidence": []},
+        )
+        permit = PermitSnapshot(
+            permit_id="permit-jeilok",
+            category="restaurant",
+            business_status="active",
+            address="부산광역시 연제구 진연로 30-9, 1층",
+        )
+        pipeline = DailyPipeline(
+            self.db,
+            verifier=VerifierAgent(PermitAddressNaverClient(), EmptyPermitClient()),
+        )
+
+        with self.db.session() as conn:
+            resolved = pipeline._resolve_with_permit_address(conn, row, decision, permit)
+
+        self.assertEqual(resolved.decision, "approved")
+        self.assertEqual(resolved.selected_candidate.name, "제일옥곰탕")
+        self.assertIn("PERMIT_ADVISORY_ADDRESS_ENRICHED", resolved.reason_codes)
+
     def test_generic_addressless_naver_candidate_stays_manual_review(self) -> None:
         result = DailyPipeline(
             self.db,
@@ -1237,7 +1657,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsNone(decision)
 
-    def test_branch_hint_match_can_auto_approve_permit_and_naver_food_candidate(self) -> None:
+    def test_branch_hint_with_unspecified_companion_stays_manual(self) -> None:
         verifier = VerifierAgent(BranchNaverClient(), BranchPermitClient())
 
         decision = verifier.verify(
@@ -1254,11 +1674,11 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "approved")
-        self.assertIn("PERMIT_ACTIVE", decision.reason_codes)
-        self.assertGreaterEqual(decision.evidence["name_similarity"], 0.78)
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
+        self.assertEqual(len(decision.evidence["candidate_evidence"]), 1)
 
-    def test_addressless_strong_naver_branch_match_can_approve_without_permit(self) -> None:
+    def test_addressless_strong_naver_branch_with_companion_stays_manual(self) -> None:
         verifier = VerifierAgent(BranchNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1275,8 +1695,8 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "approved")
-        self.assertIn("NAVER_HIGH_CONFIDENCE_ADDRESSLESS", decision.reason_codes)
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
 
     def test_short_exact_addressless_food_name_ignores_conflicting_active_permit(self) -> None:
         verifier = VerifierAgent(ShortExactNaverClient(), OutOfRegionActivePermitClient())
@@ -1421,7 +1841,39 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["NAVER_OTHER_CATEGORY"])
 
-    def test_brand_and_companion_suffix_can_auto_approve_addressless_candidate(self) -> None:
+    def test_hotel_other_category_stays_manual_for_banquet_or_lodging_ambiguity(self) -> None:
+        class HotelNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id="lotte-hotel-busan",
+                        name="롯데호텔 부산",
+                        category="other",
+                        address="부산광역시 부산진구 부전동 503-15",
+                        road_address="부산광역시 부산진구 가야대로 772",
+                        longitude=129.055,
+                        latitude=35.156,
+                    )
+                ]
+
+        decision = VerifierAgent(HotelNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="㈜부산롯데호텔",
+                address="",
+                purpose="행사 운영",
+                amount=1200000,
+                normalized_place_name="㈜부산롯데호텔",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["NAVER_OTHER_AMBIGUOUS_VENUE"])
+
+    def test_brand_and_companion_suffix_stays_manual_without_companion_identity(self) -> None:
         verifier = VerifierAgent(EdiyaNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1438,9 +1890,8 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "approved")
-        self.assertIn("PERMIT_MISSING_ALLOWED", decision.reason_codes)
-        self.assertGreaterEqual(decision.evidence["name_similarity"], 0.9)
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
 
     def test_short_base_name_with_branch_suffix_can_auto_approve_addressless_candidate(self) -> None:
         verifier = VerifierAgent(BaseSuffixNaverClient(), EmptyPermitClient())
@@ -1524,7 +1975,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decision.decision, "needs_review")
         self.assertLess(decision.evidence["name_similarity"], 0.7)
 
-    def test_addressless_fuzzy_name_does_not_auto_approve_non_busan_candidate(self) -> None:
+    def test_addressless_exact_branch_can_auto_approve_non_busan_candidate(self) -> None:
         verifier = VerifierAgent(NonBusanFuzzyNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1541,7 +1992,139 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_EXACT_ADDRESSLESS", decision.reason_codes)
+        self.assertIn("PROVIDER_ADDRESS_AVAILABLE", decision.reason_codes)
+
+    def test_addressless_duplicate_exact_names_stay_manual_review(self) -> None:
+        class DuplicateExactNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id="first",
+                        name="송이네밥상",
+                        category="restaurant",
+                        address="서울특별시 도봉구 방학로2길 12",
+                        road_address="서울특별시 도봉구 방학로2길 12",
+                        longitude=127.0,
+                        latitude=37.6,
+                    ),
+                    PlaceCandidate(
+                        provider_place_id="second",
+                        name="송이네밥상",
+                        category="restaurant",
+                        address="경상북도 문경시 문경읍 새재로 660",
+                        road_address="경상북도 문경시 문경읍 새재로 660",
+                        longitude=128.1,
+                        latitude=36.7,
+                    ),
+                ]
+
+        decision = VerifierAgent(DuplicateExactNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="송이네밥상",
+                address="",
+                purpose="오찬 간담회",
+                amount=120000,
+                normalized_place_name="송이네밥상",
+                normalized_address="",
+            )
+        )
+
         self.assertEqual(decision.decision, "needs_review")
+
+    def test_addressless_three_exact_names_stay_selectable_for_manual_review(self) -> None:
+        class ThreeExactNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id=f"place-{index}",
+                        name="송이네밥상",
+                        category="restaurant",
+                        address=address,
+                        road_address=address,
+                        longitude=127.0 + index,
+                        latitude=35.0 + index,
+                    )
+                    for index, address in enumerate(
+                        [
+                            "서울특별시 도봉구 방학로2길 12",
+                            "경상북도 문경시 문경읍 새재로 660",
+                            "전라남도 여수시 중앙로 10",
+                        ]
+                    )
+                ]
+
+        decision = VerifierAgent(ThreeExactNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="송이네밥상",
+                address="",
+                purpose="오찬 간담회",
+                amount=120000,
+                normalized_place_name="송이네밥상",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["ADDRESSLESS_TOO_MANY_MATCHES"])
+        self.assertEqual(decision.selected_candidate.name, "송이네밥상")
+        self.assertEqual(len(decision.evidence["candidate_evidence"]), 3)
+        self.assertEqual(
+            {item["provider_place_id"] for item in decision.evidence["candidate_evidence"]},
+            {"place-0", "place-1", "place-2"},
+        )
+
+    def test_unique_exact_name_auto_approves_despite_multiple_fuzzy_candidates(self) -> None:
+        class ExactAmongFuzzyNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                names = ["해운대바다정식당", "해운대바다정식당A", "해운대바다정식당B"]
+                return [
+                    PlaceCandidate(
+                        provider_place_id=f"fuzzy-{index}",
+                        name=name,
+                        category="restaurant",
+                        address=address,
+                        road_address=address,
+                        longitude=129.1 + index * 0.01,
+                        latitude=35.1 + index * 0.01,
+                    )
+                    for index, (name, address) in enumerate(
+                        zip(
+                            names,
+                            [
+                                "부산광역시 해운대구 해운대로 1",
+                                "부산광역시 수영구 광안해변로 2",
+                                "부산광역시 동구 중앙대로 3",
+                            ],
+                            strict=True,
+                        )
+                    )
+                ]
+
+        decision = VerifierAgent(ExactAmongFuzzyNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="해운대바다정식당",
+                address="",
+                purpose="업무협의 오찬",
+                amount=120000,
+                normalized_place_name="해운대바다정식당",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertEqual(decision.selected_candidate.name, "해운대바다정식당")
+        self.assertIn("NAVER_UNIQUE_EXACT_AMONG_MULTIPLE", decision.reason_codes)
 
     def test_addressless_fuzzy_name_does_not_override_closed_same_address_permit(self) -> None:
         verifier = VerifierAgent(YeyijeNaverClient(), ClosedYeyijePermitClient())
@@ -1563,8 +2146,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decision.decision, "needs_review")
         self.assertEqual(decision.reason_codes, ["PERMIT_NOT_ACTIVE_ADDRESSLESS"])
 
-    def test_famous_franchise_addressless_without_branch_auto_rejects_before_api(self) -> None:
-        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+    def test_famous_franchise_addressless_without_branch_stays_selectable(self) -> None:
+        verifier = VerifierAgent(StarbucksNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
             NormalizedExpenseRow(
@@ -1580,12 +2163,14 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "rejected")
-        self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
         self.assertEqual(decision.category, "cafe")
+        self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
+        self.assertEqual(len(decision.evidence["candidate_evidence"]), 1)
 
-    def test_vips_addressless_without_branch_auto_rejects_before_api(self) -> None:
-        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+    def test_vips_addressless_without_branch_without_result_stays_manual(self) -> None:
+        verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
             NormalizedExpenseRow(
@@ -1601,9 +2186,10 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.decision, "needs_review")
         self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
         self.assertEqual(decision.category, "restaurant")
+        self.assertIsNone(decision.selected_candidate)
 
     def test_famous_franchise_with_branch_continues_and_can_approve(self) -> None:
         verifier = VerifierAgent(StarbucksNaverClient(), EmptyPermitClient())
@@ -1647,8 +2233,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("NAVER_FRANCHISE_ADDRESS_MATCH", decision.reason_codes)
         self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
 
-    def test_manual_feedback_legal_entity_without_store_info_auto_rejects_before_api(self) -> None:
-        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+    def test_legal_entity_without_search_result_stays_manual_review(self) -> None:
+        verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
             NormalizedExpenseRow(
@@ -1664,8 +2250,8 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "rejected")
-        self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_LEGAL_ENTITY_INSUFFICIENT_INFO"])
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["AI_NO_MAP_CANDIDATE"])
 
     def test_payment_processor_place_name_auto_rejects_before_api(self) -> None:
         verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
@@ -1706,6 +2292,31 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_CLOSED_OR_NOT_OPERATING"])
+
+    def test_manual_feedback_non_restaurant_organization_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        for place_name in ("연제지역자활센터", "연제지역자할센터"):
+            with self.subTest(place_name=place_name):
+                decision = verifier.verify(
+                    NormalizedExpenseRow(
+                        row_number=1,
+                        department_name="총무과",
+                        used_date="2026-06-26",
+                        place_name=place_name,
+                        address="",
+                        purpose="여성정책분야 추진방향 논의 간담회 개최",
+                        amount=0,
+                        normalized_place_name=place_name,
+                        normalized_address="",
+                    )
+                )
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(
+                    decision.reason_codes,
+                    ["MANUAL_FEEDBACK_NON_RESTAURANT_ORGANIZATION"],
+                )
 
     def test_unknown_place_address_mismatch_auto_rejects(self) -> None:
         verifier = VerifierAgent(UnknownMismatchNaverClient(), EmptyPermitClient())
@@ -1760,6 +2371,84 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(decision.reason_codes, [expected_reason])
                 self.assertEqual(expense_scope_reject_decision(row), decision)
 
+    def test_scope_rejects_retail_and_multiple_place_names(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+        cases = {
+            "공무원매점": "NON_RESTAURANT_RETAIL_PLACE_NAME",
+            "만객당, 히얼이즈커피": "MULTIPLE_PLACE_NAMES_UNSUPPORTED",
+        }
+        for place_name, expected_reason in cases.items():
+            with self.subTest(place_name=place_name):
+                row = NormalizedExpenseRow(
+                    row_number=1,
+                    department_name="공원도시과",
+                    used_date="2026-05-12",
+                    place_name=place_name,
+                    address="",
+                    purpose="다과 구입",
+                    amount=100000,
+                    normalized_place_name=normalize_text(place_name),
+                    normalized_address="",
+                )
+
+                decision = verifier.verify(row)
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(decision.reason_codes, [expected_reason])
+
+    def test_addressless_legal_entity_without_storefront_info_is_searched(self) -> None:
+        verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-05-12",
+                place_name="주식회사 별무리애프앤비",
+                address="",
+                purpose="업무협의 간담회",
+                amount=100000,
+                normalized_place_name="주식회사 별무리애프앤비",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.reason_codes, ["AI_NO_MAP_CANDIDATE"])
+
+    def test_addressless_legal_entity_can_approve_exact_food_place(self) -> None:
+        class LegalRestaurantNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id="ireok-1",
+                        name="이레옥",
+                        category="restaurant",
+                        address="부산광역시 해운대구 마린시티3로 51",
+                        road_address="부산광역시 해운대구 마린시티3로 51",
+                        longitude=129.143,
+                        latitude=35.157,
+                    )
+                ]
+
+        decision = VerifierAgent(LegalRestaurantNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-05-12",
+                place_name="주식회사 이레옥",
+                address="",
+                purpose="업무협의 오찬",
+                amount=100000,
+                normalized_place_name="주식회사 이레옥",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertEqual(decision.selected_candidate.name, "이레옥")
+        self.assertIn("NAVER_EXACT_ADDRESSLESS", decision.reason_codes)
+
     def test_naver_search_queries_strip_companion_suffix(self) -> None:
         row = NormalizedExpenseRow(
             row_number=1,
@@ -1773,7 +2462,7 @@ class PipelineTests(unittest.TestCase):
             normalized_address="",
         )
 
-        self.assertEqual(_search_queries(row)[:2], ["19버거테이블 부산", "19버거테이블"])
+        self.assertEqual(_search_queries(row)[:2], ["19버거테이블", "19버거테이블 부산"])
 
     def test_naver_search_queries_preserve_parenthetical_branch_hint(self) -> None:
         row = NormalizedExpenseRow(
@@ -1790,7 +2479,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(
             _search_queries(row)[:3],
-            ["대박통 명륜점 부산", "대박통 명륜점", "대박통 동래명륜점 부산"],
+            ["대박통 명륜점", "대박통 명륜점 부산", "대박통 동래명륜점"],
         )
 
     def test_naver_search_queries_try_cleaned_address_before_raw_address(self) -> None:
@@ -1809,7 +2498,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(_search_queries(row)[:3], [
             "토곡정 부산광역시 연제구 토곡로 7",
             "토곡정 부산광역시 연제구 토곡로 7 1층",
-            "토곡정 부산",
+            "토곡정",
         ])
 
     def test_naver_search_queries_expand_manual_review_aliases(self) -> None:
@@ -1848,7 +2537,139 @@ class PipelineTests(unittest.TestCase):
             normalized_address="",
         )
 
-        self.assertEqual(_search_queries(row)[:2], ["카페가온비 부산", "카페가온비"])
+        self.assertEqual(_search_queries(row)[:2], ["카페가온비", "카페가온비 부산"])
+
+    def test_parenthetical_branch_is_preserved_for_matching(self) -> None:
+        parsed = parse_place_name("온더보더 (광화문D타워점)")
+
+        self.assertEqual(parsed.base_name, "온더보더")
+        self.assertEqual(parsed.branch_name, "광화문D타워점")
+        self.assertEqual(parsed.combined_name, "온더보더 광화문D타워점")
+        self.assertIn("온더보더 광화문d타워점", alias_keys_for_place(parsed.original))
+
+    def test_generic_name_with_parenthetical_branch_is_identified(self) -> None:
+        parsed = parse_place_name("음식점 (광화문점)")
+
+        self.assertTrue(parsed.is_generic)
+        self.assertEqual(parsed.branch_name, "광화문점")
+
+    def test_generic_name_searches_parenthetical_merchant_before_generic_label(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="음식점 (온더보더 광화문D타워점)",
+            address="",
+            purpose="오찬 간담회",
+            amount=83000,
+            normalized_place_name="음식점 (온더보더 광화문d타워점)",
+            normalized_address="",
+        )
+
+        self.assertEqual(
+            _search_queries(row)[:2],
+            ["온더보더 광화문D타워점", "온더보더 광화문D타워점 부산"],
+        )
+
+    def test_generic_parenthetical_full_merchant_can_auto_approve_exact_match(self) -> None:
+        class ParentheticalMerchantNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id="ontheborder-gwanghwamun",
+                        name="온더보더 광화문D타워점",
+                        category="restaurant",
+                        address="서울특별시 종로구 청진동 246",
+                        road_address="서울특별시 종로구 종로3길 17",
+                        longitude=126.978,
+                        latitude=37.571,
+                    )
+                ]
+
+        decision = VerifierAgent(ParentheticalMerchantNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="음식점 (온더보더 광화문D타워점)",
+                address="",
+                purpose="오찬 간담회",
+                amount=83000,
+                normalized_place_name="음식점 (온더보더 광화문d타워점)",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "approved")
+        self.assertIn("NAVER_EXACT_ADDRESSLESS", decision.reason_codes)
+
+    def test_generic_parenthetical_branch_only_does_not_auto_approve(self) -> None:
+        class BranchOnlyNaverClient:
+            def search_local(self, row: NormalizedExpenseRow) -> list[PlaceCandidate]:
+                return [
+                    PlaceCandidate(
+                        provider_place_id="branch-only",
+                        name="광화문점",
+                        category="restaurant",
+                        address="서울특별시 종로구 종로3길 17",
+                        road_address="서울특별시 종로구 종로3길 17",
+                        longitude=126.978,
+                        latitude=37.571,
+                    )
+                ]
+
+        decision = VerifierAgent(BranchOnlyNaverClient(), EmptyPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-05",
+                place_name="음식점 (광화문점)",
+                address="",
+                purpose="오찬 간담회",
+                amount=83000,
+                normalized_place_name="음식점 (광화문점)",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "needs_review")
+
+    def test_naver_food_taxonomy_maps_mexican_and_family_restaurant(self) -> None:
+        self.assertEqual(_category_from_naver("멕시코,남미음식"), "restaurant")
+        self.assertEqual(_category_from_naver("음식점>양식>패밀리레스토랑"), "restaurant")
+
+    def test_naver_rank_prefers_exact_non_busan_name_over_unrelated_busan_place(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-04-10",
+            place_name="온더보더 광화문D타워점",
+            address="",
+            purpose="오찬 간담회",
+            amount=83000,
+            normalized_place_name="온더보더 광화문d타워점",
+            normalized_address="",
+        )
+        exact = PlaceCandidate(
+            provider_place_id="exact",
+            name="온더보더 광화문D타워점",
+            category="restaurant",
+            address="서울특별시 종로구 청진동 246",
+            road_address="서울특별시 종로구 종로3길 17",
+            longitude=126.978,
+            latitude=37.571,
+        )
+        unrelated = PlaceCandidate(
+            provider_place_id="unrelated",
+            name="부산문화카페",
+            category="cafe",
+            address="부산광역시 연제구 중앙대로 1001",
+            road_address="부산광역시 연제구 중앙대로 1001",
+            longitude=129.075,
+            latitude=35.18,
+        )
+
+        self.assertGreater(_place_rank(row, exact), _place_rank(row, unrelated))
 
     def test_alias_keys_strip_generic_cafe_prefix(self) -> None:
         self.assertIn("가온비", alias_keys_for_place("카페 가온비"))

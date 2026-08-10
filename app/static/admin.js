@@ -21,6 +21,7 @@ const candidateOpen = {
 };
 let candidateSearch = "";
 let candidateSort = "id_desc";
+const candidateActionMessages = new Map();
 let currentCollectionPlanId = null;
 let collectionProgressData = {
   by_institution: [],
@@ -71,6 +72,25 @@ function candidateStatusLabel(status) {
   }[status] || status;
 }
 
+function candidateActionMessage(candidateId) {
+  return candidateActionMessages.get(String(candidateId)) || null;
+}
+
+function setCandidateActionMessage(candidateId, message, status = "success") {
+  candidateActionMessages.set(String(candidateId), { message, status });
+}
+
+function geocodingResultMessage(result = {}) {
+  const status = result.status || "unknown";
+  if (status === "success") {
+    return `지오코딩 성공 · ${result.road_address || result.query || "주소 확인 완료"}`;
+  }
+  if (status === "not_found") return `지오코딩 결과 없음 · ${result.query || "입력 주소 확인 필요"}`;
+  if (status === "skipped") return `지오코딩 생략 · ${result.reason || "실행 조건 미충족"}`;
+  if (status === "failed") return `지오코딩 실패 · ${result.reason || "외부 API 오류"}`;
+  return `지오코딩 상태 확인 필요 · ${status}`;
+}
+
 function providerCandidateList(item) {
   const candidates = item.provider_candidates || [];
   if (!candidates.length) return "";
@@ -91,8 +111,11 @@ function providerCandidateList(item) {
             <small>보정 상호명/주소를 네이버 후보로 덮어쓰지 않음</small>
           </span>
         </label>
-        ${candidates.map((candidate) => `
-          <label class="${candidate.is_approvable ? "" : "disabled"}">
+        ${candidates.map((candidate) => {
+          const isSelectable = candidate.is_approvable || candidate.can_admin_override;
+          const requiresOverride = !candidate.is_approvable && candidate.can_admin_override;
+          return `
+          <label class="${isSelectable ? (requiresOverride ? "category-override" : "") : "disabled"}">
             <input
               type="radio"
               name="provider-${groupId}"
@@ -100,7 +123,8 @@ function providerCandidateList(item) {
               data-provider-name="${escapeHtml(candidate.provider_place_name)}"
               data-provider-address="${escapeHtml(candidate.provider_road_address || candidate.provider_address || "")}"
               data-provider-category="${escapeHtml(candidate.provider_category || "other")}"
-              ${candidate.is_approvable ? "" : "disabled"}
+              data-requires-category-override="${requiresOverride ? "true" : "false"}"
+              ${isSelectable ? "" : "disabled"}
             >
             <span>
               ${escapeHtml(candidate.provider_place_name)}
@@ -108,9 +132,11 @@ function providerCandidateList(item) {
               · 이름 ${(Number(candidate.name_similarity || 0) * 100).toFixed(0)}%
               · 주소 ${(Number(candidate.address_similarity || 0) * 100).toFixed(0)}%
               <small>${escapeHtml(candidate.provider_road_address || candidate.provider_address || "")}</small>
+              ${requiresOverride ? "<small class=\"category-override-note\">네이버 분류가 기타입니다. 보정 분류를 확인한 뒤 범주 예외로 승인됩니다.</small>" : ""}
             </span>
           </label>
-        `).join("")}
+        `;
+        }).join("")}
       </div>
     </div>
   `;
@@ -123,6 +149,7 @@ function candidateDbEditor(item) {
   const effectiveCategory = item.effective_major_category || item.place_major_category || "other";
   const originalName = item.original_place_name || "";
   const originalAddress = item.original_address || "원문 주소 없음";
+  const actionMessage = candidateActionMessage(item.candidate_id);
   return `
     <div class="candidate-db-row candidate-sheet" data-candidate-id="${item.candidate_id}">
       <div class="candidate-db-meta">
@@ -203,8 +230,10 @@ function candidateDbEditor(item) {
         <span>검토 의견</span>
         <input data-db-field="reviewer_note" value="${escapeHtml(item.review_note || "")}" placeholder="검토 의견" ${isVerified ? "disabled" : ""}>
       </label>
-      <button class="cell-action secondary" type="button" data-action="geocode-candidate" data-id="${item.candidate_id}">지오코딩</button>
-      <button class="cell-action" type="button" data-action="update-candidate" data-id="${item.candidate_id}">DB 업데이트</button>
+      <button class="cell-action secondary" type="button" data-action="refresh-candidate" data-id="${item.candidate_id}">네이버 후보 다시 검색</button>
+      <button class="cell-action secondary" type="button" data-action="geocode-candidate" data-id="${item.candidate_id}">주소 지오코딩</button>
+      <button class="cell-action" type="button" data-action="update-candidate" data-id="${item.candidate_id}">저장·상태 적용</button>
+      ${actionMessage ? `<p class="candidate-action-result ${escapeHtml(actionMessage.status)}">${escapeHtml(actionMessage.message)}</p>` : ""}
     </div>
   `;
 }
@@ -221,6 +250,7 @@ function candidateEditorPayload(editor) {
     rejection_reason: editor.querySelector("[data-db-field='rejection_reason']")?.value || "manual_reject",
     reviewer_note: editor.querySelector("[data-db-field='reviewer_note']")?.value || "",
     selected_verification_id: selectedProvider?.value || "",
+    allow_category_override: selectedProvider?.dataset.requiresCategoryOverride === "true",
   };
 }
 
@@ -233,7 +263,9 @@ function applyProviderCandidateToEditor(input) {
   const category = editor.querySelector("[data-db-field='review_major_category']");
   if (name) name.value = input.dataset.providerName || "";
   if (address) address.value = input.dataset.providerAddress || "";
-  if (category) category.value = input.dataset.providerCategory || "other";
+  if (category && input.dataset.requiresCategoryOverride !== "true") {
+    category.value = input.dataset.providerCategory || "other";
+  }
 }
 
 function useDirectInputForEditor(editor) {
@@ -389,7 +421,7 @@ async function loadReviewQueue() {
               </div>
               ${item.provider_place_name ? `
                 <p class="candidate-evidence">
-                  최신 후보: ${escapeHtml(item.provider_place_name)}
+                  추천 후보: ${escapeHtml(item.provider_place_name)}
                   · ${escapeHtml(item.provider_category)}
                   · 이름 ${(Number(item.name_similarity || 0) * 100).toFixed(0)}%
                   · 주소 ${(Number(item.address_similarity || 0) * 100).toFixed(0)}%
@@ -479,10 +511,35 @@ async function loadReviewQueue() {
       if (button.dataset.action === "update-candidate") {
         const id = button.dataset.id;
         const editor = item.querySelector(".candidate-db-row");
-        await fetchJson(`/admin/candidates/${id}`, {
-          method: "POST",
-          body: JSON.stringify(candidateEditorPayload(editor)),
-        });
+        try {
+          await fetchJson(`/admin/candidates/${id}`, {
+            method: "POST",
+            body: JSON.stringify(candidateEditorPayload(editor)),
+          });
+          setCandidateActionMessage(id, "보정값과 검토 상태를 저장했습니다.");
+        } catch (error) {
+          setCandidateActionMessage(id, `저장 실패 · ${error.message}`, "failed");
+        }
+        await loadReviewQueue();
+        await loadVerificationStatus();
+        return;
+      }
+      if (button.dataset.action === "refresh-candidate") {
+        const id = button.dataset.id;
+        const editor = item.querySelector(".candidate-db-row");
+        try {
+          const response = await fetchJson(`/admin/candidates/${id}/refresh`, {
+            method: "POST",
+            body: JSON.stringify(candidateEditorPayload(editor)),
+          });
+          const refresh = response.provider_refresh || {};
+          const message = refresh.status === "success"
+            ? `네이버 후보 검색 완료 · ${Number(refresh.stored || 0)}건 저장`
+            : `네이버 후보 검색 미완료 · ${refresh.reason || refresh.status || "상태 미상"}`;
+          setCandidateActionMessage(id, message, refresh.status === "success" ? "success" : "failed");
+        } catch (error) {
+          setCandidateActionMessage(id, `네이버 후보 검색 실패 · ${error.message}`, "failed");
+        }
         await loadReviewQueue();
         await loadVerificationStatus();
         return;
@@ -490,10 +547,24 @@ async function loadReviewQueue() {
       if (button.dataset.action === "geocode-candidate") {
         const id = button.dataset.id;
         const editor = item.querySelector(".candidate-db-row");
-        await fetchJson(`/admin/candidates/${id}/geocode`, {
-          method: "POST",
-          body: JSON.stringify(candidateEditorPayload(editor)),
-        });
+        try {
+          const response = await fetchJson(`/admin/candidates/${id}/geocode`, {
+            method: "POST",
+            body: JSON.stringify(candidateEditorPayload(editor)),
+          });
+          const geocoding = response.geocoding || {};
+          const refresh = response.provider_refresh || {};
+          const refreshSuffix = refresh.status === "success"
+            ? ` · 네이버 후보 ${Number(refresh.stored || 0)}건 갱신`
+            : "";
+          setCandidateActionMessage(
+            id,
+            `${geocodingResultMessage(geocoding)}${refreshSuffix}`,
+            geocoding.status === "success" ? "success" : "failed",
+          );
+        } catch (error) {
+          setCandidateActionMessage(id, `지오코딩 실패 · ${error.message}`, "failed");
+        }
         await loadReviewQueue();
         await loadVerificationStatus();
         return;

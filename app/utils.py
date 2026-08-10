@@ -69,6 +69,8 @@ def address_match_keys(value: str | None) -> set[str]:
         sub_number = road_match.group(3) or ""
         keys.add(f"road:{region}:{road}:{main_number}:{sub_number}")
         keys.add(f"road::{road}:{main_number}:{sub_number}")
+        keys.add(f"road:{region}:{road}:{main_number}")
+        keys.add(f"road::{road}:{main_number}")
     lot_match = re.search(r"([0-9a-z가-힣]+(?:동|읍|면|리))\s+(\d+)(?:\s+(\d+))?", normalized)
     if lot_match:
         dong = lot_match.group(1)
@@ -76,6 +78,8 @@ def address_match_keys(value: str | None) -> set[str]:
         sub_number = lot_match.group(3) or ""
         keys.add(f"lot:{region}:{dong}:{main_number}:{sub_number}")
         keys.add(f"lot::{dong}:{main_number}:{sub_number}")
+        keys.add(f"lot:{region}:{dong}:{main_number}")
+        keys.add(f"lot::{dong}:{main_number}")
     postal_match = re.search(r"(?<!\d)(\d{5})(?!\d)", normalized)
     if postal_match:
         keys.add(f"postal:{postal_match.group(1)}")
