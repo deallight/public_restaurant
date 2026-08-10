@@ -6,6 +6,14 @@ import re
 VERSION = "0001"
 DESCRIPTION = "application-compatible baseline"
 
+MIGRATION_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS app_schema_migrations (
+  version TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+""".strip()
+
 POSTGRES_INFORMATION_SCHEMA_TYPES = {
     "BIGSERIAL": "bigint",
     "BIGINT": "bigint",
@@ -37,15 +45,7 @@ def statements(sqlite_schema: str, dependency_drop_order: list[str]) -> list[str
         if name in table_statements
     ]
     ddl.extend(other_statements)
-    ddl.append(
-        """
-        CREATE TABLE IF NOT EXISTS app_schema_migrations (
-          version TEXT PRIMARY KEY,
-          description TEXT NOT NULL,
-          applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """.strip()
-    )
+    ddl.append(MIGRATION_TABLE_STATEMENT)
     return ddl
 
 
