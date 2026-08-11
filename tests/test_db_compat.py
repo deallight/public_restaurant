@@ -125,9 +125,9 @@ class DatabaseCompatibilityTests(unittest.TestCase):
 
     def test_database_rejects_non_postgres_targets(self) -> None:
         with self.assertRaisesRegex(ValueError, "PostgreSQL"):
-            Database("var/public_restaurant.db")
+            Database("file:///tmp/public_restaurant")
         with self.assertRaisesRegex(ValueError, "PostgreSQL"):
-            Database("sqlite:///var/public_restaurant.db")
+            Database("mysql://restaurant_app@127.0.0.1/example")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ Day3 이후 현재 작업트리 변경 규모는 다음과 같다.
 
 ```text
 app/schema.py            | 후보 보정 필드 추가
-app/database.py          | 기존 SQLite DB용 경량 마이그레이션 추가
+app/database.py          | 기존 개발 DB용 경량 마이그레이션 추가
 app/pipeline.py          | 라이브 수집 후 검증 지연 및 수집 데이터 검증 분리
 app/http_server.py       | 관리자 후보 API, 지오코딩 API, 수집 조건 API 추가
 app/services.py          | 후보 목록/편집/상태전환/지오코딩/ provider refresh 구현
@@ -111,7 +111,7 @@ review_major_category
 
 원본 데이터는 그대로 보존하고, 운영자가 검토 과정에서 보정한 상호명, 주소, 분류를 별도 필드에 저장한다. 서비스 계층에서는 `effective_*` 값을 계산해 보정값이 있으면 보정값을 우선 사용하고, 없으면 원본값을 사용한다.
 
-기존 SQLite DB에도 적용될 수 있도록 `Database.initialize()` 단계에서 누락 컬럼을 추가하는 경량 마이그레이션을 넣었다.
+기존 개발 DB에도 적용될 수 있도록 `Database.initialize()` 단계에서 누락 컬럼을 추가하는 경량 마이그레이션을 넣었다.
 
 ### 후보 목록 API 추가
 
@@ -296,7 +296,7 @@ OK
 
 현재 프로젝트 진행 상황은 다음과 같다.
 
-- Day1: MVP 파이프라인, 공개 API, 관리자 API, SQLite/PostgreSQL 스키마, 기본 테스트 완성
+- Day1: MVP 파이프라인, 공개 API, 관리자 API, PostgreSQL 스키마, 기본 테스트 완성
 - Day2: 별칭 기억, 주소 없는 후보 자동 승인, 비음식 목적 필터, 재검증 흐름, 회귀 테스트 보강
 - Day3: 구조화 주소 매칭, 프랜차이즈/지점명 규칙, provider 후보 evidence 저장, 관리자 후보 선택 승인, 반려 사유/검토 의견 저장
 - Day4: 라이브 수집/검증 단계 분리, 후보 보정 필드, 후보 전체 관리 API/UI, 지오코딩 버튼, provider 후보 refresh, 상태별 후보 관리
@@ -316,7 +316,7 @@ Day4 변경분은 아직 커밋되지 않은 작업트리 변경이다.
 
 ### PostgreSQL 스키마 반영 필요
 
-SQLite 스키마에는 후보 보정 필드가 추가되었고 경량 마이그레이션도 들어갔다. 운영용 PostgreSQL 스키마에도 동일 필드와 마이그레이션 절차를 반영해야 한다.
+개발 스키마에는 후보 보정 필드가 추가되었고 경량 마이그레이션도 들어갔다. 운영용 PostgreSQL 스키마에도 동일 필드와 마이그레이션 절차를 반영해야 한다.
 
 ### 관리자 지오코딩 UX 검증 필요
 
