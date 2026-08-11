@@ -12,6 +12,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from .auth import SESSION_MAX_AGE_SECONDS, SessionCodec
@@ -32,8 +33,10 @@ from .pipeline import (
     BusanCityLiveAdapter,
     DailyPipeline,
 )
+from .operation_jobs import ACTIVE_JOB_STATUSES, OperationJobQueue
 from .progress import VerificationProgressStore
 from .services import AppError, RequestContext, RestaurantService
+from .utils import stable_hash
 from .views import (
     admin_accounts_index,
     admin_document_detail_index,
@@ -116,6 +119,7 @@ class PublicRestaurantApplication:
             ),
         )
         self.verification_progress = VerificationProgressStore()
+        self.operation_jobs = OperationJobQueue(self.database)
         self.session_codec = SessionCodec(
             settings.session_secret
             or settings.naver_login_client_secret
@@ -257,19 +261,85 @@ class PublicRestaurantApplication:
             max_batches=max_batches,
         )
 
-    def verify_pending(self, limit: int = 100, sort: str = "verification_oldest") -> dict:
+    def verify_pending(
+        self,
+        limit: int = 100,
+        sort: str = "verification_oldest",
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict:
         return DailyPipeline(
             self.database,
             settings=self.settings,
-            verification_progress_callback=self.verification_progress.update,
+            verification_progress_callback=progress_callback or self.verification_progress.update,
         ).verify_pending(limit=limit, sort=sort)
 
-    def verify_collected(self, limit: int = 100, sort: str = "verification_oldest") -> dict:
+    def verify_collected(
+        self,
+        limit: int = 100,
+        sort: str = "verification_oldest",
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict:
         return DailyPipeline(
             self.database,
             settings=self.settings,
-            verification_progress_callback=self.verification_progress.update,
+            verification_progress_callback=progress_callback or self.verification_progress.update,
         ).verify_collected(limit=limit, sort=sort)
+
+    def enqueue_operation(
+        self,
+        job_type: str,
+        payload: dict[str, Any],
+        context: RequestContext,
+    ) -> dict[str, Any]:
+        return self.operation_jobs.enqueue(
+            job_type,
+            payload,
+            dedupe_key=f"{job_type}:{stable_hash(job_type, payload)}",
+            requested_by=context.actor_id,
+        )
+
+    def operation_job(self, job_id: int) -> dict[str, Any]:
+        job = self.operation_jobs.get(job_id)
+        if job is None:
+            raise AppError(404, "operation job not found")
+        return job
+
+    def operation_job_list(self, active_only: bool = False, limit: int = 20) -> dict[str, Any]:
+        jobs = self.operation_jobs.list(
+            statuses=ACTIVE_JOB_STATUSES if active_only else (),
+            limit=limit,
+        )
+        return {"jobs": jobs, "active_count": sum(job["status"] in ACTIVE_JOB_STATUSES for job in jobs)}
+
+    def verification_progress_snapshot(self) -> dict[str, Any]:
+        latest = self.operation_jobs.latest(("verify_pending", "verify_collected"))
+        if latest is not None:
+            progress = dict(latest.get("progress") or {})
+            if progress:
+                progress["operation_job_id"] = latest["job_id"]
+                progress["operation_job_status"] = latest["status"]
+                return progress
+            if latest["status"] in ACTIVE_JOB_STATUSES:
+                return {
+                    "active": True,
+                    "batch_id": None,
+                    "job_name": latest["job_type"],
+                    "operation_job_id": latest["job_id"],
+                    "operation_job_status": latest["status"],
+                    "total": int((latest.get("payload") or {}).get("limit") or 0),
+                    "limit": int((latest.get("payload") or {}).get("limit") or 0),
+                    "processed": 0,
+                    "summary": {},
+                    "classifications": {
+                        "approved": 0,
+                        "needs_review": 0,
+                        "rejected": 0,
+                        "failed": 0,
+                    },
+                    "items": [],
+                    "updated_at": latest["updated_at"],
+                }
+        return self.verification_progress.snapshot()
 
     def verification_status(self) -> dict:
         missing_env = {
@@ -715,7 +785,17 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 elif path == "/ops/api-usage":
                     self._json(app.api_usage_status())
                 elif path == "/ops/verification-progress":
-                    self._json(app.verification_progress.snapshot())
+                    self._json(app.verification_progress_snapshot())
+                elif path == "/ops/jobs":
+                    self._json(
+                        app.operation_job_list(
+                            active_only=str(query.get("active", "")).lower()
+                            in {"1", "true", "yes"},
+                            limit=int(query.get("limit", "20") or "20"),
+                        )
+                    )
+                elif path.startswith("/ops/jobs/"):
+                    self._json(app.operation_job(self._path_int(path, "/ops/jobs/")))
                 elif path == "/ops/logs":
                     plan_id = int(query["plan_id"]) if query.get("plan_id") else None
                     limit = int(query.get("limit", "100") or "100")
@@ -796,90 +876,106 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     )
                 elif path == "/ops/collection-plans":
                     self._json(
-                        app.create_collection_plan(
-                            start_date=str(payload.get("start_date", "")),
-                            end_date=str(payload.get("end_date", "")),
-                            batch_size=int(payload.get("batch_size", 20) or 20),
+                        app.enqueue_operation(
+                            "collection_plan_create",
+                            {
+                                "start_date": str(payload.get("start_date", "")),
+                                "end_date": str(payload.get("end_date", "")),
+                                "batch_size": int(payload.get("batch_size", 20) or 20),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path.startswith("/ops/collection-plans/") and path.endswith("/run"):
                     plan_id = int(path.split("/")[3])
-                    repeat = bool(payload.get("repeat", True))
-                    if repeat:
-                        self._json(
-                            app.run_collection_plan_batches(
-                                plan_id,
-                                batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
-                                max_batches=int(payload.get("max_batches", 100) or 100),
-                            ),
-                            status=201,
-                        )
-                        return
                     self._json(
-                        app.run_collection_plan_batch(
-                            plan_id,
-                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
+                        app.enqueue_operation(
+                            "collection_plan_run",
+                            {
+                                "plan_id": plan_id,
+                                "batch_size": int(payload["batch_size"])
+                                if payload.get("batch_size")
+                                else None,
+                                "repeat": bool(payload.get("repeat", True)),
+                                "max_batches": int(payload.get("max_batches", 100) or 100),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path.startswith("/ops/collection-plans/") and path.endswith("/retry-failed"):
                     plan_id = int(path.split("/")[3])
                     self._json(
-                        app.retry_collection_plan_failures(
-                            plan_id,
-                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
-                            max_batches=int(payload.get("max_batches", 100) or 100),
+                        app.enqueue_operation(
+                            "collection_plan_retry",
+                            {
+                                "plan_id": plan_id,
+                                "batch_size": int(payload["batch_size"])
+                                if payload.get("batch_size")
+                                else None,
+                                "max_batches": int(payload.get("max_batches", 100) or 100),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path.startswith("/ops/collection-plans/") and path.endswith("/parse"):
                     plan_id = int(path.split("/")[3])
-                    repeat = bool(payload.get("repeat", True))
-                    if not repeat:
-                        self._json(
-                            app.parse_collection_plan_batch(
-                                plan_id,
-                                batch_size=int(payload["batch_size"])
+                    self._json(
+                        app.enqueue_operation(
+                            "collection_plan_parse",
+                            {
+                                "plan_id": plan_id,
+                                "batch_size": int(payload["batch_size"])
                                 if payload.get("batch_size")
                                 else None,
-                            ),
-                            status=201,
-                        )
-                        return
-                    self._json(
-                        app.parse_collection_plan_batches(
-                            plan_id,
-                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
-                            max_batches=int(payload.get("max_batches", 100) or 100),
+                                "repeat": bool(payload.get("repeat", True)),
+                                "max_batches": int(payload.get("max_batches", 100) or 100),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path.startswith("/ops/collection-plans/") and path.endswith("/retry-parse-failed"):
                     plan_id = int(path.split("/")[3])
                     self._json(
-                        app.retry_collection_plan_parse_failures(
-                            plan_id,
-                            batch_size=int(payload["batch_size"]) if payload.get("batch_size") else None,
-                            max_batches=int(payload.get("max_batches", 100) or 100),
+                        app.enqueue_operation(
+                            "collection_plan_parse_retry",
+                            {
+                                "plan_id": plan_id,
+                                "batch_size": int(payload["batch_size"])
+                                if payload.get("batch_size")
+                                else None,
+                                "max_batches": int(payload.get("max_batches", 100) or 100),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path == "/ops/verify-pending":
                     self._json(
-                        app.verify_pending(
-                            limit=int(payload.get("limit", 100)),
-                            sort=str(payload.get("sort", "verification_oldest")),
+                        app.enqueue_operation(
+                            "verify_pending",
+                            {
+                                "limit": int(payload.get("limit", 100)),
+                                "sort": str(payload.get("sort", "verification_oldest")),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path == "/ops/verify-collected":
                     self._json(
-                        app.verify_collected(
-                            limit=int(payload.get("limit", 100)),
-                            sort=str(payload.get("sort", "verification_oldest")),
+                        app.enqueue_operation(
+                            "verify_collected",
+                            {
+                                "limit": int(payload.get("limit", 100)),
+                                "sort": str(payload.get("sort", "verification_oldest")),
+                            },
+                            context,
                         ),
-                        status=201,
+                        status=HTTPStatus.ACCEPTED,
                     )
                 elif path.startswith("/admin/photos/restaurants/"):
                     parts = path.strip("/").split("/")

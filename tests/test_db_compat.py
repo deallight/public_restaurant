@@ -18,6 +18,10 @@ from database.migrations.m0003_user_interactions import (
     STATEMENTS as USER_INTERACTIONS_STATEMENTS,
     VERSION as USER_INTERACTIONS_VERSION,
 )
+from database.migrations.m0004_operation_jobs import (
+    STATEMENTS as OPERATION_JOBS_STATEMENTS,
+    VERSION as OPERATION_JOBS_VERSION,
+)
 from scripts.db_transfer import (
     fingerprint,
     require_sqlite_copy,
@@ -103,6 +107,16 @@ class DatabaseCompatibilityTests(unittest.TestCase):
         self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE|ALTER)\b")
         self.assertIn(
             USER_INTERACTIONS_VERSION,
+            {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
+        )
+
+    def test_operation_jobs_are_an_explicit_additive_migration(self) -> None:
+        ddl = "\n".join(OPERATION_JOBS_STATEMENTS)
+        self.assertIn("CREATE TABLE IF NOT EXISTS operation_jobs", ddl)
+        self.assertIn("idx_operation_jobs_active_dedupe", ddl)
+        self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE|ALTER)\b")
+        self.assertIn(
+            OPERATION_JOBS_VERSION,
             {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
         )
 

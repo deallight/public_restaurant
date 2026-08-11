@@ -10,6 +10,7 @@ Mac 개발 PC
        └─ N150 /srv/app/releases/<새 릴리스>
             ├─ deploy 계정으로 앱 실행
             ├─ systemd public-restaurant.service (127.0.0.1:8001)
+            ├─ systemd public-restaurant-worker.service (DB 작업 큐)
             ├─ Nginx + HTTPS (https://gonggibap.com)
             └─ PostgreSQL 127.0.0.1:5432
                  ├─ public_restaurant_test  배포 검증용

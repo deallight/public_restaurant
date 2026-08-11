@@ -17,6 +17,7 @@ from app.http_server import (
     _trusted_proxy_client_ip,
     make_handler,
 )
+from app.worker import OperationWorker
 from http.server import ThreadingHTTPServer
 
 
@@ -58,6 +59,15 @@ class HttpServerTests(unittest.TestCase):
         payload: dict | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict:
+        _status, response = self.post_json_response(path, payload, headers)
+        return response
+
+    def post_json_response(
+        self,
+        path: str,
+        payload: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict]:
         data = json.dumps(payload or {}).encode("utf-8")
         request_headers = {"Content-Type": "application/json"}
         request_headers.update(headers or {})
@@ -68,7 +78,7 @@ class HttpServerTests(unittest.TestCase):
             headers=request_headers,
         )
         with urlopen(request, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return resp.status, json.loads(resp.read().decode("utf-8"))
 
     def post_multipart(
         self,
@@ -207,6 +217,9 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("sessionStorage", workflow_js)
         self.assertIn("retry-parse-failed", workflow_js)
         self.assertIn("batchExecutionPayload", workflow_js)
+        self.assertIn("/ops/jobs?limit=40", workflow_js)
+        self.assertIn("waitForOperationJob", workflow_js)
+        self.assertIn("대기열 등록", workflow_js)
         app_js = urlopen(f"{self.base_url}/static/app.js", timeout=5).read().decode("utf-8")
         self.assertNotIn('class="rank-source-name"', app_js)
         self.assertNotIn('class="detail-source-names"', app_js)
@@ -336,10 +349,17 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("institution_name", queue["reviews"][0])
         self.assertIn("source_title", queue["reviews"][0])
         self.assertIn("payment_method", queue["reviews"][0])
-        verify = self.post_json("/ops/verify-pending", {"limit": 10}, admin_headers)
-        self.assertEqual(verify["status"], "success")
-        self.assertEqual(verify["summary"]["rows_seen"], 1)
-        self.assertEqual(verify["summary"]["rows_processed"], 1)
+        status, verify_job = self.post_json_response(
+            "/ops/verify-pending", {"limit": 10}, admin_headers
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(verify_job["status"], "queued")
+        OperationWorker(self.app.settings, worker_id="http-test-worker").run_once()
+        verify = self.get_json(verify_job["status_url"], admin_headers)
+        self.assertEqual(verify["status"], "succeeded")
+        self.assertEqual(verify["result"]["status"], "success")
+        self.assertEqual(verify["result"]["summary"]["rows_seen"], 1)
+        self.assertEqual(verify["result"]["summary"]["rows_processed"], 1)
         batch_lookup = self.get_json(f"/ops/batches/{batch['batch_id']}", admin_headers)
         self.assertEqual(batch_lookup["status"], "success")
         sources = self.get_json("/ops/sources", admin_headers)
@@ -400,44 +420,37 @@ class HttpServerTests(unittest.TestCase):
             "naver_search_not_configured",
         )
 
-    def test_collection_and_parsing_routes_support_all_or_single_batch(self) -> None:
+    def test_collection_and_parsing_routes_enqueue_all_or_single_batch(self) -> None:
         admin_headers = self.session_headers("admin")
-        result = {"status": "success", "summary": {"documents_seen": 17}}
-        with (
-            patch.object(self.app, "run_collection_plan_batch", return_value=result) as collect_one,
-            patch.object(self.app, "run_collection_plan_batches", return_value=result) as collect_all,
-            patch.object(self.app, "parse_collection_plan_batch", return_value=result) as parse_one,
-            patch.object(self.app, "parse_collection_plan_batches", return_value=result) as parse_all,
-        ):
-            self.post_json(
-                "/ops/collection-plans/42/run",
-                {"batch_size": 17, "repeat": False, "max_batches": 1},
-                admin_headers,
-            )
-            collect_one.assert_called_once_with(42, batch_size=17)
-            collect_all.assert_not_called()
+        status, plan_job = self.post_json_response(
+            "/ops/collection-plans",
+            {"start_date": "2026-01-01", "end_date": "2026-01-31", "batch_size": 23},
+            admin_headers,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(plan_job["job_type"], "collection_plan_create")
+        self.assertEqual(plan_job["payload"]["batch_size"], 23)
+        requests = [
+            ("/ops/collection-plans/42/run", {"batch_size": 17, "repeat": False, "max_batches": 1}),
+            ("/ops/collection-plans/42/parse", {"batch_size": 19, "repeat": False, "max_batches": 1}),
+            ("/ops/collection-plans/42/run", {"batch_size": 20, "repeat": True, "max_batches": 100}),
+            ("/ops/collection-plans/42/parse", {"batch_size": 20, "repeat": True, "max_batches": 100}),
+        ]
+        queued = []
+        for path, payload in requests:
+            status, job = self.post_json_response(path, payload, admin_headers)
+            self.assertEqual(status, 202)
+            self.assertEqual(job["status"], "queued")
+            queued.append(job)
 
-            self.post_json(
-                "/ops/collection-plans/42/parse",
-                {"batch_size": 19, "repeat": False, "max_batches": 1},
-                admin_headers,
-            )
-            parse_one.assert_called_once_with(42, batch_size=19)
-            parse_all.assert_not_called()
-
-            self.post_json(
-                "/ops/collection-plans/42/run",
-                {"batch_size": 20, "repeat": True, "max_batches": 100},
-                admin_headers,
-            )
-            collect_all.assert_called_once_with(42, batch_size=20, max_batches=100)
-
-            self.post_json(
-                "/ops/collection-plans/42/parse",
-                {"batch_size": 20, "repeat": True, "max_batches": 100},
-                admin_headers,
-            )
-            parse_all.assert_called_once_with(42, batch_size=20, max_batches=100)
+        self.assertEqual(queued[0]["job_type"], "collection_plan_run")
+        self.assertFalse(queued[0]["payload"]["repeat"])
+        self.assertEqual(queued[0]["payload"]["batch_size"], 17)
+        self.assertEqual(queued[1]["job_type"], "collection_plan_parse")
+        self.assertFalse(queued[1]["payload"]["repeat"])
+        self.assertTrue(queued[2]["payload"]["repeat"])
+        self.assertEqual(queued[2]["payload"]["max_batches"], 100)
+        self.assertTrue(queued[3]["payload"]["repeat"])
 
     def test_api_usage_warning_explains_timeout_reason(self) -> None:
         warning_app = PublicRestaurantApplication(
