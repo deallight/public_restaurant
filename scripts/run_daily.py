@@ -13,7 +13,7 @@ from app.pipeline import DailyPipeline
 
 def main() -> None:
     settings = load_settings()
-    database = Database(settings.database_url or settings.db_path)
+    database = Database(settings.database_url)
     result = DailyPipeline(database, settings=settings).run()
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 

@@ -16,14 +16,10 @@ from app.services import RestaurantService
 def main() -> None:
     settings = load_settings()
     parser = argparse.ArgumentParser(description="Re-verify pending restaurant candidates.")
-    parser.add_argument("--db", default="", help="SQLite development override")
     parser.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
 
-    if args.db and settings.database_url:
-        raise SystemExit("--db cannot override DATABASE_URL")
-    database_target = Path(args.db) if args.db else settings.database_url or settings.db_path
-    database = Database(database_target)
+    database = Database(settings.database_url)
     database.prepare()
     service = RestaurantService(database)
     before = service.verification_overview()

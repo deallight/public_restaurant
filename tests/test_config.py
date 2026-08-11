@@ -45,7 +45,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_server_cli_overrides_preserve_all_loaded_settings(self) -> None:
         settings = Settings(
-            db_path=Path("original.db"),
+            database_url="postgresql://restaurant_app@127.0.0.1/example_test",
             host="127.0.0.1",
             port=8000,
             privacy_contact_email="privacy@example.test",

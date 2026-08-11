@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from app.agents import (
@@ -20,7 +18,6 @@ from app.agents import (
     parse_place_name,
 )
 from app.config import Settings
-from app.database import Database
 from app.integrations import DataGoKrPermitClient, _category_from_naver, _place_rank, _search_queries
 from app.pipeline import (
     CachedPermitClient,
@@ -37,16 +34,12 @@ from app.pipeline import (
 from app.services import RestaurantService
 from app.source_catalog import iter_source_catalog
 from app.utils import normalize_text, normalized_address_similarity, strip_address_detail, structured_address_match
+from tests.postgres_test import fresh_postgres_database, postgres_test_url
 
 
 class PipelineTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = Database(Path(self.tmp.name) / "test.db")
-        self.db.initialize()
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
+        self.db = fresh_postgres_database()
 
     def test_daily_pipeline_is_idempotent_for_service_data(self) -> None:
         first = DailyPipeline(self.db).run()
@@ -842,21 +835,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(document["parse_attempts"], 2)
         self.assertEqual(document["rows_inserted"], 1)
 
-    def test_sqlite_schema_apply_and_development_rollback(self) -> None:
+    def test_postgres_schema_is_initialized_and_seeded(self) -> None:
         self.assertGreater(self.db.count("regions"), 0)
         self.assertEqual(self.db.count("source_registry"), len(iter_source_catalog()))
-        self.db.rollback_schema()
         with self.db.session() as conn:
             tables = conn.execute(
                 """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table' AND name = 'regions'
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'regions'
                 """
             ).fetchall()
-        self.assertEqual(tables, [])
-        self.db.initialize()
-        self.assertGreater(self.db.count("regions"), 0)
+        self.assertEqual([row["table_name"] for row in tables], ["regions"])
 
     def test_verifier_uses_rule_reject_and_ai_review_boundaries(self) -> None:
         verifier = VerifierAgent(FakeNaverClient(), FakePermitClient())
@@ -1083,7 +1073,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_settings_permit_timeout_is_advisory_and_does_not_dlq(self) -> None:
         settings = Settings(
-            db_path=Path(self.tmp.name) / "test.db",
+            database_url=postgres_test_url(),
             data_go_kr_service_key="test-key",
         )
 
@@ -1123,7 +1113,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_settings_permit_not_active_is_advisory_and_does_not_override_naver_approval(self) -> None:
         settings = Settings(
-            db_path=Path(self.tmp.name) / "test.db",
+            database_url=postgres_test_url(),
             data_go_kr_service_key="test-key",
         )
 

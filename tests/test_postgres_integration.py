@@ -1,45 +1,28 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import os
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 from urllib.request import Request, urlopen
 
 from app.config import Settings
-from app.database import Database, SQLITE_TABLES
+from app.database import Database
 from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
 from app.pipeline import DailyPipeline
 from app.services import RequestContext, RestaurantService
 from database.migrations.m0003_user_interactions import VERSION as USER_INTERACTIONS_VERSION
+from tests.postgres_test import postgres_test_url, reset_postgres_database
 
 
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "")
-
-
-@unittest.skipUnless(
-    TEST_DATABASE_URL.startswith(("postgresql://", "postgres://"))
-    and importlib.util.find_spec("psycopg") is not None,
-    "set TEST_DATABASE_URL to an isolated PostgreSQL test database",
-)
 class PostgresIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.db = Database(TEST_DATABASE_URL)
-        with cls.db.session() as conn:
-            name = conn.execute("SELECT current_database() AS name").fetchone()["name"]
-            if name == "public_restaurant" or "test" not in str(name).lower():
-                raise unittest.SkipTest("TEST_DATABASE_URL database name must contain 'test'")
+        cls.db = Database(postgres_test_url())
         cls.db.initialize()
 
     def setUp(self) -> None:
-        with self.db.session() as conn:
-            for table in SQLITE_TABLES:
-                conn.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
-        self.db.initialize()
+        reset_postgres_database(self.db)
 
     def test_fixture_public_admin_and_review_contracts(self) -> None:
         DailyPipeline(self.db).run()
@@ -148,8 +131,7 @@ class PostgresIntegrationTests(unittest.TestCase):
 
     def test_postgres_http_and_major_screen_contracts(self) -> None:
         settings = Settings(
-            db_path=Path("unused.db"),
-            database_url=TEST_DATABASE_URL,
+            database_url=postgres_test_url(),
             app_env="development",
             port=0,
             session_secret="postgres-integration-test-session-secret",

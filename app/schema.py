@@ -1,8 +1,6 @@
-SQLITE_SCHEMA = """
-PRAGMA foreign_keys = ON;
-
+APP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS regions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   sido TEXT NOT NULL,
   sigungu TEXT,
   region_code TEXT,
@@ -11,8 +9,8 @@ CREATE TABLE IF NOT EXISTS regions (
 );
 
 CREATE TABLE IF NOT EXISTS institutions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  region_id INTEGER REFERENCES regions(id),
+  id BIGSERIAL PRIMARY KEY,
+  region_id BIGINT REFERENCES regions(id),
   name TEXT NOT NULL,
   institution_code TEXT NOT NULL,
   source_base_url TEXT,
@@ -22,8 +20,8 @@ CREATE TABLE IF NOT EXISTS institutions (
 );
 
 CREATE TABLE IF NOT EXISTS source_registry (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  institution_id INTEGER NOT NULL REFERENCES institutions(id),
+  id BIGSERIAL PRIMARY KEY,
+  institution_id BIGINT NOT NULL REFERENCES institutions(id),
   source_key TEXT NOT NULL UNIQUE,
   source_type TEXT NOT NULL,
   adapter_name TEXT NOT NULL,
@@ -36,7 +34,7 @@ CREATE TABLE IF NOT EXISTS source_registry (
 );
 
 CREATE TABLE IF NOT EXISTS operation_jobs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   job_type TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
   payload_json TEXT NOT NULL DEFAULT '{}',
@@ -67,7 +65,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_jobs_active_dedupe
   WHERE dedupe_key <> '' AND status IN ('queued', 'running');
 
 CREATE TABLE IF NOT EXISTS batch_jobs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   job_name TEXT NOT NULL,
   status TEXT NOT NULL,
   started_at TEXT NOT NULL,
@@ -77,7 +75,7 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
 );
 
 CREATE TABLE IF NOT EXISTS collection_plans (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   source_key TEXT NOT NULL,
   start_date TEXT NOT NULL,
   end_date TEXT NOT NULL,
@@ -92,7 +90,7 @@ CREATE TABLE IF NOT EXISTS collection_plans (
   failed_count INTEGER NOT NULL DEFAULT 0,
   rows_seen INTEGER NOT NULL DEFAULT 0,
   rows_inserted INTEGER NOT NULL DEFAULT 0,
-  created_batch_job_id INTEGER REFERENCES batch_jobs(id),
+  created_batch_job_id BIGINT REFERENCES batch_jobs(id),
   summary_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -100,15 +98,15 @@ CREATE TABLE IF NOT EXISTS collection_plans (
 );
 
 CREATE TABLE IF NOT EXISTS collection_plan_documents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  plan_id INTEGER NOT NULL REFERENCES collection_plans(id) ON DELETE CASCADE,
+  id BIGSERIAL PRIMARY KEY,
+  plan_id BIGINT NOT NULL REFERENCES collection_plans(id) ON DELETE CASCADE,
   source_url TEXT NOT NULL,
   source_title TEXT,
   department_name TEXT,
   published_at TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
-  raw_document_id INTEGER REFERENCES raw_documents(id),
-  batch_job_id INTEGER REFERENCES batch_jobs(id),
+  raw_document_id BIGINT REFERENCES raw_documents(id),
+  batch_job_id BIGINT REFERENCES batch_jobs(id),
   rows_seen INTEGER NOT NULL DEFAULT 0,
   rows_inserted INTEGER NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -124,9 +122,9 @@ CREATE TABLE IF NOT EXISTS collection_plan_documents (
 );
 
 CREATE TABLE IF NOT EXISTS raw_documents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  institution_id INTEGER NOT NULL REFERENCES institutions(id),
-  source_registry_id INTEGER REFERENCES source_registry(id),
+  id BIGSERIAL PRIMARY KEY,
+  institution_id BIGINT NOT NULL REFERENCES institutions(id),
+  source_registry_id BIGINT REFERENCES source_registry(id),
   source_url TEXT NOT NULL,
   source_title TEXT,
   published_at TEXT,
@@ -144,10 +142,10 @@ CREATE TABLE IF NOT EXISTS raw_documents (
 );
 
 CREATE TABLE IF NOT EXISTS expense_records (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  raw_document_id INTEGER NOT NULL REFERENCES raw_documents(id),
-  institution_id INTEGER NOT NULL REFERENCES institutions(id),
-  region_id INTEGER REFERENCES regions(id),
+  id BIGSERIAL PRIMARY KEY,
+  raw_document_id BIGINT NOT NULL REFERENCES raw_documents(id),
+  institution_id BIGINT NOT NULL REFERENCES institutions(id),
+  region_id BIGINT REFERENCES regions(id),
   source_row_number INTEGER,
   department_name TEXT,
   used_at TEXT,
@@ -169,10 +167,10 @@ CREATE TABLE IF NOT EXISTS expense_records (
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_candidates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  expense_record_id INTEGER NOT NULL UNIQUE REFERENCES expense_records(id),
-  institution_id INTEGER NOT NULL REFERENCES institutions(id),
-  region_id INTEGER REFERENCES regions(id),
+  id BIGSERIAL PRIMARY KEY,
+  expense_record_id BIGINT NOT NULL UNIQUE REFERENCES expense_records(id),
+  institution_id BIGINT NOT NULL REFERENCES institutions(id),
+  region_id BIGINT REFERENCES regions(id),
   original_place_name TEXT NOT NULL,
   normalized_place_name TEXT NOT NULL,
   original_address TEXT,
@@ -198,8 +196,8 @@ CREATE TABLE IF NOT EXISTS restaurant_candidates (
 );
 
 CREATE TABLE IF NOT EXISTS place_verifications (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  candidate_id INTEGER NOT NULL REFERENCES restaurant_candidates(id),
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL REFERENCES restaurant_candidates(id),
   provider TEXT NOT NULL DEFAULT 'naver',
   provider_place_id TEXT,
   provider_place_name TEXT,
@@ -208,10 +206,10 @@ CREATE TABLE IF NOT EXISTS place_verifications (
   provider_road_address TEXT,
   normalized_provider_name TEXT,
   normalized_provider_address TEXT,
-  longitude REAL,
-  latitude REAL,
-  name_similarity REAL,
-  address_similarity REAL,
+  longitude DOUBLE PRECISION,
+  latitude DOUBLE PRECISION,
+  name_similarity DOUBLE PRECISION,
+  address_similarity DOUBLE PRECISION,
   is_name_match INTEGER NOT NULL DEFAULT 0,
   is_address_match INTEGER NOT NULL DEFAULT 0,
   is_coordinate_valid INTEGER NOT NULL DEFAULT 0,
@@ -224,9 +222,9 @@ CREATE TABLE IF NOT EXISTS place_verifications (
 );
 
 CREATE TABLE IF NOT EXISTS restaurants (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  region_id INTEGER REFERENCES regions(id),
-  place_verification_id INTEGER REFERENCES place_verifications(id),
+  id BIGSERIAL PRIMARY KEY,
+  region_id BIGINT REFERENCES regions(id),
+  place_verification_id BIGINT REFERENCES place_verifications(id),
   canonical_name TEXT NOT NULL,
   normalized_name TEXT NOT NULL,
   major_category TEXT NOT NULL,
@@ -234,8 +232,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
   address TEXT NOT NULL,
   road_address TEXT,
   normalized_address TEXT NOT NULL,
-  longitude REAL NOT NULL,
-  latitude REAL NOT NULL,
+  longitude DOUBLE PRECISION NOT NULL,
+  latitude DOUBLE PRECISION NOT NULL,
   verification_status TEXT NOT NULL DEFAULT 'success',
   map_exposure_status TEXT NOT NULL DEFAULT 'visible',
   first_verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -247,10 +245,10 @@ CREATE TABLE IF NOT EXISTS restaurants (
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_expense_links (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id),
-  expense_record_id INTEGER NOT NULL REFERENCES expense_records(id),
-  candidate_id INTEGER NOT NULL UNIQUE REFERENCES restaurant_candidates(id),
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id),
+  expense_record_id BIGINT NOT NULL REFERENCES expense_records(id),
+  candidate_id BIGINT NOT NULL UNIQUE REFERENCES restaurant_candidates(id),
   used_date TEXT,
   amount INTEGER,
   link_reason TEXT,
@@ -259,8 +257,8 @@ CREATE TABLE IF NOT EXISTS restaurant_expense_links (
 );
 
 CREATE TABLE IF NOT EXISTS manual_review_tasks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  candidate_id INTEGER NOT NULL UNIQUE REFERENCES restaurant_candidates(id),
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL UNIQUE REFERENCES restaurant_candidates(id),
   status TEXT NOT NULL DEFAULT 'pending',
   reason TEXT NOT NULL,
   reviewer_note TEXT,
@@ -270,22 +268,22 @@ CREATE TABLE IF NOT EXISTS manual_review_tasks (
 );
 
 CREATE TABLE IF NOT EXISTS permit_snapshots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   normalized_place_name TEXT NOT NULL,
   normalized_address TEXT,
   permit_id TEXT,
   permit_category TEXT NOT NULL,
   business_status TEXT NOT NULL,
   road_address TEXT,
-  longitude REAL,
-  latitude REAL,
+  longitude DOUBLE PRECISION,
+  latitude DOUBLE PRECISION,
   fetched_at TEXT NOT NULL,
   raw_response_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE (permit_id)
 );
 
 CREATE TABLE IF NOT EXISTS api_call_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   provider TEXT NOT NULL,
   endpoint TEXT NOT NULL,
   request_hash TEXT NOT NULL,
@@ -297,8 +295,8 @@ CREATE TABLE IF NOT EXISTS api_call_logs (
 );
 
 CREATE TABLE IF NOT EXISTS dead_letter_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  batch_job_id INTEGER REFERENCES batch_jobs(id),
+  id BIGSERIAL PRIMARY KEY,
+  batch_job_id BIGINT REFERENCES batch_jobs(id),
   stage TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   error_message TEXT NOT NULL,
@@ -309,19 +307,19 @@ CREATE TABLE IF NOT EXISTS dead_letter_queue (
 );
 
 CREATE TABLE IF NOT EXISTS alias_memory (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER REFERENCES restaurants(id),
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT REFERENCES restaurants(id),
   alias_text TEXT NOT NULL,
   normalized_alias TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'manual',
-  confidence REAL NOT NULL DEFAULT 1.0,
+  confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (restaurant_id, normalized_alias)
 );
 
 CREATE TABLE IF NOT EXISTS entity_status_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id),
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id),
   status TEXT NOT NULL,
   reason TEXT,
   evidence_json TEXT NOT NULL DEFAULT '{}',
@@ -329,12 +327,12 @@ CREATE TABLE IF NOT EXISTS entity_status_history (
 );
 
 CREATE TABLE IF NOT EXISTS decision_audit_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   actor_type TEXT NOT NULL,
   actor_id TEXT,
   action TEXT NOT NULL,
   target_type TEXT NOT NULL,
-  target_id INTEGER,
+  target_id BIGINT,
   before_json TEXT NOT NULL DEFAULT '{}',
   after_json TEXT NOT NULL DEFAULT '{}',
   reason_codes_json TEXT NOT NULL DEFAULT '[]',
@@ -342,7 +340,7 @@ CREATE TABLE IF NOT EXISTS decision_audit_logs (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGSERIAL PRIMARY KEY,
   display_name TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
   status TEXT NOT NULL DEFAULT 'active',
@@ -351,8 +349,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS oauth_accounts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id),
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id),
   provider TEXT NOT NULL,
   provider_subject TEXT NOT NULL,
   display_name TEXT,
@@ -362,9 +360,9 @@ CREATE TABLE IF NOT EXISTS oauth_accounts (
 );
 
 CREATE TABLE IF NOT EXISTS account_merge_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_user_id INTEGER NOT NULL REFERENCES users(id),
-  target_user_id INTEGER NOT NULL REFERENCES users(id),
+  id BIGSERIAL PRIMARY KEY,
+  source_user_id BIGINT NOT NULL REFERENCES users(id),
+  target_user_id BIGINT NOT NULL REFERENCES users(id),
   status TEXT NOT NULL DEFAULT 'pending',
   reason TEXT,
   requested_by TEXT,
@@ -374,16 +372,16 @@ CREATE TABLE IF NOT EXISTS account_merge_requests (
 );
 
 CREATE TABLE IF NOT EXISTS user_saved_restaurants (
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (user_id, restaurant_id)
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_reviews (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id),
-  user_id INTEGER REFERENCES users(id),
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id),
+  user_id BIGINT REFERENCES users(id),
   rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
   body TEXT NOT NULL,
   reviewer_label TEXT NOT NULL DEFAULT '방문자',
@@ -394,8 +392,8 @@ CREATE TABLE IF NOT EXISTS restaurant_reviews (
 );
 
 CREATE TABLE IF NOT EXISTS review_reactions (
-  review_id INTEGER NOT NULL REFERENCES restaurant_reviews(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  review_id BIGINT NOT NULL REFERENCES restaurant_reviews(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   reaction TEXT NOT NULL CHECK (reaction IN ('up', 'down')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -403,7 +401,7 @@ CREATE TABLE IF NOT EXISTS review_reactions (
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_ai_summaries (
-  restaurant_id INTEGER PRIMARY KEY REFERENCES restaurants(id),
+  restaurant_id BIGINT PRIMARY KEY REFERENCES restaurants(id),
   summary_text TEXT NOT NULL DEFAULT '',
   summarized_review_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'idle',
@@ -417,9 +415,9 @@ CREATE TABLE IF NOT EXISTS restaurant_ai_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_user_images (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   storage_key TEXT NOT NULL UNIQUE,
   original_filename TEXT NOT NULL,
   content_type TEXT NOT NULL,
@@ -431,8 +429,8 @@ CREATE TABLE IF NOT EXISTS restaurant_user_images (
 );
 
 CREATE TABLE IF NOT EXISTS restaurant_admin_images (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  id BIGSERIAL PRIMARY KEY,
+  restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
   storage_key TEXT NOT NULL UNIQUE,
   original_filename TEXT NOT NULL,
   content_type TEXT NOT NULL,
@@ -445,10 +443,10 @@ CREATE TABLE IF NOT EXISTS restaurant_admin_images (
 );
 
 CREATE TABLE IF NOT EXISTS review_reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  review_id INTEGER NOT NULL REFERENCES restaurant_reviews(id),
+  id BIGSERIAL PRIMARY KEY,
+  review_id BIGINT NOT NULL REFERENCES restaurant_reviews(id),
   reason TEXT NOT NULL,
-  reporter_user_id INTEGER REFERENCES users(id),
+  reporter_user_id BIGINT REFERENCES users(id),
   reporter_ip_hash TEXT,
   status TEXT NOT NULL DEFAULT 'open',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -456,8 +454,8 @@ CREATE TABLE IF NOT EXISTS review_reports (
 );
 
 CREATE TABLE IF NOT EXISTS review_moderation_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  review_id INTEGER NOT NULL REFERENCES restaurant_reviews(id),
+  id BIGSERIAL PRIMARY KEY,
+  review_id BIGINT NOT NULL REFERENCES restaurant_reviews(id),
   action TEXT NOT NULL,
   moderator_id TEXT,
   reason TEXT,

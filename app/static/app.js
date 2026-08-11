@@ -459,10 +459,37 @@ function updateFilterIndex() {
   }
 }
 
+function restaurantsVisibleInMap() {
+  if (!state.map || !window.naver?.maps || typeof state.map.getBounds !== "function") {
+    return state.restaurants;
+  }
+  let bounds;
+  try {
+    bounds = state.map.getBounds();
+  } catch {
+    return state.restaurants;
+  }
+  if (!bounds || typeof bounds.hasLatLng !== "function") return state.restaurants;
+  return state.restaurants.filter((restaurant) => {
+    const position = naverPosition(restaurant);
+    if (!position) return false;
+    try {
+      return bounds.hasLatLng(position);
+    } catch {
+      return false;
+    }
+  });
+}
+
 function renderRanking() {
-  document.querySelector("#result-count").textContent = state.restaurants.length;
+  const visibleRestaurants = restaurantsVisibleInMap();
+  document.querySelector("#result-count").textContent = visibleRestaurants.length;
   const list = document.querySelector("#ranking-list");
-  list.innerHTML = state.restaurants.map((restaurant) => `
+  if (!visibleRestaurants.length) {
+    list.innerHTML = '<li class="empty">현재 지도 영역에 음식점이 없습니다.</li>';
+    return;
+  }
+  list.innerHTML = visibleRestaurants.map((restaurant) => `
     <li>
       <button type="button" data-id="${restaurant.id}" class="rank-item ${state.selectedId === restaurant.id ? "active" : ""}">
         <span class="rank-main">
@@ -934,6 +961,7 @@ function bindNaverMapEvents() {
   naver.maps.Event.addListener(state.map, "idle", () => {
     const zoom = Number(state.map?.getZoom?.());
     if (Number.isFinite(zoom) && zoom !== state.markerZoom) renderNaverMarkers();
+    renderRanking();
   });
   naver.maps.Event.addListener(state.map, "dragstart", closeClusterInfoWindow);
   naver.maps.Event.addListener(state.map, "click", closeClusterInfoWindow);
@@ -951,6 +979,7 @@ function renderNaverMap() {
   state.fallbackClusterIndex = null;
   bindNaverMapEvents();
   renderNaverMarkers();
+  renderRanking();
 }
 
 function renderFallbackMap() {

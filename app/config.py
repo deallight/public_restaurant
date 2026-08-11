@@ -41,8 +41,7 @@ def load_dotenv(
 
 @dataclass(frozen=True)
 class Settings:
-    db_path: Path
-    database_url: str = ""
+    database_url: str
     restaurant_image_upload_dir: Path | None = None
     app_env: str = "development"
     host: str = "127.0.0.1"
@@ -75,13 +74,10 @@ class Settings:
 
 def load_settings() -> Settings:
     load_dotenv()
-    db_path = Path(os.getenv("APP_DB_PATH", BASE_DIR / "var" / "public_restaurant.db"))
     database_url = os.getenv("DATABASE_URL", "").strip()
     app_env = os.getenv("APP_ENV", "development").strip().lower()
-    if database_url and not database_url.startswith(("postgresql://", "postgres://", "sqlite:///")):
-        raise ValueError("DATABASE_URL must use postgresql:// or sqlite:///")
-    if app_env == "production" and not database_url.startswith(("postgresql://", "postgres://")):
-        raise ValueError("APP_ENV=production requires a PostgreSQL DATABASE_URL")
+    if not database_url.startswith(("postgresql://", "postgres://")):
+        raise ValueError("DATABASE_URL must use postgresql:// or postgres://")
     privacy_contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "").strip()
     email_local, email_separator, email_domain = privacy_contact_email.partition("@")
     if app_env == "production" and (
@@ -93,7 +89,6 @@ def load_settings() -> Settings:
     ):
         raise ValueError("APP_ENV=production requires PRIVACY_CONTACT_EMAIL")
     return Settings(
-        db_path=db_path,
         database_url=database_url,
         restaurant_image_upload_dir=Path(
             os.getenv(

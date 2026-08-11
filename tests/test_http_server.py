@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
 import threading
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -19,6 +17,7 @@ from app.http_server import (
 )
 from app.worker import OperationWorker
 from http.server import ThreadingHTTPServer
+from tests.postgres_test import fresh_postgres_database, postgres_test_url
 
 
 class HttpServerTests(unittest.TestCase):
@@ -29,9 +28,9 @@ class HttpServerTests(unittest.TestCase):
     )
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        fresh_postgres_database()
         settings = Settings(
-            db_path=Path(self.tmp.name) / "test.db",
+            database_url=postgres_test_url(),
             port=0,
             session_secret="http-server-test-session-secret",
         )
@@ -45,7 +44,6 @@ class HttpServerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
-        self.tmp.cleanup()
 
     def get_json(self, path: str, headers: dict[str, str] | None = None) -> dict:
         request_headers = {"Accept": "application/json"}
@@ -221,6 +219,12 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn("waitForOperationJob", workflow_js)
         self.assertIn("대기열 등록", workflow_js)
         app_js = urlopen(f"{self.base_url}/static/app.js", timeout=5).read().decode("utf-8")
+        self.assertIn("function restaurantsVisibleInMap()", app_js)
+        self.assertIn("bounds.hasLatLng(position)", app_js)
+        self.assertIn("const visibleRestaurants = restaurantsVisibleInMap();", app_js)
+        idle_handler_start = app_js.index('naver.maps.Event.addListener(state.map, "idle"')
+        idle_handler_end = app_js.index('naver.maps.Event.addListener(state.map, "dragstart"')
+        self.assertIn("renderRanking();", app_js[idle_handler_start:idle_handler_end])
         self.assertNotIn('class="rank-source-name"', app_js)
         self.assertNotIn('class="detail-source-names"', app_js)
         self.assertIn("visit.source_place_name", app_js)
@@ -455,7 +459,7 @@ class HttpServerTests(unittest.TestCase):
     def test_api_usage_warning_explains_timeout_reason(self) -> None:
         warning_app = PublicRestaurantApplication(
             Settings(
-                db_path=Path(self.tmp.name) / "warning.db",
+                database_url=postgres_test_url(),
                 data_go_kr_service_key="configured-for-test",
             )
         )

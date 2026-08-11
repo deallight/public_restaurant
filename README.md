@@ -104,7 +104,7 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 .venv/bin/python -m scripts.check_db_schema
 ```
 
-`DATABASE_URL`을 비우면 개발 환경에서 `APP_DB_PATH`의 SQLite를 사용할 수 있습니다. 다만 운영 환경인 `APP_ENV=production`은 PostgreSQL URL을 필수로 요구합니다.
+개발·테스트·운영 환경 모두 PostgreSQL `DATABASE_URL`이 필수입니다. 값이 없거나 PostgreSQL URL이 아니면 애플리케이션은 시작하지 않습니다.
 
 ## 현재 개발 상태
 
@@ -147,8 +147,7 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 ## 기술 구조
 
 - 웹 서버: Python 표준 라이브러리 `ThreadingHTTPServer`
-- 데이터베이스: PostgreSQL 16+와 `psycopg` 3
-- 호환성 DB: SQLite(개발, 회귀 테스트, 이관·롤백 도구용)
+- 데이터베이스: PostgreSQL 16+와 `psycopg` 3만 지원
 - 프론트엔드: Python 서버 렌더링 HTML + 정적 JavaScript/CSS
 - 지도: Naver Maps JavaScript API, 키가 없을 때 로컬 fallback 지도
 - 테스트: Python `unittest`, 외부 API는 fake client로 대체
@@ -163,12 +162,12 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 | `app/pipeline.py` | 수집, 파싱, 후보 생성, 검증, 저장 파이프라인 |
 | `app/agents.py` | 음식점 판단과 `VerificationDecision` 생성 |
 | `app/integrations.py` | Naver, NCP Maps, 공공데이터, OAuth, Groq 클라이언트 |
-| `app/database.py` | SQLite/PostgreSQL 공통 DB 접근과 스키마 검증 |
+| `app/database.py` | PostgreSQL DB 접근, 번호형 마이그레이션과 스키마 검증 |
 | `app/schema.py` | 애플리케이션 데이터 모델 기준 |
 | `app/views.py` | 서버 렌더링 화면 |
 | `app/static/` | 공개 지도와 관리자 화면 JavaScript/CSS |
 | `database/migrations/` | PostgreSQL 마이그레이션 |
-| `scripts/` | DB 점검·이관·수집·검증 운영 명령 |
+| `scripts/` | PostgreSQL 점검·마이그레이션·수집·검증 운영 명령 |
 
 ## 환경 변수
 
@@ -178,8 +177,8 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 | --- | --- |
 | `APP_HOST`, `APP_PORT` | 서버 바인딩 주소와 포트 |
 | `APP_ENV` | `development` 또는 `production` |
-| `DATABASE_URL` | PostgreSQL 접속 URL. 운영 환경에서는 필수 |
-| `APP_DB_PATH` | `DATABASE_URL`이 없을 때 사용하는 SQLite 경로 |
+| `DATABASE_URL` | PostgreSQL 접속 URL. 모든 환경에서 필수 |
+| `TEST_DATABASE_URL` | 이름에 `test`가 포함된 격리 PostgreSQL 테스트 DB. 생략 시 개발 DB 이름에 `_test`를 붙여 계산 |
 | `RESTAURANT_IMAGE_UPLOAD_DIR` | 관리자 보관 사진과 사용자 등록 사진 저장 경로 |
 | `APP_SESSION_SECRET` | 로그인 세션 서명 키 |
 | `PRIVACY_CONTACT_EMAIL` | 개인정보처리방침·이용약관 문의 이메일. 운영 환경에서는 필수 |
@@ -360,9 +359,9 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `GET /ops/api-usage`
 - `GET /ops/logs`
 
-## PostgreSQL 스키마와 이관
+## PostgreSQL 스키마와 마이그레이션
 
-`app/schema.py`가 애플리케이션 데이터 모델의 기준입니다. PostgreSQL 0001 마이그레이션은 `database/migrations/m0001_app_compatible.py`에 있으며, 서버는 시작할 때 필수 테이블·컬럼·타입과 `app_schema_migrations.version = '0001'`을 확인하고 불일치하면 중단합니다.
+`app/schema.py`가 애플리케이션 데이터 모델의 기준입니다. 서버는 시작할 때 필수 테이블·컬럼·타입과 `app_schema_migrations`의 모든 필수 버전을 확인하고 불일치하면 중단합니다. 일반 서버 시작은 DDL을 자동 적용하지 않습니다.
 
 마이그레이션 SQL 검토:
 
@@ -370,19 +369,13 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 .venv/bin/python -m scripts.render_postgres_schema > /tmp/public_restaurant-0001.sql
 ```
 
-기존 SQLite 데이터를 PostgreSQL로 이관할 때는 운영 원본이 아닌 `.backup` 복사본만 사용합니다. 기본 동작은 dry-run이며 행 값과 접속 secret을 출력하지 않습니다.
+새 DB 또는 기존 PostgreSQL DB에 누락된 번호형 마이그레이션을 적용할 때는 먼저 custom-format 백업과 복원 목록을 검증합니다.
 
 ```bash
-sqlite3 var/public_restaurant.db '.backup /secure-backup/public_restaurant-cutover.db'
-
-.venv/bin/python -m scripts.migrate_sqlite_to_postgres \
-  --source-copy /secure-backup/public_restaurant-cutover.db --batch-size 500
-
-.venv/bin/python -m scripts.migrate_sqlite_to_postgres \
-  --source-copy /secure-backup/public_restaurant-cutover.db --apply --batch-size 500
-
-.venv/bin/python -m scripts.compare_databases \
-  --sqlite-copy /secure-backup/public_restaurant-cutover.db
+pg_dump --format=custom --dbname="$DATABASE_URL" --file=/secure-backup/public-restaurant.dump
+pg_restore --list /secure-backup/public-restaurant.dump >/dev/null
+.venv/bin/python -m scripts.init_db --apply
+.venv/bin/python -m scripts.check_db_schema
 ```
 
 PostGIS는 현재 숫자 위도·경도 bounds 검색에 필요하지 않습니다. `pg_trgm`은 선택 기능이며 `database/migrations/0002_optional_pg_trgm.sql`로 분리되어 있습니다.
@@ -395,10 +388,10 @@ PostGIS는 현재 숫자 위도·경도 bounds 검색에 필요하지 않습니�
 .venv/bin/python -m unittest discover -s tests
 ```
 
-격리된 PostgreSQL 테스트 DB가 있으면 SQLite 호환성 테스트와 함께 PostgreSQL 통합 계약도 검증할 수 있습니다. 안전을 위해 DB 이름에 `test`가 포함되어야 합니다.
+전체 테스트는 격리 PostgreSQL에서만 실행됩니다. 안전을 위해 테스트 DB 이름에는 반드시 `test`가 포함되어야 하며, 각 테스트 전에 해당 DB의 애플리케이션 테이블을 초기화합니다.
 
 ```bash
-TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_test' \
+TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_dev_test' \
   .venv/bin/python -m unittest discover -s tests
 ```
 
@@ -411,14 +404,14 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 - 리뷰 제한, 신고, AI 요약, 저장 가게, 마이페이지, 계정 탈퇴
 - 관리자 인증·권한과 운영 API 라우팅
 - 외부·관리자 사진 비노출, 사용자 사진 소유권과 등록·수정·삭제
-- SQLite/PostgreSQL SQL 호환 및 운영 환경의 PostgreSQL 강제
+- PostgreSQL 스키마 드리프트 차단과 모든 환경의 PostgreSQL 강제
 
 ## 운영 시 확인할 사항
 
 - GitHub `main` 병합 후 N150 업데이트는 `sudo /srv/app/bin/deploy-public-restaurant`로 실행합니다. 최초 설치와 복구용 수동 절차는 [N150 자가 운영 절차서](database/N150_SELF_SERVICE_RUNBOOK.md)를 따릅니다.
 - 배포 스크립트는 테스트, PostgreSQL 백업·복원 목록 검증, release에 포함된 검토된 번호형 마이그레이션 적용, 운영 스키마 호환 검사, 별도 포트 사전 점검, 원자적 release 전환, HTTP 검증과 실패 시 코드 롤백을 수행합니다.
 - 운영 URL은 <https://gonggibap.com>이며 `APP_ENV=production`을 사용합니다.
-- 운영 환경은 PostgreSQL `DATABASE_URL`과 유효한 `PRIVACY_CONTACT_EMAIL` 없이는 시작하지 않습니다.
+- 모든 환경은 PostgreSQL `DATABASE_URL` 없이는 시작하지 않으며, 운영 환경은 추가로 유효한 `PRIVACY_CONTACT_EMAIL`을 요구합니다.
 - DB 비밀번호, OAuth secret, API 키, 세션 키는 배포 환경의 secret으로만 주입합니다.
 - PostgreSQL 스키마 변경은 서버 시작과 분리되어 있습니다. 배포 시 운영 DB 백업 검증을 먼저 마친 뒤 저장소에 포함된 검토된 마이그레이션만 적용하고, 호환 결과와 HTTP 상태를 확인합니다.
 - 라이브 수집은 부산시 게시판 구조와 첨부 포맷에 의존합니다. 지원하지 않는 XLS, DRM, HWP, PDF는 DLQ에 남겨 parser 확장 대상으로 관리합니다.

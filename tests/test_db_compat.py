@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from app.config import load_settings
 from app.database import (
+    APP_TABLES,
     REQUIRED_POSTGRES_MIGRATIONS,
     Database,
     postgres_schema_statements,
@@ -22,25 +21,9 @@ from database.migrations.m0004_operation_jobs import (
     STATEMENTS as OPERATION_JOBS_STATEMENTS,
     VERSION as OPERATION_JOBS_VERSION,
 )
-from scripts.db_transfer import (
-    fingerprint,
-    require_sqlite_copy,
-    transfer,
-    transfer_key_columns,
-    transfer_succeeded,
-)
 
 
 class DatabaseCompatibilityTests(unittest.TestCase):
-    def test_review_reaction_uses_composite_transfer_key(self) -> None:
-        self.assertEqual(
-            transfer_key_columns(
-                "review_reactions",
-                ["review_id", "user_id", "reaction"],
-            ),
-            ["review_id", "user_id"],
-        )
-
     def test_postgres_sql_translation(self) -> None:
         translated = postgres_sql(
             "INSERT OR IGNORE INTO items (name) VALUES (?)"
@@ -64,17 +47,7 @@ class DatabaseCompatibilityTests(unittest.TestCase):
 
     def test_postgres_schema_has_every_application_table_without_extensions(self) -> None:
         ddl = "\n".join(postgres_schema_statements())
-        with tempfile.TemporaryDirectory() as tmp:
-            database = Database(Path(tmp) / "schema.db")
-            database.initialize()
-            with database.session() as conn:
-                sqlite_tables = {
-                    row["name"]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table'"
-                    )
-                }
-        for table in sqlite_tables - {"sqlite_sequence"}:
+        for table in APP_TABLES:
             self.assertIn(f"CREATE TABLE IF NOT EXISTS {table}", ddl)
         self.assertNotIn("CREATE EXTENSION", ddl)
         self.assertNotIn("AUTOINCREMENT", ddl)
@@ -120,9 +93,12 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
         )
 
-    def test_production_requires_postgres(self) -> None:
+    def test_all_environments_require_postgres(self) -> None:
         with patch.dict(os.environ, {"APP_ENV": "production", "DATABASE_URL": ""}, clear=True):
-            with self.assertRaisesRegex(ValueError, "requires a PostgreSQL"):
+            with self.assertRaisesRegex(ValueError, "DATABASE_URL must use postgresql"):
+                load_settings()
+        with patch.dict(os.environ, {"APP_ENV": "development", "DATABASE_URL": ""}, clear=True):
+            with self.assertRaisesRegex(ValueError, "DATABASE_URL must use postgresql"):
                 load_settings()
 
     def test_production_requires_privacy_contact_email(self) -> None:
@@ -147,39 +123,11 @@ class DatabaseCompatibilityTests(unittest.TestCase):
         verify_schema.assert_called_once_with()
         initialize_postgres.assert_not_called()
 
-    def test_migration_rejects_default_live_sqlite_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "var" / "public_restaurant.db"
-            path.parent.mkdir()
-            path.touch()
-            with self.assertRaisesRegex(ValueError, "backup copy"):
-                require_sqlite_copy(path)
-
-    def test_transfer_result_fails_closed(self) -> None:
-        self.assertTrue(transfer_succeeded({"status": "dry_run", "errors": []}))
-        self.assertTrue(transfer_succeeded({"status": "applied", "errors": []}))
-        self.assertFalse(transfer_succeeded({"status": "schema_mismatch", "errors": []}))
-        self.assertFalse(
-            transfer_succeeded({"status": "completed_with_errors", "errors": [{"row": 1}]})
-        )
-
-    def test_transfer_streams_small_batches_and_is_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Database(Path(tmp) / "source-copy.db")
-            target = Database(Path(tmp) / "rollback-target.db")
-            source.initialize()
-            target.initialize()
-            with source.session() as conn:
-                conn.execute("INSERT INTO users (display_name) VALUES (?)", ("fixture-user",))
-
-            first = transfer(source, target, apply=True, batch_size=3)
-            second = transfer(source, target, apply=True, batch_size=2)
-
-            self.assertTrue(transfer_succeeded(first))
-            self.assertTrue(transfer_succeeded(second))
-            self.assertEqual(first["tables"]["institutions"]["source"], source.count("institutions"))
-            self.assertEqual(target.count("users"), 1)
-            self.assertEqual(fingerprint(source), fingerprint(target))
+    def test_database_rejects_non_postgres_targets(self) -> None:
+        with self.assertRaisesRegex(ValueError, "PostgreSQL"):
+            Database("var/public_restaurant.db")
+        with self.assertRaisesRegex(ValueError, "PostgreSQL"):
+            Database("sqlite:///var/public_restaurant.db")
 
 
 if __name__ == "__main__":

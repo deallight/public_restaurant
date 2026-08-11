@@ -1,3 +1,2 @@
-# Runtime dependency for the PostgreSQL backend. SQLite development uses only
-# the Python standard library.
+# Required database driver. PostgreSQL is the only supported backend.
 psycopg[binary]==3.2.13

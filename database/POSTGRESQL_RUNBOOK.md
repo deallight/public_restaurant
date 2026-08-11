@@ -1,4 +1,4 @@
-# PostgreSQL cutover and rollback runbook
+# PostgreSQL-only migration and rollback runbook
 
 All commands must be tested against a database whose name contains `test`
 before the production window. Populate `DATABASE_URL` only in the process
@@ -20,39 +20,34 @@ TEST_DATABASE_URL="$DATABASE_URL" .venv/bin/python -m unittest tests.test_postgr
 only with separate extension-install approval. PostGIS is not needed by the
 current application.
 
-## 2. Back up and dry-run
+## 2. Back up
 
-Stop SQLite writers, then make an immutable copy. Never run the migrator against
-`var/public_restaurant.db` itself.
-
-```bash
-sqlite3 var/public_restaurant.db '.backup /secure-backup/public_restaurant-cutover.db'
-python3 -m scripts.migrate_sqlite_to_postgres \
-  --source-copy /secure-backup/public_restaurant-cutover.db --batch-size 500
-```
-
-The default is dry-run. It checks every table/column and reports counts without
-printing row values. Schema mismatches and row errors return a non-zero process
-exit code. Resolve every mismatch or error before continuing.
-
-## 3. Migrate and verify
+Create a PostgreSQL custom-format backup and verify that its archive list is
+readable before every migration.
 
 ```bash
-python3 -m scripts.migrate_sqlite_to_postgres \
-  --source-copy /secure-backup/public_restaurant-cutover.db --apply --batch-size 500
-
-python3 -m scripts.compare_databases \
-  --sqlite-copy /secure-backup/public_restaurant-cutover.db
+pg_dump --format=custom --dbname="$DATABASE_URL" \
+  --file=/secure-backup/public-restaurant-pre-migration.dump
+pg_restore --list /secure-backup/public-restaurant-pre-migration.dump >/dev/null
+test -s /secure-backup/public-restaurant-pre-migration.dump
 ```
 
-The transfer uses explicit IDs and ID-based upserts, then advances every
-sequence. Rows are streamed in bounded batches, so table size does not determine
-Python memory use. It is safe to rerun and restores seed timestamps exactly. Cut over
-only when schema differences are empty, core table count/content fingerprints
-match, service contracts match, the full SQLite suite passes, and the
-PostgreSQL integration suite passes.
+Do not continue if the database target, environment, backup ownership, archive
+list, or file size is unexpected.
 
-## 4. Production start
+## 3. Apply numbered migrations and verify
+
+```bash
+python3 -m scripts.check_db_schema
+python3 -m scripts.init_db --apply
+python3 -m scripts.check_db_schema
+```
+
+Only reviewed modules in `database/migrations/` are applied. Normal application
+startup never applies DDL. Continue only when the final report is
+`{"status":"compatible","schema_issues":[]}`.
+
+## 4. Start the application
 
 ```bash
 export APP_ENV=production
@@ -60,24 +55,24 @@ export DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restauran
 python3 -m app.server --host 127.0.0.1 --port 8000
 ```
 
-Production mode rejects SQLite and a missing `DATABASE_URL`. Normal application
-startup verifies every required migration plus every required table, column, and
-PostgreSQL data type, and never applies DDL. Schema drift causes startup to fail
-closed.
+Every environment rejects a missing or non-PostgreSQL `DATABASE_URL`. Normal
+application startup verifies every required migration plus every required table,
+column, and PostgreSQL data type. Schema drift causes startup to fail closed.
 
 ## 5. Roll back
 
-Preferred immediate rollback is the untouched cutover SQLite copy: stop the app,
-unset `DATABASE_URL`, set `APP_ENV=development`, and point `APP_DB_PATH` to a
-working copy of the backup. Any writes accepted after PostgreSQL cutover will not
-exist in that snapshot.
-
-To retain post-cutover writes, stop writers and export PostgreSQL to a new file:
+Stop application and worker writers, restore the verified PostgreSQL backup into
+a separate recovery database, validate its schema and service contract, then
+switch `DATABASE_URL` through the reviewed deployment procedure. Never overwrite
+the current PostgreSQL database in place during diagnosis.
 
 ```bash
-python3 -m scripts.export_postgres_to_sqlite --output /secure-backup/rollback-new.db
-python3 -m scripts.export_postgres_to_sqlite --output /secure-backup/rollback-new.db --apply
+createdb public_restaurant_recovery
+pg_restore --dbname=public_restaurant_recovery \
+  /secure-backup/public-restaurant-pre-migration.dump
+DATABASE_URL='postgresql:///public_restaurant_recovery' \
+  python3 -m scripts.check_db_schema
 ```
 
-Verify the exported file before switching. The exporter refuses to overwrite an
-existing path. Keep PostgreSQL intact until rollback validation is complete.
+Keep the original PostgreSQL database and backup intact until recovery is fully
+validated.

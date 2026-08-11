@@ -188,7 +188,7 @@ def main() -> None:
             raise SystemExit("--apply requires an existing non-empty --backup file")
 
     settings = load_settings()
-    database = Database(settings.database_url or settings.db_path)
+    database = Database(settings.database_url)
     result = reset_collection_state(database, apply=args.apply)
     if args.backup is not None:
         result["backup"] = str(args.backup.resolve())

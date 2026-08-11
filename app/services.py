@@ -160,10 +160,7 @@ class RestaurantService:
         self.ai_summary_client = ai_summary_client
         self.restaurant_image_client = restaurant_image_client
         if restaurant_image_upload_dir is None:
-            if database.path is not None:
-                restaurant_image_upload_dir = database.path.parent / "restaurant_images"
-            else:
-                restaurant_image_upload_dir = Path.cwd() / "var" / "restaurant_images"
+            restaurant_image_upload_dir = Path.cwd() / "var" / "restaurant_images"
         self.restaurant_image_upload_dir = Path(restaurant_image_upload_dir).resolve()
         self.ai_summary_now = ai_summary_now or (lambda: datetime.now(timezone.utc))
         self.ai_summary_cooldown_seconds = max(

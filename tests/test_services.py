@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from app.database import Database
 from app.pipeline import DailyPipeline
 from app.agents import PlaceCandidate
 from app.services import (
@@ -17,6 +14,7 @@ from app.services import (
 )
 from app.source_catalog import iter_source_catalog
 from app.utils import safe_json_dumps
+from tests.postgres_test import fresh_postgres_database
 
 
 class FakeReviewSummaryClient:
@@ -73,14 +71,9 @@ class ServiceTests(unittest.TestCase):
     )
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = Database(Path(self.tmp.name) / "test.db")
-        self.db.initialize()
+        self.db = fresh_postgres_database()
         DailyPipeline(self.db).run()
         self.service = RestaurantService(self.db, review_rate_limit_per_hour=3)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
 
     def _insert_manual_review_with_provider(self, suffix: str, place_name: str, amount: int) -> int:
         with self.db.session() as conn:

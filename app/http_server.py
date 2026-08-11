@@ -16,7 +16,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from .auth import SESSION_MAX_AGE_SECONDS, SessionCodec
-from .config import Settings
+from .config import BASE_DIR, Settings
 from .database import Database
 from .integrations import (
     GeocodingNaverClient,
@@ -82,7 +82,7 @@ def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
 class PublicRestaurantApplication:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.database = Database(settings.database_url or settings.db_path)
+        self.database = Database(settings.database_url)
         self.database.prepare()
         geocoding_client = None
         if settings.naver_maps_client_id and settings.naver_maps_client_secret:
@@ -115,7 +115,7 @@ class PublicRestaurantApplication:
             restaurant_image_client=None,
             restaurant_image_upload_dir=(
                 settings.restaurant_image_upload_dir
-                or settings.db_path.parent / "restaurant_images"
+                or BASE_DIR / "var" / "restaurant_images"
             ),
         )
         self.verification_progress = VerificationProgressStore()

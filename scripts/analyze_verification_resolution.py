@@ -215,7 +215,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze or apply stored-evidence approval/rejection resolutions."
     )
-    parser.add_argument("--db", default="", help="SQLite development override")
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -228,10 +227,7 @@ def main() -> None:
         help="Refuse --apply unless the projected resolution percentage meets this value",
     )
     args = parser.parse_args()
-    if args.db and settings.database_url:
-        raise SystemExit("--db cannot override DATABASE_URL")
-    target = Path(args.db) if args.db else settings.database_url or settings.db_path
-    database = Database(target)
+    database = Database(settings.database_url)
     result = (
         apply_stored_evidence_resolutions(database, args.minimum_percent)
         if args.apply

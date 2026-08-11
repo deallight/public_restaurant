@@ -15,12 +15,12 @@ def main() -> None:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="required before applying PostgreSQL DDL; SQLite remains automatic",
+        help="required before applying reviewed PostgreSQL DDL",
     )
     args = parser.parse_args()
     settings = load_settings()
-    database = Database(settings.database_url or settings.db_path)
-    if database.backend == "postgresql" and not args.apply:
+    database = Database(settings.database_url)
+    if not args.apply:
         raise SystemExit("PostgreSQL DDL not applied: review the migration and rerun with --apply")
     database.initialize()
     print(f"Initialized {database.backend} database")

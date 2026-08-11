@@ -3,12 +3,10 @@ from __future__ import annotations
 import http.client
 import json
 import re
-import tempfile
 import threading
 import unittest
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer
-from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
 
@@ -25,6 +23,7 @@ from app.http_server import (
 from app.integrations import OAuthProfile
 from app.services import RequestContext
 from app.views import login_index, public_index
+from tests.postgres_test import fresh_postgres_database, postgres_test_url
 
 
 class SessionCodecTests(unittest.TestCase):
@@ -77,9 +76,9 @@ class AuthViewTests(unittest.TestCase):
 
 class NaverAuthHttpTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        fresh_postgres_database()
         settings = Settings(
-            db_path=Path(self.tmp.name) / "auth.db",
+            database_url=postgres_test_url(),
             port=0,
             naver_login_client_id="test-client-id",
             naver_login_client_secret="test-client-secret",
@@ -96,7 +95,6 @@ class NaverAuthHttpTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
-        self.tmp.cleanup()
 
     def request(
         self,

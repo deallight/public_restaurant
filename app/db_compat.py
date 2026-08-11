@@ -8,7 +8,7 @@ from typing import Any, Iterator, Sequence
 
 
 def normalize_db_value(value: Any) -> Any:
-    """Return values with the same public shape as sqlite3.Row values."""
+    """Normalize PostgreSQL driver values for the JSON-facing service layer."""
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, date):
@@ -25,7 +25,7 @@ def normalize_row(row: Any) -> dict[str, Any] | None:
 
 
 def postgres_sql(sql: str) -> str:
-    """Translate the small, audited SQLite dialect used by the application."""
+    """Translate the application's compact SQL conventions for psycopg."""
     translated = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", sql, flags=re.I)
     ignored_insert = translated != sql
     # psycopg uses percent-style binding. Escape SQL LIKE literals before
@@ -93,18 +93,30 @@ class PostgresCursor:
 
 class PostgresConnection:
     backend = "postgresql"
+    tables_without_id = {
+        "app_schema_migrations",
+        "restaurant_ai_summaries",
+        "review_reactions",
+        "user_saved_restaurants",
+    }
 
     def __init__(self, raw_connection: Any):
         self.raw_connection = raw_connection
 
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> PostgresCursor:
         translated = postgres_sql(sql)
-        is_insert = bool(re.match(r"\s*INSERT\s+INTO\b", translated, flags=re.I))
+        insert_match = re.match(
+            r"\s*INSERT\s+INTO\s+([a-z_]+)\b",
+            translated,
+            flags=re.I,
+        )
+        is_insert = insert_match is not None
+        insert_table = insert_match.group(1).lower() if insert_match else ""
         if (
             is_insert
             and "RETURNING" not in translated.upper()
             and "ON CONFLICT" not in translated.upper()
-            and "APP_SCHEMA_MIGRATIONS" not in translated.upper()
+            and insert_table not in self.tables_without_id
         ):
             translated = translated.rstrip().rstrip(";") + " RETURNING id"
         cursor = self.raw_connection.cursor()

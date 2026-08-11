@@ -24,13 +24,9 @@ POSTGRES_INFORMATION_SCHEMA_TYPES = {
 }
 
 
-def statements(sqlite_schema: str, dependency_drop_order: list[str]) -> list[str]:
-    """Render the current SQLite contract as PostgreSQL-compatible DDL."""
-    schema = re.sub(r"^\s*PRAGMA[^;]+;", "", sqlite_schema, flags=re.M)
-    schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-    schema = re.sub(r"\b([a-z_]+_id) INTEGER\b", r"\1 BIGINT", schema)
-    schema = re.sub(r"\bREAL\b", "DOUBLE PRECISION", schema)
-    raw_statements = [part.strip() for part in schema.split(";") if part.strip()]
+def statements(schema_template: str, dependency_order: list[str]) -> list[str]:
+    """Order the authoritative PostgreSQL schema for dependency-safe creation."""
+    raw_statements = [part.strip() for part in schema_template.split(";") if part.strip()]
     table_statements: dict[str, str] = {}
     other_statements: list[str] = []
     for statement in raw_statements:
@@ -41,7 +37,7 @@ def statements(sqlite_schema: str, dependency_drop_order: list[str]) -> list[str
             other_statements.append(statement)
     ddl = [
         table_statements[name]
-        for name in reversed(dependency_drop_order)
+        for name in reversed(dependency_order)
         if name in table_statements
     ]
     ddl.extend(other_statements)

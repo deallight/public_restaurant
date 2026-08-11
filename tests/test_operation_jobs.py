@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,17 +11,13 @@ from app.config import Settings
 from app.database import Database
 from app.operation_jobs import OperationJobQueue
 from app.worker import OperationWorker
+from tests.postgres_test import fresh_postgres_database, postgres_test_url
 
 
 class OperationJobQueueTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.database = Database(Path(self.tmp.name) / "jobs.db")
-        self.database.initialize()
+        self.database = fresh_postgres_database()
         self.queue = OperationJobQueue(self.database)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
 
     def test_job_lifecycle_is_persisted_and_duplicate_active_request_is_reused(self) -> None:
         first = self.queue.enqueue(
@@ -73,7 +68,7 @@ class OperationJobQueueTests(unittest.TestCase):
         self.assertIsNone(recovered["worker_id"])
 
     def test_worker_dispatches_collection_job_and_stores_result(self) -> None:
-        settings = Settings(db_path=Path(self.tmp.name) / "worker.db")
+        settings = Settings(database_url=postgres_test_url())
         worker = OperationWorker(settings, worker_id="worker-test")
         queued = worker.queue.enqueue(
             "collection_plan_run",
@@ -90,7 +85,7 @@ class OperationJobQueueTests(unittest.TestCase):
         self.assertEqual(completed["result"], result)
 
     def test_worker_dispatches_parsing_job_and_stores_result(self) -> None:
-        settings = Settings(db_path=Path(self.tmp.name) / "parsing-worker.db")
+        settings = Settings(database_url=postgres_test_url())
         worker = OperationWorker(settings, worker_id="parsing-worker-test")
         queued = worker.queue.enqueue(
             "collection_plan_parse",
@@ -107,7 +102,7 @@ class OperationJobQueueTests(unittest.TestCase):
         self.assertEqual(completed["result"], result)
 
     def test_worker_persists_verification_progress_for_http_polling(self) -> None:
-        settings = Settings(db_path=Path(self.tmp.name) / "verification-worker.db")
+        settings = Settings(database_url=postgres_test_url())
         worker = OperationWorker(settings, worker_id="verification-worker-test")
         queued = worker.queue.enqueue("verify_collected", {"limit": 1, "sort": "id_asc"})
 
@@ -145,16 +140,14 @@ class OperationJobQueueTests(unittest.TestCase):
         self.assertEqual(completed["progress"]["classifications"]["approved"], 1)
 
     def test_worker_cli_processes_job_in_a_separate_process(self) -> None:
-        database_path = Path(self.tmp.name) / "worker-process.db"
-        database = Database(database_path)
-        database.initialize()
+        database_url = postgres_test_url()
+        database = Database(database_url)
         queue = OperationJobQueue(database)
         queued = queue.enqueue("verify_collected", {"limit": 1, "sort": "id_asc"})
         environment = {
             **os.environ,
             "APP_ENV": "development",
-            "DATABASE_URL": "",
-            "APP_DB_PATH": str(database_path),
+            "DATABASE_URL": database_url,
         }
 
         result = subprocess.run(

@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from zipfile import ZipFile
 
-from app.database import Database
 from app.pipeline import BusanCityLiveAdapter, DailyPipeline
 from app.xlsx_parser import parse_expense_xlsx
+from tests.postgres_test import fresh_postgres_database
 
 
 def make_xlsx(
@@ -211,8 +211,7 @@ class BusanLiveAdapterTests(unittest.TestCase):
     def test_collection_plan_parse_keeps_rows_outside_used_date_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            database = Database(root / "test.db")
-            database.initialize()
+            database = fresh_postgres_database()
             collection_pipeline = DailyPipeline(
                 database,
                 adapter=FakeLiveAdapter(root / "raw", date_value="20251231"),
