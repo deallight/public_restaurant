@@ -1332,6 +1332,54 @@
   margin: 0;
 }
 
+.account-mobile-menu {
+  display: none;
+  position: relative;
+}
+
+.account-mobile-menu summary {
+  list-style: none;
+}
+
+.account-mobile-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.account-mobile-menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  gap: 4px;
+  width: 148px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 14px 32px rgba(29, 41, 57, 0.18);
+}
+
+.account-mobile-menu-panel a,
+.account-mobile-menu-panel button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 40px;
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--ink);
+  background: #fff;
+  font-weight: 800;
+  text-align: left;
+  text-decoration: none;
+}
+
+.account-mobile-menu-panel a:hover,
+.account-mobile-menu-panel button:hover {
+  background: #edf6f4;
+}
+
 .account-login,
 .account-name,
 .account-logout {
@@ -1870,6 +1918,17 @@ button {
   grid-template-columns: minmax(160px, 1fr) 72px;
   gap: 8px;
   width: 100%;
+}
+
+.search-submit-icon {
+  display: none;
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
 }
 
 .searchbar input,
@@ -6577,6 +6636,129 @@ button:disabled {
   .workflow-db-row-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 520px) {
+  .map-controls {
+    top: 6px;
+    right: 4px;
+    left: 4px;
+  }
+
+  .topbar {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    gap: 4px;
+    padding: 4px;
+  }
+
+  .brand {
+    display: block;
+    width: 28px;
+    height: 28px;
+  }
+
+  .searchbar {
+    grid-column: 2;
+    grid-row: 1;
+    grid-template-columns: minmax(0, 1fr) 44px;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .searchbar input,
+  .searchbar > button {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .searchbar input {
+    min-width: 0;
+    padding: 9px 11px;
+  }
+
+  .searchbar > button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    padding: 0;
+  }
+
+  .search-submit-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .search-submit-icon {
+    display: block;
+  }
+
+  .account-actions {
+    grid-column: 3;
+    grid-row: 1;
+    gap: 0;
+  }
+
+  .account-actions.signed-in > .account-name,
+  .account-actions.signed-in > form {
+    display: none;
+  }
+
+  .account-mobile-menu {
+    display: block;
+    z-index: 2;
+  }
+
+  .account-mobile-menu summary {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border: 1px solid #cfe2df;
+    border-radius: 6px;
+    color: var(--accent);
+    background: #edf6f4;
+    cursor: pointer;
+  }
+
+  .account-mobile-menu summary svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.8;
+  }
+
+  .account-login {
+    min-height: 44px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 820px) {
+  .detail-panel .detail-summary {
+    cursor: grab;
+    touch-action: pan-x;
+  }
+
+  .detail-panel.detail-dragging {
+    transition: none;
+    transform: translateY(var(--detail-drag-offset, 0));
+    user-select: none;
+  }
+
+  .detail-panel.detail-dragging .detail-summary {
+    cursor: grabbing;
   }
 }
 

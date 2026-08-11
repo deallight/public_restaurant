@@ -69,9 +69,13 @@ class AuthViewTests(unittest.TestCase):
         signed_in = public_index("", current_user={"display_name": "테스터"})
 
         self.assertIn('href="/login"', anonymous)
+        self.assertIn('class="search-submit"', anonymous)
+        self.assertIn('aria-label="검색"', anonymous)
         self.assertIn("테스터", signed_in)
         self.assertIn('window.CURRENT_USER_DISPLAY_NAME = "테스터";', signed_in)
         self.assertIn('action="/auth/logout"', signed_in)
+        self.assertIn('class="account-mobile-menu"', signed_in)
+        self.assertIn('aria-label="계정 메뉴"', signed_in)
 
 
 class NaverAuthHttpTests(unittest.TestCase):
