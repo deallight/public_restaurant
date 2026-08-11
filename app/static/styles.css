@@ -2399,7 +2399,10 @@ button {
   top: 128px;
   height: auto;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-rows: auto auto max-content minmax(160px, 1fr);
+  grid-template-rows: auto auto max-content max-content;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .detail-panel.detail-expanded .detail-summary {
@@ -2474,12 +2477,13 @@ button {
 }
 
 .visit-history.is-paginated {
-  height: min(360px, 42vh);
+  height: max-content;
 }
 
 .visit-history.is-paginated .visit-table-scroll {
-  flex: 1 1 auto;
-  overflow: auto;
+  flex: 0 0 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .visit-table {
@@ -2881,6 +2885,21 @@ button {
   grid-row: 4;
   border-top: 1px solid var(--line);
   padding-top: 14px;
+}
+
+@media (min-width: 821px) {
+  .detail-panel.detail-expanded .restaurant-photo-card,
+  .detail-panel.detail-expanded .reviews {
+    align-self: start;
+    min-height: 160px;
+    overflow: visible;
+  }
+
+  .detail-panel.detail-expanded .restaurant-photo-grid {
+    grid-auto-rows: clamp(160px, 22vh, 220px);
+    flex: 0 0 auto;
+    overflow: visible;
+  }
 }
 
 .review-list {
