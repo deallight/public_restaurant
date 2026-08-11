@@ -14,6 +14,9 @@ readonly BRANCH="main"
 readonly APP_USER="deploy"
 readonly APP_GROUP="deploy"
 readonly SERVICE_NAME="public-restaurant.service"
+readonly WORKER_SERVICE_NAME="public-restaurant-worker.service"
+readonly WORKER_UNIT_SOURCE="deploy/public-restaurant-worker.service"
+readonly WORKER_UNIT_PATH="/etc/systemd/system/${WORKER_SERVICE_NAME}"
 readonly PROD_ENV_FILE="${SHARED_DIR}/public_restaurant.env"
 readonly TEST_ENV_FILE="${SHARED_DIR}/public_restaurant_test.env"
 readonly SHARED_VAR_DIR="${SHARED_DIR}/var"
@@ -42,11 +45,11 @@ Usage: sudo /srv/app/bin/deploy-public-restaurant [--skip-tests]
 Deploy the latest GitHub main commit to the N150 production service.
 
 The default workflow creates a new release, installs dependencies, runs the
-isolated PostgreSQL integration suite, verifies the production schema, creates
-a PostgreSQL backup, starts a production preflight server on 127.0.0.1:18001,
-atomically switches /srv/app/current, restarts systemd, and verifies local and
-public HTTP responses. A failed post-switch check automatically restores the
-previous release.
+isolated PostgreSQL integration suite, creates a PostgreSQL backup, applies and
+verifies reviewed migrations, starts a production preflight server on
+127.0.0.1:18001, atomically switches /srv/app/current, restarts the web and
+background worker services, and verifies local and public HTTP responses. A
+failed post-switch check automatically restores the previous release.
 
 Options:
   --skip-tests  Skip the isolated PostgreSQL test suite. Use only when the
@@ -155,8 +158,12 @@ atomic_switch() {
 rollback_release() {
   [[ -n "$PREVIOUS_RELEASE" ]] || return 1
   warn "restoring previous release: $PREVIOUS_RELEASE"
+  systemctl stop "$WORKER_SERVICE_NAME" >/dev/null 2>&1 || true
   atomic_switch "$PREVIOUS_RELEASE" "rollback"
   systemctl restart "$SERVICE_NAME"
+  if [[ -f "$PREVIOUS_RELEASE/app/worker.py" ]]; then
+    systemctl restart "$WORKER_SERVICE_NAME"
+  fi
   if wait_for_http 200 "http://${APP_HOST}:${APP_PORT}/" "rollback upstream" 30; then
     warn "rollback completed"
     return 0
@@ -320,6 +327,27 @@ else
   warn "isolated PostgreSQL tests were explicitly skipped"
 fi
 
+log "creating a production PostgreSQL backup"
+install -d -o postgres -g postgres -m 700 "$BACKUP_DIR"
+BACKUP_FILE="${BACKUP_DIR}/predeploy-${SHORT_SHA}-$(date +%Y%m%d-%H%M%S).dump"
+runuser -u postgres -- sh -c \
+  'umask 077; exec pg_dump --format=custom --dbname="$1" --file="$2"' \
+  sh "$DATABASE_NAME" "$BACKUP_FILE"
+runuser -u postgres -- pg_restore --list "$BACKUP_FILE" >/dev/null
+[[ -s "$BACKUP_FILE" ]] || die "PostgreSQL backup is empty"
+log "backup verified: $BACKUP_FILE"
+
+log "applying reviewed production PostgreSQL migrations"
+MIGRATION_UNIT="public-restaurant-migrate-${SHORT_SHA}-$$"
+systemd-run --quiet --wait --pipe --collect \
+  --unit="$MIGRATION_UNIT" \
+  --uid="$APP_USER" \
+  --gid="$APP_GROUP" \
+  --setenv="HOME=${APP_HOME}" \
+  --working-directory="$NEW_RELEASE" \
+  --property="EnvironmentFile=${PROD_ENV_FILE}" \
+  "$NEW_RELEASE/.venv/bin/python" -m scripts.init_db --apply
+
 log "checking production PostgreSQL schema compatibility"
 SCHEMA_UNIT="public-restaurant-schema-${SHORT_SHA}-$$"
 systemd-run --quiet --wait --pipe --collect \
@@ -330,16 +358,6 @@ systemd-run --quiet --wait --pipe --collect \
   --working-directory="$NEW_RELEASE" \
   --property="EnvironmentFile=${PROD_ENV_FILE}" \
   "$NEW_RELEASE/.venv/bin/python" -m scripts.check_db_schema
-
-log "creating a production PostgreSQL backup"
-install -d -o postgres -g postgres -m 700 "$BACKUP_DIR"
-BACKUP_FILE="${BACKUP_DIR}/predeploy-${SHORT_SHA}-$(date +%Y%m%d-%H%M%S).dump"
-runuser -u postgres -- sh -c \
-  'umask 077; exec pg_dump --format=custom --dbname="$1" --file="$2"' \
-  sh "$DATABASE_NAME" "$BACKUP_FILE"
-runuser -u postgres -- pg_restore --list "$BACKUP_FILE" >/dev/null
-[[ -s "$BACKUP_FILE" ]] || die "PostgreSQL backup is empty"
-log "backup verified: $BACKUP_FILE"
 
 PREFLIGHT_UNIT="public-restaurant-preflight-${SHORT_SHA}-$$"
 systemctl stop "$PREFLIGHT_UNIT" >/dev/null 2>&1 || true
@@ -365,6 +383,13 @@ wait_for_http 200 "http://${APP_HOST}:${PREFLIGHT_PORT}/static/app.js" "prefligh
 wait_for_http 401 "http://${APP_HOST}:${PREFLIGHT_PORT}/admin" "preflight admin guard"
 stop_preflight
 
+[[ -f "$NEW_RELEASE/$WORKER_UNIT_SOURCE" ]] \
+  || die "worker systemd unit is missing from the release"
+install -o root -g root -m 644 \
+  "$NEW_RELEASE/$WORKER_UNIT_SOURCE" "${WORKER_UNIT_PATH}.next"
+mv -Tf "${WORKER_UNIT_PATH}.next" "$WORKER_UNIT_PATH"
+systemctl daemon-reload
+
 [[ "$(readlink -f "$CURRENT_LINK")" == "$PREVIOUS_RELEASE" ]] \
   || die "current release changed while deployment was running"
 
@@ -373,6 +398,8 @@ atomic_switch "$NEW_RELEASE" "$SHORT_SHA"
 SWITCHED=1
 
 systemctl restart "$SERVICE_NAME"
+systemctl enable "$WORKER_SERVICE_NAME" >/dev/null
+systemctl restart "$WORKER_SERVICE_NAME"
 wait_for_http 200 "http://${APP_HOST}:${APP_PORT}/" "production upstream"
 wait_for_http 200 "http://${APP_HOST}:${APP_PORT}/api/map/restaurants" "production map"
 wait_for_http 401 "http://${APP_HOST}:${APP_PORT}/admin" "production admin guard"
@@ -381,6 +408,12 @@ NEW_MAIN_PID="$(systemctl show "$SERVICE_NAME" --property=MainPID --value)"
 [[ "$NEW_MAIN_PID" =~ ^[1-9][0-9]*$ ]] || die "new systemd MainPID is invalid"
 [[ "$(readlink -f "/proc/${NEW_MAIN_PID}/cwd")" == "$NEW_RELEASE" ]] \
   || die "systemd process is not running from the new release"
+systemctl is-active --quiet "$WORKER_SERVICE_NAME" \
+  || die "${WORKER_SERVICE_NAME} is not active after deployment"
+WORKER_MAIN_PID="$(systemctl show "$WORKER_SERVICE_NAME" --property=MainPID --value)"
+[[ "$WORKER_MAIN_PID" =~ ^[1-9][0-9]*$ ]] || die "worker systemd MainPID is invalid"
+[[ "$(readlink -f "/proc/${WORKER_MAIN_PID}/cwd")" == "$NEW_RELEASE" ]] \
+  || die "worker process is not running from the new release"
 
 wait_for_http 200 "${PUBLIC_URL}/" "public home"
 wait_for_http 200 "${PUBLIC_URL}/api/map/restaurants" "public map"

@@ -41,17 +41,21 @@ class N150DeployScriptTests(unittest.TestCase):
     def test_safety_gates_precede_the_release_switch(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         schema_check = source.index("-m scripts.check_db_schema")
+        migration = source.index("-m scripts.init_db --apply")
         backup = source.index("pg_dump --format=custom")
         preflight = source.index('wait_for_http 200 "http://${APP_HOST}:${PREFLIGHT_PORT}/"')
         release_switch = source.index('atomic_switch "$NEW_RELEASE"')
         public_check = source.index('wait_for_http 200 "${PUBLIC_URL}/" "public home"')
 
-        self.assertLess(schema_check, backup)
+        self.assertLess(backup, migration)
+        self.assertLess(migration, schema_check)
         self.assertLess(backup, preflight)
         self.assertLess(preflight, release_switch)
         self.assertLess(release_switch, public_check)
         self.assertIn("rollback_release", source)
         self.assertIn("another deployment is already running", source)
+        self.assertIn('systemctl restart "$WORKER_SERVICE_NAME"', source)
+        self.assertIn('systemctl is-active --quiet "$WORKER_SERVICE_NAME"', source)
 
     @unittest.skipIf(os.geteuid() == 0, "non-root guard requires a non-root test process")
     def test_deployment_requires_sudo(self) -> None:

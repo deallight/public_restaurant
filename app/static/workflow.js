@@ -122,6 +122,9 @@ const workflowState = {
   verificationRequestPending: false,
   verificationRequestedTotal: 0,
   verificationRequestedAt: "",
+  operationJobs: [],
+  operationJobTimer: null,
+  operationJobStatuses: {},
   syncedPlanPeriod: false,
 };
 
@@ -430,7 +433,11 @@ function verificationProgressItem(candidateId) {
 }
 
 function verificationIsRunning() {
-  return Boolean(workflowState.verificationRequestPending || workflowState.verificationProgress?.active);
+  return Boolean(
+    workflowState.verificationRequestPending
+    || workflowState.verificationProgress?.active
+    || activeOperationJobs().some((job) => ["verify_pending", "verify_collected"].includes(job.job_type))
+  );
 }
 
 function renderVerificationActivity() {
@@ -646,6 +653,67 @@ function persistedLogEntries() {
   return [...batches, ...dlq];
 }
 
+const OPERATION_JOB_META = {
+  collection_plan_create: { label: "목록 가져오기", selector: "#workflow-fetch-list" },
+  collection_plan_run: { label: "수집", selector: "#workflow-run-collection" },
+  collection_plan_retry: { label: "재수집", selector: "#workflow-retry-collection" },
+  collection_plan_parse: { label: "파싱", selector: "#workflow-run-parse" },
+  collection_plan_parse_retry: { label: "실패 재파싱", selector: "#workflow-retry-parse" },
+  verify_pending: { label: "검증", selector: "#workflow-run-verification" },
+  verify_collected: { label: "검증", selector: "#workflow-run-verification" },
+};
+
+function activeOperationJobs() {
+  return (workflowState.operationJobs || []).filter((job) => ["queued", "running"].includes(job.status));
+}
+
+function mergeOperationJob(job) {
+  const jobs = workflowState.operationJobs || [];
+  const remaining = jobs.filter((item) => Number(item.job_id) !== Number(job.job_id));
+  workflowState.operationJobs = [job, ...remaining]
+    .sort((a, b) => Number(b.job_id) - Number(a.job_id))
+    .slice(0, 40);
+}
+
+function operationJobLogEntries() {
+  return (workflowState.operationJobs || []).map((job) => {
+    const meta = OPERATION_JOB_META[job.job_type] || { label: job.job_type || "작업" };
+    const progress = job.progress || {};
+    const statusLabel = {
+      queued: "대기열 등록",
+      running: progress.label || "실행 중",
+      succeeded: `완료: ${actionSummary(job.result || {})}`,
+      failed: `실패: ${job.error_message || "오류 메시지 없음"}`,
+    }[job.status] || job.status;
+    return {
+      time: job.finished_at || job.heartbeat_at || job.started_at || job.created_at,
+      message: `${meta.label} #${job.job_id} ${statusLabel}`,
+      tone: job.status === "failed" ? "error" : job.status === "succeeded" ? "success" : "info",
+      className: "operation-job",
+    };
+  });
+}
+
+function syncOperationButtons() {
+  const active = activeOperationJobs();
+  Object.entries(OPERATION_JOB_META).forEach(([jobType, meta]) => {
+    const button = select(meta.selector);
+    if (!button) return;
+    if (!button.dataset.idleText) button.dataset.idleText = button.textContent;
+    const running = active.some((job) => job.job_type === jobType);
+    if (running) {
+      button.disabled = true;
+      button.textContent = "실행 중";
+      button.setAttribute("aria-busy", "true");
+    } else if (!active.some((job) => OPERATION_JOB_META[job.job_type]?.selector === meta.selector)) {
+      button.disabled = false;
+      button.textContent = button.dataset.idleText;
+      button.setAttribute("aria-busy", "false");
+    }
+  });
+  renderVerificationActivity();
+}
+
 function verificationProgressLogEntry() {
   const progress = workflowState.verificationProgress || {};
   const running = verificationIsRunning();
@@ -674,6 +742,7 @@ function renderLogPanel() {
   const progressEntry = verificationProgressLogEntry();
   const entries = [
     ...(progressEntry ? [progressEntry] : []),
+    ...operationJobLogEntries(),
     ...workflowState.localLogs,
     ...persistedLogEntries(),
   ]
@@ -729,6 +798,7 @@ function renderAll() {
   renderVerificationActivity();
   renderLogPanel();
   updateStepsAndSummary();
+  syncOperationButtons();
 }
 
 async function loadWorkflowData() {
@@ -739,7 +809,7 @@ async function loadWorkflowData() {
 
   const shouldLoadDocuments = Boolean(select("#workflow-document-rows"));
   const shouldLoadCandidates = Boolean(select("#workflow-candidate-rows"));
-  const [dashboard, documents, candidates, progress] = await Promise.all([
+  const [dashboard, documents, candidates, progress, operationJobs] = await Promise.all([
     fetchJson(`/ops/dashboard?${dashboardQueryParams().toString()}`),
     shouldLoadDocuments
       ? fetchJson(`/admin/documents/data?${documentQueryParams().toString()}`)
@@ -748,15 +818,81 @@ async function loadWorkflowData() {
       ? fetchJson(`/admin/candidates?${candidateQueryParams().toString()}`)
       : Promise.resolve({ groups: {}, selected: { items: [], total: 0 } }),
     shouldLoadCandidates ? fetchJson("/ops/verification-progress") : Promise.resolve({ items: [] }),
+    fetchJson("/ops/jobs?limit=40"),
   ]);
   workflowState.dashboard = dashboard;
   workflowState.documents = documents;
   workflowState.candidates = candidates;
   workflowState.verificationProgress = progress;
+  workflowState.operationJobs = operationJobs.jobs || [];
+  workflowState.operationJobStatuses = Object.fromEntries(
+    workflowState.operationJobs.map((job) => [String(job.job_id), job.status])
+  );
   renderAll();
   if (progress.active && !workflowState.verificationProgressTimer) {
     startVerificationProgressPolling();
   }
+  if (activeOperationJobs().length) startOperationJobPolling();
+}
+
+async function refreshOperationJobs() {
+  const previous = { ...(workflowState.operationJobStatuses || {}) };
+  const payload = await fetchJson("/ops/jobs?limit=40");
+  workflowState.operationJobs = payload.jobs || [];
+  workflowState.operationJobStatuses = Object.fromEntries(
+    workflowState.operationJobs.map((job) => [String(job.job_id), job.status])
+  );
+  const completedSinceLastPoll = workflowState.operationJobs.some((job) => (
+    ["queued", "running"].includes(previous[String(job.job_id)])
+    && ["succeeded", "failed"].includes(job.status)
+  ));
+  renderLogPanel();
+  syncOperationButtons();
+  if (!activeOperationJobs().length) stopOperationJobPolling();
+  if (completedSinceLastPoll) {
+    await loadWorkflowData();
+  }
+  return payload;
+}
+
+function startOperationJobPolling() {
+  if (workflowState.operationJobTimer) return;
+  workflowState.operationJobTimer = window.setInterval(() => {
+    refreshOperationJobs().catch((error) => {
+      appendLog(`비동기 작업 조회 실패: ${error.message}`, "error");
+    });
+  }, 1000);
+}
+
+function stopOperationJobPolling() {
+  if (!workflowState.operationJobTimer) return;
+  window.clearInterval(workflowState.operationJobTimer);
+  workflowState.operationJobTimer = null;
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function waitForOperationJob(initialJob) {
+  let job = initialJob;
+  mergeOperationJob(job);
+  startOperationJobPolling();
+  while (["queued", "running"].includes(job.status)) {
+    await wait(700);
+    job = await fetchJson(job.status_url || `/ops/jobs/${job.job_id}`);
+    mergeOperationJob(job);
+    workflowState.operationJobStatuses[String(job.job_id)] = job.status;
+    renderLogPanel();
+    syncOperationButtons();
+    if (["verify_pending", "verify_collected"].includes(job.job_type)) {
+      await refreshVerificationProgress().catch(() => {});
+    }
+  }
+  if (job.status === "failed") {
+    throw new Error(job.error_message || "비동기 작업 실패");
+  }
+  return job;
 }
 
 async function refreshVerificationProgress() {
@@ -830,7 +966,17 @@ async function runWorkflowAction(button, label, action, options = {}) {
     startVerificationProgressPolling();
   }
   try {
-    const payload = await action();
+    const queuedPayload = await action();
+    let payload = queuedPayload;
+    if (queuedPayload?.job_id) {
+      appendLog(
+        `${label} 작업 #${queuedPayload.job_id} 대기열 등록${queuedPayload.deduplicated ? " (기존 작업 사용)" : ""}`,
+        "info"
+      );
+      const job = await waitForOperationJob(queuedPayload);
+      payload = job.result || {};
+    }
+    if (options.onCompleted) options.onCompleted(payload);
     appendLog(`${label} 완료: ${actionSummary(payload)}`, "success");
     showToast(`${label} 완료`);
     if (options.trackVerificationProgress) {
@@ -854,6 +1000,7 @@ async function runWorkflowAction(button, label, action, options = {}) {
       renderVerificationActivity();
       renderLogPanel();
     }
+    syncOperationButtons();
   }
 }
 
@@ -884,14 +1031,16 @@ function applyWorkflowMode() {
 }
 
 on("#workflow-fetch-list", "click", (event) => {
-  runWorkflowAction(event.currentTarget, "목록 가져오기", async () => {
-    const payload = await fetchJson("/ops/collection-plans", {
+  runWorkflowAction(event.currentTarget, "목록 가져오기", () => (
+    fetchJson("/ops/collection-plans", {
       method: "POST",
       body: JSON.stringify(periodPayload()),
-    });
-    workflowState.currentPlanId = payload.plan_id;
-    resetPages();
-    return payload;
+    })
+  ), {
+    onCompleted: (payload) => {
+      workflowState.currentPlanId = payload.plan_id;
+      resetPages();
+    },
   });
 });
 

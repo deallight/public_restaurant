@@ -1,0 +1,21 @@
+[Unit]
+Description=Public Restaurant background operation worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/srv/app/current
+EnvironmentFile=/srv/app/shared/public_restaurant.env
+Environment=HOME=/home/deploy
+ExecStart=/srv/app/current/.venv/bin/python -u -m app.worker --poll-interval 1
+Restart=always
+RestartSec=3
+TimeoutStopSec=300
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

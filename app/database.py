@@ -17,6 +17,11 @@ from database.migrations.m0003_user_interactions import (
     STATEMENTS as USER_INTERACTIONS_STATEMENTS,
     VERSION as USER_INTERACTIONS_VERSION,
 )
+from database.migrations.m0004_operation_jobs import (
+    DESCRIPTION as OPERATION_JOBS_DESCRIPTION,
+    STATEMENTS as OPERATION_JOBS_STATEMENTS,
+    VERSION as OPERATION_JOBS_VERSION,
+)
 
 from .db_compat import connect_postgres
 from .schema import SQLITE_SCHEMA
@@ -25,6 +30,7 @@ from .utils import safe_json_dumps, utc_now
 
 
 SQLITE_TABLES = [
+    "operation_jobs",
     "review_moderation_logs",
     "review_reports",
     "review_reactions",
@@ -63,6 +69,11 @@ REQUIRED_POSTGRES_MIGRATIONS = (
         USER_INTERACTIONS_VERSION,
         USER_INTERACTIONS_DESCRIPTION,
         USER_INTERACTIONS_STATEMENTS,
+    ),
+    (
+        OPERATION_JOBS_VERSION,
+        OPERATION_JOBS_DESCRIPTION,
+        OPERATION_JOBS_STATEMENTS,
     ),
 )
 

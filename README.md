@@ -52,6 +52,16 @@ pg_ctl -D /Users/deallight/develop/server_pc/.postgres/data status
 .venv/bin/python -m app.server --host 127.0.0.1 --port 8000
 ```
 
+수집·파싱·검증 작업은 별도 터미널의 DB 작업 worker가 실행합니다.
+
+```bash
+.venv/bin/python -m app.worker --poll-interval 1
+```
+
+관리자 작업 POST는 즉시 `202`와 `job_id`를 반환하며, 화면은
+`/ops/jobs/{job_id}`를 조회합니다. 운영 배포에서는
+`public-restaurant-worker.service`가 worker를 계속 실행합니다.
+
 브라우저에서 다음 주소를 엽니다.
 
 - 공개 지도: <http://127.0.0.1:8000/>
