@@ -44,6 +44,19 @@ def public_index(
             <form action="/auth/logout" method="post">
               <button class="account-logout" type="submit">로그아웃</button>
             </form>
+            <details class="account-mobile-menu">
+              <summary aria-label="계정 메뉴">
+                <svg aria-hidden="true" viewBox="0 0 24 24">
+                  <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7 8a7 7 0 0 0-14 0" />
+                </svg>
+              </summary>
+              <div class="account-mobile-menu-panel">
+                <a href="/mypage">마이페이지</a>
+                <form action="/auth/logout" method="post">
+                  <button type="submit">로그아웃</button>
+                </form>
+              </div>
+            </details>
           </div>"""
     else:
         account_markup = """<div class="account-actions">
@@ -72,7 +85,13 @@ def public_index(
           </div>
           <form id="search-form" class="searchbar">
             <input id="q" name="q" type="search" placeholder="상호, 주소, 지역 검색" autocomplete="off">
-            <button type="submit">검색</button>
+            <button class="search-submit" type="submit" aria-label="검색">
+              <span class="search-submit-label">검색</span>
+              <svg class="search-submit-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="6.5" />
+                <path d="m16 16 4 4" />
+              </svg>
+            </button>
           </form>
           {account_markup}
         </div>

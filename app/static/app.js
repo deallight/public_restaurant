@@ -1214,6 +1214,9 @@ function slideDetailPanelSnapshotOut(panel, stage) {
 async function selectRestaurant(id, options = {}) {
   const restoreExpanded = options.expanded === true;
   const panel = document.querySelector("#detail-panel");
+  panel.detailDragAbortController?.abort();
+  panel.classList.remove("detail-dragging");
+  panel.style.removeProperty("--detail-drag-offset");
   const stage = panel.closest(".map-stage");
   const previousSelectedId = state.selectedId;
   const selectionRequest = ++state.detailSelectionRequest;
@@ -1513,9 +1516,97 @@ async function selectRestaurant(id, options = {}) {
   expandToggle.addEventListener("click", () => {
     setDetailExpanded(expandToggle.getAttribute("aria-expanded") !== "true");
   });
+
+  const detailDragSurface = panel.querySelector(".detail-summary");
+  let detailDrag = null;
+  const settleDetailDrag = (expanded) => {
+    const currentTop = panel.getBoundingClientRect().top;
+    setDetailExpanded(expanded);
+    panel.style.setProperty("--detail-drag-offset", "0px");
+    const targetTop = panel.getBoundingClientRect().top;
+    panel.style.setProperty("--detail-drag-offset", `${currentTop - targetTop}px`);
+    void panel.offsetHeight;
+    requestAnimationFrame(() => {
+      panel.classList.remove("detail-dragging");
+      panel.style.removeProperty("--detail-drag-offset");
+    });
+  };
+  const finishDetailDrag = (event, cancelled = false) => {
+    if (!detailDrag || event.pointerId !== detailDrag.pointerId) return;
+    const endY = Number.isFinite(event.clientY) ? event.clientY : detailDrag.lastY;
+    const deltaY = endY - detailDrag.startY;
+    const duration = Math.max(1, performance.now() - detailDrag.startedAt);
+    const velocityY = deltaY / duration;
+    const directionDistance = detailDrag.expanded ? deltaY : -deltaY;
+    const directionVelocity = detailDrag.expanded ? velocityY : -velocityY;
+    const shouldToggle = !cancelled && (
+      directionDistance >= 56
+      || (directionDistance >= 24 && directionVelocity >= 0.45)
+    );
+    const nextExpanded = shouldToggle ? !detailDrag.expanded : detailDrag.expanded;
+    const finishedDrag = detailDrag;
+    detailDrag = null;
+    if (detailDragSurface.hasPointerCapture?.(finishedDrag.pointerId)) {
+      detailDragSurface.releasePointerCapture(finishedDrag.pointerId);
+    }
+    settleDetailDrag(nextExpanded);
+  };
+  const detailDragAbortController = new AbortController();
+  panel.detailDragAbortController = detailDragAbortController;
+  const detailDragListenerOptions = { signal: detailDragAbortController.signal };
+  detailDragSurface.addEventListener("pointerdown", (event) => {
+    if (!window.matchMedia?.("(max-width: 820px)").matches) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (event.target.closest("a, button, input, select, textarea, label")) return;
+    detailDrag = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      lastY: event.clientY,
+      startedAt: performance.now(),
+      expanded: panel.classList.contains("detail-expanded"),
+    };
+    panel.classList.add("detail-dragging");
+    panel.style.setProperty("--detail-drag-offset", "0px");
+    detailDragSurface.setPointerCapture?.(event.pointerId);
+  }, detailDragListenerOptions);
+  detailDragSurface.addEventListener("pointermove", (event) => {
+    if (!detailDrag || event.pointerId !== detailDrag.pointerId) return;
+    detailDrag.lastY = event.clientY;
+    const rawDeltaY = event.clientY - detailDrag.startY;
+    const movesTowardOtherState = detailDrag.expanded ? rawDeltaY > 0 : rawDeltaY < 0;
+    const dampedDeltaY = movesTowardOtherState ? rawDeltaY : rawDeltaY * 0.2;
+    const maximumOffset = window.innerHeight * 0.55;
+    const boundedDeltaY = Math.max(-maximumOffset, Math.min(maximumOffset, dampedDeltaY));
+    panel.style.setProperty("--detail-drag-offset", `${boundedDeltaY}px`);
+    if (Math.abs(rawDeltaY) > 3) event.preventDefault();
+  }, detailDragListenerOptions);
+  detailDragSurface.addEventListener(
+    "pointerup",
+    (event) => finishDetailDrag(event),
+    detailDragListenerOptions,
+  );
+  detailDragSurface.addEventListener(
+    "pointercancel",
+    (event) => finishDetailDrag(event, true),
+    detailDragListenerOptions,
+  );
+  window.addEventListener(
+    "pointerup",
+    (event) => finishDetailDrag(event),
+    { capture: true, signal: detailDragAbortController.signal },
+  );
+  window.addEventListener(
+    "pointercancel",
+    (event) => finishDetailDrag(event, true),
+    { capture: true, signal: detailDragAbortController.signal },
+  );
   if (restoreExpanded) setDetailExpanded(true);
   panel.querySelector(".panel-close").addEventListener("click", async () => {
     if (panel.classList.contains("detail-closing")) return;
+    panel.detailDragAbortController?.abort();
+    detailDrag = null;
+    panel.classList.remove("detail-dragging");
+    panel.style.removeProperty("--detail-drag-offset");
     state.detailSelectionRequest += 1;
     stage?.querySelectorAll(".detail-panel-snapshot").forEach((snapshot) => snapshot.remove());
     panel.classList.add("detail-closing");
