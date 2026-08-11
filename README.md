@@ -52,7 +52,10 @@ pg_ctl -D /Users/deallight/develop/server_pc/.postgres/data status
 .venv/bin/python -m app.server --host 127.0.0.1 --port 8000
 ```
 
-수집·파싱·검증 작업은 별도 터미널의 DB 작업 worker가 실행합니다.
+개발 환경에서는 위 명령이 웹 서버와 수집·파싱·검증 DB 작업 worker를
+함께 실행하고, 서버를 종료하면 worker도 같이 종료합니다. worker를 별도
+터미널에서 직접 실행해야 하는 경우에는 서버에 `--no-worker`를 추가한 뒤
+아래 명령을 사용합니다.
 
 ```bash
 .venv/bin/python -m app.worker --poll-interval 1

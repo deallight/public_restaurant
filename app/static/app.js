@@ -2,7 +2,7 @@ const state = {
   restaurants: [],
   map: null,
   markers: [],
-  markerZoom: null,
+  markerViewportKey: null,
   mapEventsBound: false,
   clusterEntries: [],
   clusterInfoWindow: null,
@@ -14,6 +14,7 @@ const state = {
   fallbackViewport: null,
   regionFocus: null,
   detailSelectionRequest: 0,
+  rankingRenderKey: null,
   filters: {
     category: "",
     minVisitCount: "",
@@ -22,6 +23,7 @@ const state = {
 };
 
 const markerClusterRadius = 56;
+const markerViewportPaddingRatio = 0.3;
 const numericClusterMaxZoom = 14;
 
 const regionSearches = [
@@ -481,8 +483,14 @@ function restaurantsVisibleInMap() {
   });
 }
 
-function renderRanking() {
+function renderRanking(options = {}) {
   const visibleRestaurants = restaurantsVisibleInMap();
+  const renderKey = [
+    state.selectedId || "",
+    ...visibleRestaurants.map((restaurant) => restaurant.id),
+  ].join(":");
+  if (options.skipIfUnchanged && renderKey === state.rankingRenderKey) return;
+  state.rankingRenderKey = renderKey;
   document.querySelector("#result-count").textContent = visibleRestaurants.length;
   const list = document.querySelector("#ranking-list");
   if (!visibleRestaurants.length) {
@@ -535,7 +543,6 @@ async function renderMap(options = {}) {
     clearNaverMarkers();
     state.map = null;
     state.mapEventsBound = false;
-    state.markerZoom = null;
     if (options.focus === "results" && options.regionFocus) {
       setFallbackRegionFocus(options.regionFocus);
     } else if (options.focus === "results") {
@@ -563,6 +570,7 @@ function clearNaverMarkers() {
   const markers = state.markers;
   state.markers = [];
   state.clusterEntries = [];
+  state.markerViewportKey = null;
   markers.forEach((marker) => {
     try {
       marker.setMap(null);
@@ -697,6 +705,58 @@ function naverMapPoint(position, zoom) {
     }
   }
   return webMercatorPoint(position, zoom);
+}
+
+function restaurantsInNaverMarkerViewport(restaurants) {
+  const mapNode = document.querySelector("#map");
+  const mapWidth = Number(mapNode?.clientWidth);
+  const mapHeight = Number(mapNode?.clientHeight);
+  if (
+    !state.map
+    || !window.naver?.maps
+    || !Number.isFinite(mapWidth)
+    || mapWidth <= 0
+    || !Number.isFinite(mapHeight)
+    || mapHeight <= 0
+  ) {
+    return restaurants;
+  }
+
+  let projection;
+  try {
+    projection = state.map.getProjection();
+  } catch {
+    return restaurants;
+  }
+  if (!projection || typeof projection.fromCoordToOffset !== "function") return restaurants;
+
+  const paddingX = Math.max(markerClusterRadius * 2, mapWidth * markerViewportPaddingRatio);
+  const paddingY = Math.max(markerClusterRadius * 2, mapHeight * markerViewportPaddingRatio);
+  const viewportRestaurants = [];
+  for (const restaurant of restaurants) {
+    const position = restaurantPosition(restaurant);
+    if (!position) continue;
+    let offset;
+    try {
+      offset = projection.fromCoordToOffset(
+        new naver.maps.LatLng(position.latitude, position.longitude),
+      );
+    } catch {
+      return restaurants;
+    }
+    const x = Number(offset?.x);
+    const y = Number(offset?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return restaurants;
+    if (
+      x >= -paddingX
+      && x <= mapWidth + paddingX
+      && y >= -paddingY
+      && y <= mapHeight + paddingY
+    ) {
+      viewportRestaurants.push(restaurant);
+    }
+  }
+  return viewportRestaurants;
 }
 
 function clustersForNaverMap(restaurants, zoom) {
@@ -925,13 +985,16 @@ function openNaverClusterList(cluster, marker) {
   infoWindow.open(state.map, marker);
 }
 
-function renderNaverMarkers() {
+function renderNaverMarkers(options = {}) {
   if (!state.map || !window.naver?.maps) return;
-  clearNaverMarkers();
   const zoom = Number(state.map.getZoom?.() || 12);
   const numericMode = zoom <= numericClusterMaxZoom;
-  const clusters = clustersForNaverMap(state.restaurants, zoom);
-  state.markerZoom = zoom;
+  const markerRestaurants = restaurantsInNaverMarkerViewport(state.restaurants);
+  const viewportKey = [zoom, ...markerRestaurants.map((restaurant) => restaurant.id)].join(":");
+  if (options.skipIfUnchanged && viewportKey === state.markerViewportKey) return;
+  clearNaverMarkers();
+  const clusters = clustersForNaverMap(markerRestaurants, zoom);
+  state.markerViewportKey = viewportKey;
   state.markers = clusters.map((cluster, index) => {
     const isCluster = cluster.restaurants.length > 1;
     const restaurant = cluster.restaurants[0];
@@ -959,9 +1022,8 @@ function bindNaverMapEvents() {
   if (!state.map || state.mapEventsBound) return;
   state.mapEventsBound = true;
   naver.maps.Event.addListener(state.map, "idle", () => {
-    const zoom = Number(state.map?.getZoom?.());
-    if (Number.isFinite(zoom) && zoom !== state.markerZoom) renderNaverMarkers();
-    renderRanking();
+    renderNaverMarkers({ skipIfUnchanged: true });
+    renderRanking({ skipIfUnchanged: true });
   });
   naver.maps.Event.addListener(state.map, "dragstart", closeClusterInfoWindow);
   naver.maps.Event.addListener(state.map, "click", closeClusterInfoWindow);
