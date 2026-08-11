@@ -416,11 +416,11 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 ## 운영 시 확인할 사항
 
 - GitHub `main` 병합 후 N150 업데이트는 `sudo /srv/app/bin/deploy-public-restaurant`로 실행합니다. 최초 설치와 복구용 수동 절차는 [N150 자가 운영 절차서](database/N150_SELF_SERVICE_RUNBOOK.md)를 따릅니다.
-- 배포 스크립트는 테스트, 운영 스키마 검사, PostgreSQL 백업, 별도 포트 사전 점검, 원자적 release 전환, HTTP 검증과 실패 시 코드 롤백을 수행합니다. 스키마 변경은 자동 적용하지 않습니다.
+- 배포 스크립트는 테스트, PostgreSQL 백업·복원 목록 검증, release에 포함된 검토된 번호형 마이그레이션 적용, 운영 스키마 호환 검사, 별도 포트 사전 점검, 원자적 release 전환, HTTP 검증과 실패 시 코드 롤백을 수행합니다.
 - 운영 URL은 <https://gonggibap.com>이며 `APP_ENV=production`을 사용합니다.
 - 운영 환경은 PostgreSQL `DATABASE_URL`과 유효한 `PRIVACY_CONTACT_EMAIL` 없이는 시작하지 않습니다.
 - DB 비밀번호, OAuth secret, API 키, 세션 키는 배포 환경의 secret으로만 주입합니다.
-- PostgreSQL 스키마 변경은 서버 시작과 분리되어 있습니다. 먼저 스키마 점검, 마이그레이션 검토·적용, 호환 결과 확인, HTTP 상태 확인 순서로 진행합니다.
+- PostgreSQL 스키마 변경은 서버 시작과 분리되어 있습니다. 배포 시 운영 DB 백업 검증을 먼저 마친 뒤 저장소에 포함된 검토된 마이그레이션만 적용하고, 호환 결과와 HTTP 상태를 확인합니다.
 - 라이브 수집은 부산시 게시판 구조와 첨부 포맷에 의존합니다. 지원하지 않는 XLS, DRM, HWP, PDF는 DLQ에 남겨 parser 확장 대상으로 관리합니다.
 - 자동 검증은 근거가 부족한 후보를 공개하지 않고 관리자 검토로 넘깁니다.
 - 외부·관리자 사진은 공개하지 않습니다. 사용자 사진은 직접 촬영 또는 게시 권한 확인을 거쳐 등록하도록 안내합니다.

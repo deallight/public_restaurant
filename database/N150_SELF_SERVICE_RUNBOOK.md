@@ -114,16 +114,18 @@ sudo /srv/app/bin/deploy-public-restaurant
 3. GitHub `main`의 정확한 커밋으로 새 release를 만든다.
 4. release 전용 `.venv`를 만들고 의존성을 설치한다.
 5. `public_restaurant_test`에서 전체 테스트를 실행한다.
-6. 운영 DB 스키마가 코드와 호환되는지 읽기 전용으로 검사한다.
-7. 운영 PostgreSQL 백업을 만들고 `pg_restore --list`로 검증한다.
-8. 운영 환경을 사용하되 별도 포트 `18001`에서 사전 HTTP 점검한다.
-9. `/srv/app/current` 링크를 원자적으로 바꾸고 systemd를 재시작한다.
-10. 내부·외부 HTTP와 실제 프로세스 release를 검사한다.
-11. 전환 이후 검사에 실패하면 이전 release로 자동 롤백한다.
+6. 운영 PostgreSQL 백업을 만들고 `pg_restore --list`로 검증한다.
+7. 새 release에 포함된 검토된 번호형 마이그레이션을 운영 DB에 적용한다.
+8. 운영 DB 스키마가 코드와 호환되는지 읽기 전용으로 검사한다.
+9. 운영 환경을 사용하되 별도 포트 `18001`에서 사전 HTTP 점검한다.
+10. `/srv/app/current` 링크를 원자적으로 바꾸고 Web·Worker systemd 서비스를 재시작한다.
+11. 내부·외부 HTTP와 실제 Web·Worker 프로세스 release를 검사한다.
+12. 전환 이후 검사에 실패하면 이전 release로 자동 롤백한다.
 
-스크립트는 운영 DB에 DDL을 자동 적용하지 않는다. `scripts.check_db_schema`가
-`compatible`이 아니면 배포를 중단하고, 검토된 마이그레이션을 별도로 적용해야
-한다. 이전 release와 백업도 자동 삭제하지 않는다.
+스크립트는 백업 검증이 끝난 뒤 저장소에 포함된 검토된 번호형 마이그레이션만
+적용한다. 마이그레이션 또는 `scripts.check_db_schema`가 실패하면 release 전환
+전에 배포를 중단한다. 임의의 DDL을 실행하지 않으며 이전 release와 백업도 자동
+삭제하지 않는다.
 
 격리된 테스트 DB가 일시적으로 준비되지 않은 경우에만 위험을 인지하고 다음
 옵션을 사용할 수 있다.
