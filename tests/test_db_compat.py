@@ -21,6 +21,14 @@ from database.migrations.m0004_operation_jobs import (
     STATEMENTS as OPERATION_JOBS_STATEMENTS,
     VERSION as OPERATION_JOBS_VERSION,
 )
+from database.migrations.m0005_auth_security import (
+    STATEMENTS as AUTH_SECURITY_STATEMENTS,
+    VERSION as AUTH_SECURITY_VERSION,
+)
+from database.migrations.m0006_oauth_lifecycle import (
+    STATEMENTS as OAUTH_LIFECYCLE_STATEMENTS,
+    VERSION as OAUTH_LIFECYCLE_VERSION,
+)
 
 
 class DatabaseCompatibilityTests(unittest.TestCase):
@@ -93,6 +101,29 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
         )
 
+    def test_auth_security_is_an_explicit_additive_migration(self) -> None:
+        ddl = "\n".join(AUTH_SECURITY_STATEMENTS)
+        self.assertIn("CREATE TABLE IF NOT EXISTS auth_sessions", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS action_tokens", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS security_rate_limit_events", ddl)
+        self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE|ALTER)\b")
+        self.assertIn(
+            AUTH_SECURITY_VERSION,
+            {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
+        )
+
+    def test_oauth_lifecycle_is_an_explicit_reviewed_migration(self) -> None:
+        ddl = "\n".join(OAUTH_LIFECYCLE_STATEMENTS)
+        self.assertIn("ALTER TABLE oauth_accounts", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS oauth_flow_intents", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS oauth_lifecycle_jobs", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS oauth_disconnect_events", ddl)
+        self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE)\b")
+        self.assertIn(
+            OAUTH_LIFECYCLE_VERSION,
+            {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
+        )
+
     def test_all_environments_require_postgres(self) -> None:
         with patch.dict(os.environ, {"APP_ENV": "production", "DATABASE_URL": ""}, clear=True):
             with self.assertRaisesRegex(ValueError, "DATABASE_URL must use postgresql"):
@@ -112,6 +143,19 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(ValueError, "PRIVACY_CONTACT_EMAIL"):
+                load_settings()
+
+    def test_production_requires_dedicated_oauth_and_session_secrets(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "production",
+                "DATABASE_URL": "postgresql://restaurant_app@127.0.0.1/example",
+                "PRIVACY_CONTACT_EMAIL": "privacy@example.test",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "APP_SESSION_SECRET"):
                 load_settings()
 
     def test_postgres_runtime_prepare_never_initializes_schema(self) -> None:

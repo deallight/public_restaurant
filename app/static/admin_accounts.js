@@ -37,6 +37,7 @@ function accountStatusLabel(status) {
   return ({
     active: "활성",
     suspended: "이용 정지",
+    deletion_pending: "탈퇴 처리 중",
     deleted: "탈퇴",
     merged: "통합됨",
   })[status] || status;
@@ -62,7 +63,8 @@ function accountShowToast(message, isError = false) {
 }
 
 async function accountFetchJson(url, options = {}) {
-  const headers = { Accept: "application/json", ...(options.headers || {}) };
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const headers = { Accept: "application/json", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}), ...(options.headers || {}) };
   if (options.body) headers["Content-Type"] = "application/json";
   const response = await fetch(url, { ...options, headers });
   const payload = await response.json().catch(() => ({}));
@@ -71,7 +73,7 @@ async function accountFetchJson(url, options = {}) {
 }
 
 function accountRowMarkup(account) {
-  const isClosed = ["deleted", "merged"].includes(account.status);
+  const isClosed = ["deletion_pending", "deleted", "merged"].includes(account.status);
   const isCurrent = Number(account.id) === Number(accountAdminState.currentUserId);
   const controlsDisabled = isClosed || isCurrent;
   const statusOptions = isClosed

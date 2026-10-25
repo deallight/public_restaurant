@@ -14,7 +14,8 @@ function escapeHtml(value) {
 }
 
 async function restaurantImageFetchJson(url, options = {}) {
-  const headers = { Accept: "application/json", ...(options.headers || {}) };
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const headers = { Accept: "application/json", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}), ...(options.headers || {}) };
   if (options.body && !(options.body instanceof FormData) && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }

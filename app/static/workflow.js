@@ -1,7 +1,8 @@
 async function fetchJson(url, options = {}) {
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", Accept: "application/json", ...(options.headers || {}) },
     ...options,
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}), ...(options.headers || {}) },
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "요청 실패");

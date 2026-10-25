@@ -8,10 +8,20 @@ from urllib.request import Request, urlopen
 
 from app.config import Settings
 from app.database import Database
-from app.http_server import SESSION_COOKIE, PublicRestaurantApplication, make_handler
+from app.http_server import (
+    SESSION_COOKIE,
+    SESSION_CSRF_ACTION,
+    PublicRestaurantApplication,
+    make_handler,
+)
 from app.pipeline import DailyPipeline
 from app.services import RequestContext, RestaurantService
 from database.migrations.m0003_user_interactions import VERSION as USER_INTERACTIONS_VERSION
+from database.migrations.m0005_auth_security import VERSION as AUTH_SECURITY_VERSION
+from database.migrations.m0006_oauth_lifecycle import VERSION as OAUTH_LIFECYCLE_VERSION
+from database.migrations.m0007_oauth_lifecycle_hardening import (
+    VERSION as OAUTH_LIFECYCLE_HARDENING_VERSION,
+)
 from tests.postgres_test import postgres_test_url, reset_postgres_database
 
 
@@ -102,7 +112,10 @@ class PostgresIntegrationTests(unittest.TestCase):
 
         result = service.delete_account(user_id)
 
-        self.assertEqual(result["result"], "deleted")
+        self.assertEqual(result["result"], "deletion_pending")
+        local_delete = service.process_next_oauth_lifecycle_job("postgres-test-worker")
+        self.assertEqual(local_delete["status"], "awaiting_token")
+        self.assertTrue(local_delete["local_delete_completed"])
         with self.db.session() as conn:
             user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             oauth_count = conn.execute(
@@ -129,6 +142,116 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertIsNone(retained_report["reporter_user_id"])
         self.assertIsNone(retained_report["reporter_ip_hash"])
 
+    def test_existing_database_applies_auth_security_migration(self) -> None:
+        with self.db.session() as conn:
+            conn.execute("DROP TABLE IF EXISTS action_tokens CASCADE")
+            conn.execute("DROP TABLE IF EXISTS auth_sessions CASCADE")
+            conn.execute("DROP TABLE IF EXISTS security_rate_limit_events CASCADE")
+            conn.execute(
+                "DELETE FROM app_schema_migrations WHERE version = ?",
+                (AUTH_SECURITY_VERSION,),
+            )
+
+        try:
+            issues = self.db.schema_issues()
+            self.assertTrue(any(AUTH_SECURITY_VERSION in issue for issue in issues))
+            self.assertTrue(any("auth_sessions.session_hash" in issue for issue in issues))
+            self.assertTrue(any("action_tokens.token_hash" in issue for issue in issues))
+
+            self.db.initialize()
+
+            self.assertEqual(self.db.schema_issues(), [])
+            with self.db.session() as conn:
+                migration = conn.execute(
+                    "SELECT description FROM app_schema_migrations WHERE version = ?",
+                    (AUTH_SECURITY_VERSION,),
+                ).fetchone()
+            self.assertIsNotNone(migration)
+        finally:
+            self.db.initialize()
+
+    def test_existing_database_applies_oauth_lifecycle_migration(self) -> None:
+        with self.db.session() as conn:
+            conn.execute("DROP TABLE IF EXISTS oauth_disconnect_events CASCADE")
+            conn.execute("DROP TABLE IF EXISTS oauth_lifecycle_jobs CASCADE")
+            conn.execute("DROP TABLE IF EXISTS oauth_flow_intents CASCADE")
+            conn.execute(
+                "ALTER TABLE oauth_accounts DROP COLUMN IF EXISTS refresh_token_ciphertext"
+            )
+            conn.execute(
+                "ALTER TABLE oauth_accounts DROP COLUMN IF EXISTS token_updated_at"
+            )
+            conn.execute(
+                "DELETE FROM app_schema_migrations WHERE version = ?",
+                (OAUTH_LIFECYCLE_VERSION,),
+            )
+
+        try:
+            issues = self.db.schema_issues()
+            self.assertTrue(any(OAUTH_LIFECYCLE_VERSION in issue for issue in issues))
+            self.assertTrue(
+                any("oauth_accounts.refresh_token_ciphertext" in issue for issue in issues)
+            )
+            self.assertTrue(any("oauth_lifecycle_jobs.id" in issue for issue in issues))
+
+            self.db.initialize()
+
+            self.assertEqual(self.db.schema_issues(), [])
+            with self.db.session() as conn:
+                migration = conn.execute(
+                    "SELECT description FROM app_schema_migrations WHERE version = ?",
+                    (OAUTH_LIFECYCLE_VERSION,),
+                ).fetchone()
+            self.assertIsNotNone(migration)
+        finally:
+            self.db.initialize()
+
+    def test_existing_oauth_lifecycle_constraint_is_hardened(self) -> None:
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                ALTER TABLE oauth_lifecycle_jobs
+                  DROP CONSTRAINT IF EXISTS oauth_lifecycle_jobs_source_check
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE oauth_lifecycle_jobs
+                  ADD CONSTRAINT oauth_lifecycle_jobs_source_check
+                  CHECK (source IN ('user', 'admin', 'provider_callback'))
+                """
+            )
+            conn.execute(
+                "DELETE FROM app_schema_migrations WHERE version = ?",
+                (OAUTH_LIFECYCLE_HARDENING_VERSION,),
+            )
+
+        try:
+            issues = self.db.schema_issues()
+            self.assertTrue(
+                any(OAUTH_LIFECYCLE_HARDENING_VERSION in issue for issue in issues)
+            )
+            self.db.initialize()
+            self.assertEqual(self.db.schema_issues(), [])
+            with self.db.session() as conn:
+                migration = conn.execute(
+                    "SELECT description FROM app_schema_migrations WHERE version = ?",
+                    (OAUTH_LIFECYCLE_HARDENING_VERSION,),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO oauth_lifecycle_jobs
+                      (user_id, provider, subject_hmac, source, status,
+                       next_attempt_at, created_at, updated_at)
+                    VALUES (NULL, 'naver', 'migration-test-subject',
+                            'provider_callback_related', 'awaiting_token',
+                            NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """
+                )
+            self.assertIsNotNone(migration)
+        finally:
+            self.db.initialize()
+
     def test_postgres_http_and_major_screen_contracts(self) -> None:
         settings = Settings(
             database_url=postgres_test_url(),
@@ -142,8 +265,13 @@ class PostgresIntegrationTests(unittest.TestCase):
                 "INSERT INTO users (display_name, role) VALUES (?, ?)",
                 ("PostgreSQL admin test user", "admin"),
             )
+        admin_session = app.issue_session(int(admin_user.lastrowid))
         admin_headers = {
-            "Cookie": f"{SESSION_COOKIE}={app.issue_session(int(admin_user.lastrowid))}"
+            "Cookie": f"{SESSION_COOKIE}={admin_session}",
+            "X-CSRF-Token": app.session_codec.issue_action_token(
+                admin_session,
+                SESSION_CSRF_ACTION,
+            ),
         }
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
         thread = threading.Thread(target=server.serve_forever, daemon=True)

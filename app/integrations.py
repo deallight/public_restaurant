@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,16 +15,27 @@ from .agents import (
     PermitSnapshot,
     PlaceCandidate,
     category_from_text,
+    franchise_search_name,
     generic_parenthetical_place_name,
     name_similarity_with_branch,
     parse_place_name,
     similarity,
+    split_place_name_parts,
 )
 from .utils import normalize_address, normalize_text, strip_address_detail
 
 
 class IntegrationError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 def _get_json(url: str, headers: dict[str, str], timeout: int = 8) -> dict[str, Any]:
@@ -32,10 +44,31 @@ def _get_json(url: str, headers: dict[str, str], timeout: int = 8) -> dict[str, 
         with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise IntegrationError(f"HTTP {exc.code}: {body[:300]}") from exc
+        try:
+            exc.read()
+        finally:
+            exc.close()
+        status_code = int(exc.code)
+        raise IntegrationError(
+            "HTTP GET request failed",
+            status_code=status_code,
+            retryable=status_code == 429 or status_code >= 500,
+        ) from exc
     except URLError as exc:
-        raise IntegrationError(str(exc)) from exc
+        raise IntegrationError("HTTP GET service is unavailable", retryable=True) from exc
+
+
+def _get_json_with_retry(url: str, headers: dict[str, str], timeout: int = 8) -> dict[str, Any]:
+    """Retry transient GET failures for rate-limited integrations only."""
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            return _get_json(url, headers, timeout)
+        except IntegrationError as exc:
+            if not exc.retryable or attempt >= attempts - 1:
+                raise
+            time.sleep(0.75 * (2**attempt))
+    raise IntegrationError("HTTP GET request failed", retryable=True)
 
 
 def _post_form_json(
@@ -63,6 +96,39 @@ def _post_form_json(
         raise IntegrationError(f"HTTP {exc.code}: {body[:300]}") from exc
     except URLError as exc:
         raise IntegrationError(str(exc)) from exc
+
+
+def _post_form_status(
+    url: str,
+    data: dict[str, str],
+    *,
+    timeout: int = 8,
+) -> int:
+    request = Request(
+        url,
+        data=urlencode(data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            response.read()
+            return int(response.status)
+    except HTTPError as exc:
+        exc.read()
+        raise IntegrationError(
+            "Naver token revocation failed",
+            status_code=int(exc.code),
+            retryable=int(exc.code) == 503,
+        ) from exc
+    except URLError as exc:
+        raise IntegrationError(
+            "Naver token revocation is temporarily unavailable",
+            retryable=True,
+        ) from exc
 
 
 def _post_json(
@@ -108,19 +174,31 @@ def _naver_map_coord(value: Any) -> float | None:
 
 def _category_from_naver(value: str) -> str:
     text = normalize_text(value)
-    if any(token in text for token in ["카페", "커피", "디저트", "베이커리", "제과"]):
+    if any(
+        token in text
+        for token in ["카페", "커피", "디저트", "베이커리", "제과", "아이스크림", "떡", "한과"]
+    ):
         return "cafe"
-    if any(token in text for token in ["주점", "호프", "맥주", "포차", "술집", "바"]):
+    if any(token in text for token in ["주점", "호프", "맥주", "포차", "술집", "바", "이자카야"]):
         return "bar"
     if any(
         token in text
         for token in [
             "음식점",
             "한식",
+            "한정식",
             "중식",
             "일식",
             "분식",
+            "김밥",
+            "스파게티",
+            "파스타",
             "고기",
+            "곱창",
+            "막창",
+            "족발",
+            "보쌈",
+            "덮밥",
             "요리",
             "양식",
             "멕시코",
@@ -129,6 +207,7 @@ def _category_from_naver(value: str) -> str:
             "뷔페",
             "샤브샤브",
             "해산물",
+            "쌈밥",
         ]
     ):
         return "restaurant"
@@ -138,19 +217,100 @@ def _category_from_naver(value: str) -> str:
 def _clean_place_query(value: str) -> str:
     text = re.sub(r"\([^)]*\)", " ", value or "")
     text = re.sub(r"(주식회사|유한회사|㈜|\(주\))", " ", text)
-    text = re.sub(r"\s*외\s*\d+\s*(?:개소|개|곳)?\s*.*$", " ", text)
+    text = re.sub(
+        r"\s*(?:외\s*\d+|등\s*\d+)\s*(?:개소|개|곳|명|인|건)?\s*.*$",
+        " ",
+        text,
+    )
     text = re.sub(r"\s*(일원|등)\s*$", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def _split_place_query_parts(value: str) -> list[str]:
-    parts = re.split(r"[,/_·]+", value or "")
-    return [part.strip() for part in parts if part.strip()]
+    return split_place_name_parts(value)
+
+
+# 수동검토에서 확인된 원문 상호와 네이버 등록 상호의 차이를 검색에 반영합니다.
+MANUAL_REVIEW_SEARCH_ALIASES: dict[str, tuple[str, ...]] = {
+    "우적해운대점": ("우적 센텀점",),
+    "장박사양곱창전문점": ("장박사양곱창 센텀점",),
+    "마파람해물짐해물탕시청직영점": ("마파람해물찜해물탕 시청직영점",),
+    "문화의물결까사부사노부산근현대역사관점": ("까사부사노 부산근현대역사관점",),
+    "도너츠윤부산서구점": ("도너츠윤 부산점",),
+    "명지일삼육고기": ("일삼육고기집 명지본점",),
+    "첸차이나금곡점": ("첸차이나",),
+    "백구당외": ("백구당",),
+    "순사이쿠보": ("슌사이쿠보 화명",),
+    "풀무원푸드한국공항공사부산지역본부": (
+        "풀무원푸드앤컬처 한국공항공사김해공항카페",
+    ),
+    "메가엠지씨커피포레나점": ("메가MGC커피 포레나점",),
+    "장군성숯불갈비": ("장군성",),
+    "활스시": ("스시활",),
+    "후스시청점": ("후스",),
+    "맛이슈": ("맛이슈 부산북구점",),
+    "글로벌양상국": ("양상국 해운대점",),
+    "나폴레옹베이커리여의도아이에프씨몰점": ("나폴레옹제과점 IFC몰점",),
+    "학산테라로사커피세종지점": ("테라로사 세종점",),
+    "빅바이트컴퍼니잠바주스서울역점": ("잠바주스 서울역점",),
+    "꿈앤카페지방자치회관점": ("꿈엔카페 지방자치회관점",),
+    "농업회사법인동백1917": ("동백1917우리술양조장",),
+    "더젬코리아": ("제이엠커피로스터스 부산 본점",),
+    "언양불고기부산집본": ("언양불고기 부산집본가",),
+    "뚜레쥬르부산센텀대로점": ("뚜레쥬르 부산센텀점",),
+    "와카바서부산유통단지점": ("와카바 부산",),
+    "푸드카페삐뽀랑냠냠": ("삐뽀랑냠냠 부산",),
+    "정동각": ("정동각 여의도",),
+    "천해로207호": ("cafe천해로207",),
+    "꽃가람한식당": ("꽃가람 본점",),
+    "더소울규니꾸": ("규니꾸 우마카세",),
+    "영진인삼어탕국수": ("영진인삼추어탕",),
+    "육관소양재역본점": ("육즙관리소 양재역점",),
+    "해씨라래": ("해싸라래 커피로스터리",),
+    "lateliermarron": ("아뜰리에마롱",),
+    "우수미회센타별관": ("덕승식당 제주 연동",),
+}
 
 
 def _specific_place_aliases(value: str) -> list[str]:
     compact = normalize_text(value).replace(" ", "")
-    aliases: list[str] = []
+    raw_compact = re.sub(r"\s+", "", value or "")
+    aliases: list[str] = list(MANUAL_REVIEW_SEARCH_ALIASES.get(compact, ()))
+    if re.search(r"이비가짬뽕\(센텀2로\s*29\)", raw_compact):
+        aliases.append("이비가짬뽕 부산 해운대 센텀점")
+    if re.search(r"로터리집\(민락동소재\)", raw_compact):
+        aliases.append("로타리집")
+    if compact == "오발탄에프에스":
+        aliases.append("오발탄")
+    if compact == "연제제일식당":
+        aliases.append("연제제일식당닭한마리")
+    if compact == "식당3선덕척점":
+        aliases.append("식당3선 덕천점")
+    if compact in {"심길선총송양곱창", "심길선청송양곱창"}:
+        aliases.append("청송양곱창")
+    if compact in {"백만김밥도시락", "백만김밥부산본점"}:
+        aliases.append("백만김밥 부산본점")
+        aliases.append("백만김밥")
+    if compact in {"303화덕온천", "303화덕동래온천장본점"}:
+        aliases.append("303화덕 동래점")
+    if compact in {"고더커피부산대학교병원점", "고더커피부산대학병원점"}:
+        aliases.append("고더커피 부산대학병원점")
+    if "엠즈씨드" in compact and "폴바셋" in compact:
+        aliases.append("폴 바셋")
+    if "세일기업" in compact and "수안커피컴퍼니" in compact:
+        aliases.append("수안커피컴퍼니 커피하우스")
+    # 운영사명과 실제 음식점명이 함께 적힌 반복 상호는 음식점명도 검색합니다.
+    if compact == "푸드웨이목장원":
+        aliases.append("목장원")
+    if compact == "만수산돼지국밥ii":
+        aliases.append("만수산돼지국밥")
+    if "오현프로젝트강경불고기센텀시티점" in compact:
+        aliases.append("강경불고기 센텀시티점")
+        aliases.append("고담현불고기 해운대센텀시티 본점")
+    if "커넥트현대부산점고디바베이커리" in compact:
+        aliases.append("고디바베이커리 커넥트현대점")
+    if compact == "서면린선다이닝":
+        aliases.append("린선다이닝 서면본점")
     if "칠암사계" in compact:
         aliases.append("칠암사계")
     if "카페가온비" in compact or "cafe가온비" in compact:
@@ -164,6 +324,35 @@ def _specific_place_aliases(value: str) -> list[str]:
     if "에이제신관" in compact:
         aliases.append("예이제 신관")
         aliases.append("예이제")
+    if "폴바셋연산점" in compact:
+        aliases.append("폴 바셋 부산 연산역점")
+        aliases.append("폴 바셋")
+    if compact == "제일옥곰탕":
+        aliases.append("제일옥")
+    if compact == "이재모피자광복점":
+        aliases.append("이재모피자 광복")
+    if compact == "보리에더베이101":
+        aliases.append("보리에 베이커리 앤 델리")
+        aliases.append("보리에")
+    if compact == "솥솥해운대점":
+        aliases.append("솔솥 해운대 해리단길점")
+    if compact == "금수복국센텀벡스코점":
+        aliases.append("금수복국 센텀점")
+    if "씨네드쉐프" in compact:
+        aliases.append("씨네드쉐프")
+    if compact == "베지나랑광안점":
+        aliases.append("베지나랑 광안리점")
+        aliases.append("베지나랑")
+    if compact == "명지첫집오션시티점":
+        aliases.append("명지첫집 오션시티직영점")
+        aliases.append("명지첫집")
+    if compact == "모모스커피온천장점":
+        aliases.append("모모스커피 본점")
+        aliases.append("모모스커피")
+    if compact == "가시리":
+        aliases.append("가시리 식당")
+    if compact == "명품용수떡집":
+        aliases.append("용수떡집")
     return aliases
 
 
@@ -171,7 +360,38 @@ def _place_query_variants(value: str) -> list[str]:
     raw = (value or "").strip()
     cleaned = _clean_place_query(raw)
     variants: list[str] = []
+    raw_parts = _split_place_query_parts(raw)
+
+    # 다중 상호는 합쳐진 전체 문자열이 아니라 각 상호를 별도 검색합니다.
+    if len(raw_parts) >= 2:
+        for part in sorted(
+            raw_parts,
+            key=lambda item: category_from_text(_clean_place_query(item)) not in FOOD_CATEGORIES,
+        ):
+            cleaned_part = _clean_place_query(part)
+            spaced_part = franchise_search_name(part)
+            variants.extend(_specific_place_aliases(part))
+            variants.extend(value for value in [spaced_part, cleaned_part, part] if value)
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for variant in variants:
+            key = normalize_text(variant)
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(variant)
+        return deduped
+
     parsed = parse_place_name(raw)
+    spaced_franchise = franchise_search_name(raw)
+    if spaced_franchise:
+        variants.append(spaced_franchise)
+    outside_parentheses = re.sub(r"\([^)]*\)", "", raw)
+    if normalize_text(outside_parentheses).replace(" ", "").isdigit():
+        variants.extend(
+            re.sub(r"\s+", " ", hint).strip()
+            for hint in re.findall(r"\(([^)]{1,80})\)", raw)
+            if re.sub(r"\s+", " ", hint).strip()
+        )
     if parsed.is_generic:
         variants.extend(
             re.sub(r"\s+", " ", hint).strip()
@@ -191,7 +411,12 @@ def _place_query_variants(value: str) -> list[str]:
     for source in [raw, cleaned]:
         for part in _split_place_query_parts(source):
             cleaned_part = _clean_place_query(part)
-            if cleaned_part:
+            compact_part = normalize_text(cleaned_part).replace(" ", "")
+            if (
+                cleaned_part
+                and len(compact_part) >= 2
+                and compact_part not in {"오프라인", "온라인"}
+            ):
                 split_parts.append(cleaned_part)
     split_parts.sort(
         key=lambda part: (
@@ -200,12 +425,10 @@ def _place_query_variants(value: str) -> list[str]:
         )
     )
     variants.extend(split_parts)
-    variants.extend(value for value in [cleaned, raw] if value)
-    if cleaned:
-        words = cleaned.split()
-        if len(words) >= 2:
-            variants.append(words[-1])
-            variants.append(" ".join(words[-2:]))
+    has_companion_suffix = bool(
+        re.search(r"(?:외|등)\s*\d+\s*(?:개소|개|곳|명|인|건)?\s*$", raw)
+    )
+    variants.extend(value for value in [cleaned, *([] if has_companion_suffix else [raw])] if value)
     seen: set[str] = set()
     deduped: list[str] = []
     for variant in variants:
@@ -267,7 +490,7 @@ class NaverSearchLocalClient:
         places: list[PlaceCandidate] = []
         for query in _search_queries(row):
             params = urlencode({"query": query, "display": 10, "start": 1, "sort": "random"})
-            payload = _get_json(
+            payload = _get_json_with_retry(
                 f"{self.endpoint}?{params}",
                 headers={
                     "X-Naver-Client-Id": self.client_id,
@@ -518,24 +741,29 @@ class OAuthProfile:
 
 
 @dataclass(frozen=True)
+class OAuthLoginResult:
+    profile: OAuthProfile
+    access_token: str
+    refresh_token: str = ""
+    expires_in: int = 0
+
+
+@dataclass(frozen=True)
 class NaverLoginClient:
     client_id: str
     client_secret: str
     redirect_uri: str
 
-    def exchange_code(self, code: str, state: str) -> OAuthProfile:
-        payload = _get_json(
-            "https://nid.naver.com/oauth2.0/token?"
-            + urlencode(
-                {
-                    "grant_type": "authorization_code",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "code": code,
-                    "state": state,
-                }
-            ),
-            headers={"Accept": "application/json"},
+    def exchange_code(self, code: str, state: str) -> OAuthLoginResult:
+        payload = _post_form_json(
+            "https://nid.naver.com/oauth2.0/token",
+            {
+                "grant_type": "authorization_code",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "code": code,
+                "state": state,
+            },
         )
         access_token = payload.get("access_token")
         if not access_token:
@@ -551,11 +779,35 @@ class NaverLoginClient:
         subject = response.get("id")
         if not subject:
             raise IntegrationError("Naver profile did not return a subject")
-        return OAuthProfile(
-            provider="naver",
-            subject=subject,
-            display_name=response.get("nickname") or response.get("name") or "Naver 사용자",
+        return OAuthLoginResult(
+            profile=OAuthProfile(
+                provider="naver",
+                subject=subject,
+                display_name=response.get("nickname") or response.get("name") or "Naver 사용자",
+            ),
+            access_token=str(access_token),
+            refresh_token=str(payload.get("refresh_token") or ""),
+            expires_in=int(payload.get("expires_in") or 0),
         )
+
+    def revoke_token(self, token: str, token_type_hint: str = "refresh_token") -> None:
+        if not token:
+            raise IntegrationError("Naver token revocation requires a token")
+        status = _post_form_status(
+            "https://nid.naver.com/oauth2.0/revoke",
+            {
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "token": token,
+                "token_type_hint": token_type_hint,
+            },
+        )
+        if status != 200:
+            raise IntegrationError(
+                "Naver token revocation failed",
+                status_code=status,
+                retryable=status == 503,
+            )
 
 
 @dataclass(frozen=True)
@@ -564,7 +816,7 @@ class GoogleOAuthClient:
     client_secret: str
     redirect_uri: str
 
-    def exchange_code(self, code: str) -> OAuthProfile:
+    def exchange_code(self, code: str) -> OAuthLoginResult:
         payload = _post_form_json(
             "https://oauth2.googleapis.com/token",
             {
@@ -588,10 +840,15 @@ class GoogleOAuthClient:
         subject = profile.get("sub")
         if not subject:
             raise IntegrationError("Google userinfo did not return a subject")
-        return OAuthProfile(
-            provider="google",
-            subject=subject,
-            display_name=profile.get("name") or "Google 사용자",
+        return OAuthLoginResult(
+            profile=OAuthProfile(
+                provider="google",
+                subject=subject,
+                display_name=profile.get("name") or "Google 사용자",
+            ),
+            access_token=str(access_token),
+            refresh_token=str(payload.get("refresh_token") or ""),
+            expires_in=int(payload.get("expires_in") or 0),
         )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import re
 import secrets
 import threading
@@ -19,7 +20,8 @@ from .agents import (
     similarity,
 )
 from .database import Database
-from .integrations import IntegrationError
+from .integrations import IntegrationError, NaverLoginClient
+from .oauth_security import OAuthTokenCipher, oauth_subject_hmac
 from .utils import (
     map_search_address,
     normalize_address,
@@ -140,6 +142,10 @@ class RestaurantService:
     ADMIN_IMAGE_LIMIT = 4
     ADMIN_IMAGE_MAX_BYTES = 8 * 1024 * 1024
     USER_IMAGE_LIMIT_PER_RESTAURANT = 12
+    USER_IMAGE_PUBLIC_NAME_PATTERN = re.compile(
+        r"[0-9a-f]{32}\.(?:jpg|png|webp)"
+    )
+    REVIEW_BODY_MAX_LENGTH = 4_000
 
     def __init__(
         self,
@@ -152,6 +158,9 @@ class RestaurantService:
         restaurant_image_upload_dir: str | Path | None = None,
         ai_summary_now: Callable[[], datetime] | None = None,
         ai_summary_cooldown_seconds: int = AI_SUMMARY_COOLDOWN_SECONDS,
+        oauth_token_cipher: OAuthTokenCipher | None = None,
+        oauth_subject_hmac_secret: str = "",
+        naver_login_client: NaverLoginClient | None = None,
     ):
         self.database = database
         self.review_rate_limit_per_hour = review_rate_limit_per_hour
@@ -159,6 +168,9 @@ class RestaurantService:
         self.naver_client = naver_client
         self.ai_summary_client = ai_summary_client
         self.restaurant_image_client = restaurant_image_client
+        self.oauth_token_cipher = oauth_token_cipher
+        self.oauth_subject_hmac_secret = oauth_subject_hmac_secret
+        self.naver_login_client = naver_login_client
         if restaurant_image_upload_dir is None:
             restaurant_image_upload_dir = Path.cwd() / "var" / "restaurant_images"
         self.restaurant_image_upload_dir = Path(restaurant_image_upload_dir).resolve()
@@ -168,6 +180,41 @@ class RestaurantService:
             int(ai_summary_cooldown_seconds),
         )
         self._ai_summary_lock = threading.Lock()
+
+    def _oauth_subject_hash(self, provider: str, provider_subject: str) -> str:
+        if self.oauth_subject_hmac_secret:
+            return oauth_subject_hmac(
+                self.oauth_subject_hmac_secret,
+                provider,
+                provider_subject,
+            )
+        # Development-only compatibility. Production startup requires a secret.
+        return stable_hash("development-oauth-subject", provider, provider_subject)
+
+    @staticmethod
+    def _oauth_subject_lock_key(subject_hash: str) -> int:
+        """Return a stable signed bigint for a PostgreSQL advisory lock."""
+        unsigned = int(str(subject_hash)[:16], 16)
+        return unsigned - (1 << 64) if unsigned >= (1 << 63) else unsigned
+
+    def _lock_oauth_subject_hashes(
+        self,
+        conn: Any,
+        provider_subject_hashes: list[tuple[str, str]],
+    ) -> None:
+        """Serialize login and lifecycle changes for each provider subject."""
+        unique_hashes = sorted(set(provider_subject_hashes))
+        for provider, subject_hash in unique_hashes:
+            lock_hash = stable_hash("oauth-subject-lock", provider, subject_hash)
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(?)",
+                (self._oauth_subject_lock_key(lock_hash),),
+            )
+
+    def _encrypt_oauth_token(self, token: str) -> str | None:
+        if not token or self.oauth_token_cipher is None:
+            return None
+        return self.oauth_token_cipher.encrypt(token)
 
     def _add_effective_candidate_values(self, payload: dict[str, Any]) -> None:
         payload["effective_place_name"] = candidate_effective_place_name(payload)
@@ -653,11 +700,13 @@ class RestaurantService:
         restaurant_name: str,
     ) -> dict[str, Any]:
         storage_key = str(image.get("storage_key") or "")
-        media_url = f"/media/restaurant-images/{quote(storage_key, safe='/')}"
+        public_name = Path(storage_key).name
+        if self.USER_IMAGE_PUBLIC_NAME_PATTERN.fullmatch(public_name) is None:
+            raise AppError(500, "invalid user restaurant image key")
+        media_url = f"/media/community-photos/{quote(public_name, safe='')}"
         return {
             "id": int(image["id"]),
             "restaurant_id": int(image["restaurant_id"]),
-            "user_id": int(image["user_id"]),
             "thumbnail_url": media_url,
             "source_url": media_url,
             "title": str(image.get("alt_text") or restaurant_name or "사용자 등록 사진"),
@@ -730,7 +779,7 @@ class RestaurantService:
                 "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM restaurant_user_images WHERE restaurant_id = ?",
                 (restaurant_id,),
             ).fetchone()["next_order"])
-        storage_key = f"user-{user_id}/restaurant-{restaurant_id}/{secrets.token_hex(16)}.{extension}"
+        storage_key = f"community/{secrets.token_hex(16)}.{extension}"
         target_path = self._admin_image_file_path(storage_key)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = target_path.with_suffix(f"{target_path.suffix}.upload")
@@ -778,7 +827,7 @@ class RestaurantService:
         if image_bytes:
             new_content_type, extension = self._validated_admin_image(image_bytes)
             new_filename = Path(str(filename or "image")).name[:255] or f"image.{extension}"
-            new_storage_key = f"user-{user_id}/restaurant-{int(existing['restaurant_id'])}/{secrets.token_hex(16)}.{extension}"
+            new_storage_key = f"community/{secrets.token_hex(16)}.{extension}"
             new_path = self._admin_image_file_path(new_storage_key)
             new_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = new_path.with_suffix(f"{new_path.suffix}.upload")
@@ -1121,6 +1170,39 @@ class RestaurantService:
             raise AppError(400, "invalid restaurant image path")
         return path
 
+    def public_admin_image_file_path(self, storage_key: str) -> Path:
+        with self.database.session() as conn:
+            image = conn.execute(
+                "SELECT storage_key FROM restaurant_admin_images WHERE storage_key = ?",
+                (storage_key,),
+            ).fetchone()
+        if image is None:
+            raise AppError(404, "restaurant image not found")
+        return self._admin_image_file_path(str(image["storage_key"]))
+
+    def public_user_image_file_path(self, public_name: str) -> Path:
+        safe_name = str(public_name or "")
+        if self.USER_IMAGE_PUBLIC_NAME_PATTERN.fullmatch(safe_name) is None:
+            raise AppError(404, "restaurant image not found")
+        with self.database.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT storage_key
+                FROM restaurant_user_images
+                WHERE storage_key = ? OR storage_key LIKE ?
+                LIMIT 2
+                """,
+                (f"community/{safe_name}", f"user-%/restaurant-%/{safe_name}"),
+            ).fetchall()
+        matches = [
+            str(row["storage_key"])
+            for row in rows
+            if Path(str(row["storage_key"])).name == safe_name
+        ]
+        if len(matches) != 1:
+            raise AppError(404, "restaurant image not found")
+        return self._admin_image_file_path(matches[0])
+
     def _validated_admin_image_alt_text(self, value: str) -> str:
         alt_text = str(value or "").strip()
         if len(alt_text) > 120:
@@ -1427,7 +1509,15 @@ class RestaurantService:
             raise AppError(400, "rating must be between 1 and 5")
         if not body or len(body.strip()) < 3:
             raise AppError(400, "review body is too short")
+        if len(body.strip()) > self.REVIEW_BODY_MAX_LENGTH:
+            raise AppError(400, "review body is too long")
         ip_hash = stable_hash("ip", context.ip)
+        if context.user_id is None:
+            rate_identity_clause = "COALESCE(ip_hash, '') = ?"
+            rate_identity_params: tuple[Any, ...] = (ip_hash,)
+        else:
+            rate_identity_clause = "(user_id = ? OR COALESCE(ip_hash, '') = ?)"
+            rate_identity_params = (context.user_id, ip_hash)
         with self.database.session() as conn:
             if conn.execute("SELECT id FROM restaurants WHERE id = ?", (restaurant_id,)).fetchone() is None:
                 raise AppError(404, "restaurant not found")
@@ -1435,12 +1525,10 @@ class RestaurantService:
                 """
                 SELECT COUNT(*) AS c
                 FROM restaurant_reviews
-                WHERE restaurant_id = ?
-                  AND COALESCE(user_id, -1) = COALESCE(?, -1)
-                  AND COALESCE(ip_hash, '') = ?
+                WHERE {rate_identity_clause}
                   AND created_at >= datetime('now', '-1 hour')
-                """,
-                (restaurant_id, context.user_id, ip_hash),
+                """.format(rate_identity_clause=rate_identity_clause),
+                rate_identity_params,
             ).fetchone()["c"]
             if recent_count >= self.review_rate_limit_per_hour:
                 self._audit(
@@ -1764,8 +1852,14 @@ class RestaurantService:
             },
         }
 
-    def delete_account(self, user_id: int) -> dict[str, Any]:
-        """Deactivate an account and remove or de-identify user-linked data."""
+    def delete_account(
+        self,
+        user_id: int,
+        *,
+        access_token: str = "",
+        refresh_token: str = "",
+    ) -> dict[str, Any]:
+        """Delete local data and durably schedule provider token revocation."""
         with self.database.session() as conn:
             user = conn.execute(
                 "SELECT * FROM users WHERE id = ? AND status = 'active'",
@@ -1773,12 +1867,15 @@ class RestaurantService:
             ).fetchone()
             if user is None:
                 raise AppError(401, "login required")
-            return self._delete_account_record(
+            return self._delete_account_with_oauth(
                 conn,
                 user,
                 actor_type="user",
                 action="account_delete",
                 reason_code="USER_ACCOUNT_DELETE",
+                source="user",
+                access_token=access_token,
+                refresh_token=refresh_token,
             )
 
     def admin_delete_account(self, user_id: int, *, actor_user_id: int) -> dict[str, Any]:
@@ -1799,13 +1896,576 @@ class RestaurantService:
                 raise AppError(404, "user not found")
             if user["status"] not in {"active", "suspended"}:
                 raise AppError(409, "closed accounts cannot be deleted again")
-            return self._delete_account_record(
+            return self._delete_account_with_oauth(
                 conn,
                 user,
                 actor_type="admin",
                 action="admin_account_delete",
                 reason_code="ADMIN_ACCOUNT_DELETE",
+                source="admin",
             )
+
+    def create_account_delete_intent(
+        self,
+        user_id: int,
+        *,
+        return_to: str = "/mypage",
+        ttl_seconds: int = 10 * 60,
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        with self.database.session() as conn:
+            account = conn.execute(
+                """
+                SELECT o.provider_subject
+                FROM oauth_accounts o
+                JOIN users u ON u.id = o.user_id
+                WHERE o.user_id = ? AND o.provider = 'naver' AND u.status = 'active'
+                ORDER BY o.id
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if account is None:
+                raise AppError(409, "Naver account connection is required")
+            conn.execute(
+                "DELETE FROM oauth_flow_intents WHERE used_at IS NOT NULL OR expires_at <= ?",
+                (now.isoformat(timespec="seconds"),),
+            )
+            conn.execute(
+                """
+                INSERT INTO oauth_flow_intents
+                  (token_hash, user_id, provider, purpose, expected_subject_hmac,
+                   return_to, expires_at)
+                VALUES (?, ?, 'naver', 'account_delete', ?, ?, ?)
+                """,
+                (
+                    stable_hash("oauth-flow-intent", token),
+                    user_id,
+                    self._oauth_subject_hash("naver", str(account["provider_subject"])),
+                    str(return_to or "/mypage")[:500],
+                    expires_at,
+                ),
+            )
+        return token
+
+    def create_oauth_login_intent(
+        self,
+        provider: str,
+        state: str,
+        *,
+        return_to: str = "/",
+        ttl_seconds: int = 10 * 60,
+    ) -> None:
+        if provider not in {"naver", "google"} or not state:
+            raise AppError(400, "invalid OAuth login intent")
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        with self.database.session() as conn:
+            conn.execute(
+                "DELETE FROM oauth_flow_intents WHERE used_at IS NOT NULL OR expires_at <= ?",
+                (now.isoformat(timespec="seconds"),),
+            )
+            conn.execute(
+                """
+                INSERT INTO oauth_flow_intents
+                  (token_hash, user_id, provider, purpose, expected_subject_hmac,
+                   return_to, expires_at)
+                VALUES (?, NULL, ?, 'login', NULL, ?, ?)
+                """,
+                (
+                    stable_hash("oauth-flow-intent", state),
+                    provider,
+                    str(return_to or "/")[:500],
+                    expires_at,
+                ),
+            )
+
+    def consume_oauth_login_intent(self, provider: str, state: str) -> None:
+        now = utc_now()
+        with self.database.session() as conn:
+            consumed = conn.execute(
+                """
+                UPDATE oauth_flow_intents
+                SET used_at = ?
+                WHERE token_hash = ? AND provider = ? AND purpose = 'login'
+                  AND used_at IS NULL AND expires_at > ?
+                RETURNING token_hash
+                """,
+                (
+                    now,
+                    stable_hash("oauth-flow-intent", state),
+                    provider,
+                    now,
+                ),
+            ).fetchone()
+        if consumed is None:
+            raise AppError(401, "OAuth login request expired")
+
+    def complete_account_delete_intent(
+        self,
+        intent_token: str,
+        *,
+        provider_subject: str,
+        access_token: str,
+        refresh_token: str = "",
+    ) -> dict[str, Any]:
+        now = utc_now()
+        intent_hash = stable_hash("oauth-flow-intent", intent_token)
+        supplied_subject_hash = self._oauth_subject_hash("naver", provider_subject)
+        with self.database.session() as conn:
+            intent = conn.execute(
+                """
+                SELECT * FROM oauth_flow_intents
+                WHERE token_hash = ? AND provider = 'naver'
+                  AND purpose = 'account_delete' AND used_at IS NULL AND expires_at > ?
+                """,
+                (intent_hash, now),
+            ).fetchone()
+            if intent is None:
+                raise AppError(401, "account deletion request expired")
+            if not hmac.compare_digest(
+                str(intent["expected_subject_hmac"]),
+                supplied_subject_hash,
+            ):
+                raise AppError(409, "a different Naver account was authenticated")
+            user = conn.execute(
+                "SELECT * FROM users WHERE id = ? AND status = 'active'",
+                (intent["user_id"],),
+            ).fetchone()
+            if user is None:
+                raise AppError(409, "account is not active")
+            conn.execute(
+                "UPDATE oauth_flow_intents SET used_at = ? WHERE token_hash = ?",
+                (now, intent_hash),
+            )
+            return self._delete_account_with_oauth(
+                conn,
+                user,
+                actor_type="user",
+                action="account_delete",
+                reason_code="USER_ACCOUNT_DELETE_REAUTHENTICATED",
+                source="user",
+                access_token=access_token,
+                refresh_token=refresh_token,
+                reauthenticated_provider_subject=provider_subject,
+            )
+
+    def accept_naver_disconnect(
+        self,
+        *,
+        provider_subject: str,
+        provider_timestamp: int,
+        event_digest: str,
+    ) -> dict[str, Any]:
+        subject_hash = self._oauth_subject_hash("naver", provider_subject)
+        now = utc_now()
+        with self.database.session() as conn:
+            claimed_event = conn.execute(
+                """
+                INSERT INTO oauth_disconnect_events
+                  (event_digest, lifecycle_job_id, provider, subject_hmac,
+                   provider_timestamp, result)
+                VALUES (?, NULL, 'naver', ?, ?, 'processing')
+                ON CONFLICT(event_digest) DO NOTHING
+                """,
+                (event_digest, subject_hash, provider_timestamp),
+            )
+            if claimed_event.rowcount == 0:
+                return {"result": "duplicate", "accepted": True}
+
+            account_link = conn.execute(
+                """
+                SELECT o.user_id
+                FROM oauth_accounts o
+                WHERE o.provider = 'naver' AND o.provider_subject = ?
+                """,
+                (provider_subject,),
+            ).fetchone()
+            if account_link is not None:
+                linked_accounts = conn.execute(
+                    """
+                    SELECT provider_subject
+                    FROM oauth_accounts
+                    WHERE user_id = ? AND provider = 'naver'
+                    """,
+                    (account_link["user_id"],),
+                ).fetchall()
+                subject_locks = [
+                    (
+                        "naver",
+                        self._oauth_subject_hash(
+                            "naver",
+                            str(linked_account["provider_subject"]),
+                        ),
+                    )
+                    for linked_account in linked_accounts
+                ]
+            else:
+                subject_locks = [("naver", subject_hash)]
+            self._lock_oauth_subject_hashes(conn, subject_locks)
+
+            account = conn.execute(
+                """
+                SELECT u.*
+                FROM oauth_accounts o
+                JOIN users u ON u.id = o.user_id
+                WHERE o.provider = 'naver' AND o.provider_subject = ?
+                """,
+                (provider_subject,),
+            ).fetchone()
+            if account is None or account["status"] not in {"active", "suspended"}:
+                active_job = conn.execute(
+                    """
+                    SELECT * FROM oauth_lifecycle_jobs
+                    WHERE provider = 'naver' AND subject_hmac = ?
+                      AND status IN ('queued', 'running', 'retry_wait', 'awaiting_token', 'manual_review')
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (subject_hash,),
+                ).fetchone()
+                if active_job is not None:
+                    conn.execute(
+                        """
+                        UPDATE oauth_lifecycle_jobs
+                        SET source = 'provider_callback',
+                            status = CASE
+                              WHEN token_ciphertext IS NOT NULL THEN 'queued'
+                              WHEN local_delete_completed = 1 THEN 'completed'
+                              ELSE 'queued'
+                            END,
+                            next_attempt_at = CASE
+                              WHEN token_ciphertext IS NOT NULL OR local_delete_completed = 0
+                              THEN ? ELSE NULL
+                            END,
+                            last_error_code = NULL,
+                            worker_id = NULL,
+                            completed_at = CASE
+                              WHEN token_ciphertext IS NULL AND local_delete_completed = 1
+                              THEN ?
+                              ELSE NULL
+                            END,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, now, active_job["id"]),
+                    )
+                conn.execute(
+                    """
+                    UPDATE oauth_disconnect_events
+                    SET lifecycle_job_id = ?, result = ?, processed_at = ?
+                    WHERE event_digest = ?
+                    """,
+                    (
+                        active_job["id"] if active_job is not None else None,
+                        "revocation_confirmed" if active_job is not None else "account_absent",
+                        now,
+                        event_digest,
+                    ),
+                )
+                return {
+                    "result": (
+                        "revocation_confirmed" if active_job is not None else "account_absent"
+                    ),
+                    "accepted": True,
+                }
+
+            linked_accounts = conn.execute(
+                """
+                SELECT * FROM oauth_accounts
+                WHERE user_id = ? AND provider = 'naver'
+                ORDER BY id
+                """,
+                (account["id"],),
+            ).fetchall()
+            linked_accounts.sort(
+                key=lambda linked_account: (
+                    str(linked_account["provider_subject"]) != provider_subject,
+                    int(linked_account["id"]),
+                )
+            )
+            jobs: list[dict[str, Any]] = []
+            for linked_account in linked_accounts:
+                linked_subject = str(linked_account["provider_subject"])
+                callback_subject = linked_subject == provider_subject
+                token_ciphertext = None
+                token_type_hint = None
+                if not callback_subject and linked_account.get("refresh_token_ciphertext"):
+                    token_ciphertext = str(linked_account["refresh_token_ciphertext"])
+                    token_type_hint = "refresh_token"
+                jobs.append(
+                    self._create_oauth_lifecycle_job(
+                        conn,
+                        user_id=int(account["id"]),
+                        provider="naver",
+                        provider_subject=linked_subject,
+                        source=(
+                            "provider_callback"
+                            if callback_subject
+                            else "provider_callback_related"
+                        ),
+                        token_ciphertext=token_ciphertext,
+                        token_type_hint=token_type_hint,
+                    )
+                )
+            job = jobs[0]
+            conn.execute(
+                """
+                UPDATE oauth_disconnect_events
+                SET lifecycle_job_id = ?, result = 'account_deletion_pending', processed_at = ?
+                WHERE event_digest = ?
+                """,
+                (job["id"], now, event_digest),
+            )
+            result = self._mark_account_deletion_pending(
+                conn,
+                account,
+                actor_type="provider",
+                action="provider_account_disconnect_pending",
+                reason_code="NAVER_SERVICE_CONSENT_WITHDRAWN",
+            )
+        return {
+            **result,
+            "provider_revocation": (
+                "completed"
+                if len(jobs) == 1
+                else (
+                    "queued"
+                    if any(item["status"] == "queued" for item in jobs[1:])
+                    else "awaiting_token"
+                )
+            ),
+            "lifecycle_job_id": int(job["id"]),
+            "lifecycle_job_ids": [int(item["id"]) for item in jobs],
+        }
+
+    def _delete_account_with_oauth(
+        self,
+        conn: Any,
+        user: Any,
+        *,
+        actor_type: str,
+        action: str,
+        reason_code: str,
+        source: str,
+        access_token: str = "",
+        refresh_token: str = "",
+        reauthenticated_provider_subject: str = "",
+    ) -> dict[str, Any]:
+        user_id = int(user["id"])
+        naver_accounts = conn.execute(
+            """
+            SELECT * FROM oauth_accounts
+            WHERE user_id = ? AND provider = 'naver'
+            ORDER BY id
+            """,
+            (user_id,),
+        ).fetchall()
+        self._lock_oauth_subject_hashes(
+            conn,
+            [
+                (
+                    "naver",
+                    self._oauth_subject_hash("naver", str(account["provider_subject"])),
+                )
+                for account in naver_accounts
+            ],
+        )
+        naver_accounts = conn.execute(
+            """
+            SELECT * FROM oauth_accounts
+            WHERE user_id = ? AND provider = 'naver'
+            ORDER BY id
+            """,
+            (user_id,),
+        ).fetchall()
+        if reauthenticated_provider_subject:
+            naver_accounts.sort(
+                key=lambda account: (
+                    str(account["provider_subject"]) != reauthenticated_provider_subject,
+                    int(account["id"]),
+                )
+            )
+        lifecycle_jobs: list[dict[str, Any]] = []
+        supplied_token_used = False
+        for naver_account in naver_accounts:
+            account_subject = str(naver_account["provider_subject"])
+            use_supplied_token = bool(refresh_token or access_token) and not supplied_token_used
+            if reauthenticated_provider_subject:
+                use_supplied_token = account_subject == reauthenticated_provider_subject
+            token_ciphertext = None
+            token_type_hint = None
+            if use_supplied_token:
+                token_ciphertext = self._encrypt_oauth_token(refresh_token or access_token)
+                token_type_hint = "refresh_token" if refresh_token else "access_token"
+                supplied_token_used = True
+            if not token_ciphertext and naver_account.get("refresh_token_ciphertext"):
+                token_ciphertext = str(naver_account["refresh_token_ciphertext"])
+                token_type_hint = "refresh_token"
+            lifecycle_jobs.append(
+                self._create_oauth_lifecycle_job(
+                    conn,
+                    user_id=user_id,
+                    provider="naver",
+                    provider_subject=account_subject,
+                    source=source,
+                    token_ciphertext=token_ciphertext,
+                    token_type_hint=token_type_hint,
+                )
+            )
+        if not lifecycle_jobs:
+            result = self._delete_account_record(
+                conn,
+                user,
+                actor_type=actor_type,
+                action=action,
+                reason_code=reason_code,
+            )
+            return {**result, "provider_revocation": "not_applicable"}
+        result = self._mark_account_deletion_pending(
+            conn,
+            user,
+            actor_type=actor_type,
+            action=f"{action}_pending",
+            reason_code=reason_code,
+        )
+        lifecycle_statuses = {str(job["status"]) for job in lifecycle_jobs}
+        if "queued" in lifecycle_statuses or "running" in lifecycle_statuses:
+            provider_revocation = "queued"
+        elif "retry_wait" in lifecycle_statuses:
+            provider_revocation = "retry_wait"
+        elif "manual_review" in lifecycle_statuses:
+            provider_revocation = "manual_review"
+        else:
+            provider_revocation = "awaiting_token"
+        return {
+            **result,
+            "provider_revocation": provider_revocation,
+            "lifecycle_job_id": int(lifecycle_jobs[0]["id"]),
+            "lifecycle_job_ids": [int(job["id"]) for job in lifecycle_jobs],
+        }
+
+    def _create_oauth_lifecycle_job(
+        self,
+        conn: Any,
+        *,
+        user_id: int,
+        provider: str,
+        provider_subject: str,
+        source: str,
+        token_ciphertext: str | None,
+        token_type_hint: str | None,
+    ) -> dict[str, Any]:
+        subject_hash = self._oauth_subject_hash(provider, provider_subject)
+        self._lock_oauth_subject_hashes(conn, [(provider, subject_hash)])
+        existing = conn.execute(
+            """
+            SELECT * FROM oauth_lifecycle_jobs
+            WHERE provider = ? AND subject_hmac = ?
+              AND status IN ('queued', 'running', 'retry_wait', 'awaiting_token', 'manual_review')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (provider, subject_hash),
+        ).fetchone()
+        if existing is not None:
+            if token_ciphertext:
+                conn.execute(
+                    """
+                    UPDATE oauth_lifecycle_jobs
+                    SET token_ciphertext = ?, token_type_hint = ?,
+                        status = CASE
+                          WHEN status = 'manual_review' THEN 'manual_review'
+                          ELSE 'queued'
+                        END,
+                        next_attempt_at = CASE
+                          WHEN status = 'manual_review' THEN NULL
+                          ELSE ?
+                        END,
+                        last_error_code = CASE
+                          WHEN status = 'manual_review' THEN last_error_code
+                          ELSE NULL
+                        END,
+                        worker_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        token_ciphertext,
+                        token_type_hint,
+                        utc_now(),
+                        utc_now(),
+                        existing["id"],
+                    ),
+                )
+                existing = conn.execute(
+                    "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                    (existing["id"],),
+                ).fetchone()
+            return dict(existing)
+        status = (
+            "queued"
+            if source == "provider_callback" or token_ciphertext
+            else "awaiting_token"
+        )
+        now = utc_now()
+        cursor = conn.execute(
+            """
+            INSERT INTO oauth_lifecycle_jobs
+              (user_id, provider, subject_hmac, token_ciphertext, token_type_hint,
+               source, status, next_attempt_at, completed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                provider,
+                subject_hash,
+                token_ciphertext,
+                token_type_hint,
+                source,
+                status,
+                now if status == "queued" else None,
+                None,
+                now,
+                now,
+            ),
+        )
+        return dict(
+            conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        )
+
+    def _mark_account_deletion_pending(
+        self,
+        conn: Any,
+        user: Any,
+        *,
+        actor_type: str,
+        action: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        user_id = int(user["id"])
+        now = utc_now()
+        conn.execute(
+            "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (now, user_id),
+        )
+        conn.execute(
+            "UPDATE users SET status = 'deletion_pending', updated_at = ? WHERE id = ?",
+            (now, user_id),
+        )
+        result = {"result": "deletion_pending"}
+        self._audit(
+            conn,
+            actor_type,
+            action,
+            "user",
+            user_id,
+            after=result,
+            reason_codes=[reason_code],
+        )
+        return result
 
     def _delete_account_record(
         self,
@@ -1856,6 +2516,10 @@ class RestaurantService:
             (user_id, user_id),
         )
         conn.execute("DELETE FROM oauth_accounts WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (utc_now(), user_id),
+        )
         conn.execute("DELETE FROM user_saved_restaurants WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM review_reactions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM restaurant_user_images WHERE user_id = ?", (user_id,))
@@ -3721,63 +4385,886 @@ class RestaurantService:
             ) or None
         return metrics
 
-    def upsert_oauth_account(self, provider: str, provider_subject: str, display_name: str) -> dict[str, Any]:
+    def upsert_oauth_account(
+        self,
+        provider: str,
+        provider_subject: str,
+        display_name: str,
+        *,
+        access_token: str = "",
+        refresh_token: str = "",
+    ) -> dict[str, Any]:
         if provider not in {"google", "naver"}:
             raise AppError(400, "unsupported provider")
         if not provider_subject:
             raise AppError(400, "provider subject is required")
         normalized_display_name = display_name.strip()[:40] or f"{provider} 사용자"
+        subject_hash = self._oauth_subject_hash(provider, provider_subject)
+        blocked = False
+        result: dict[str, Any] | None = None
         with self.database.session() as conn:
-            account = conn.execute(
-                "SELECT * FROM oauth_accounts WHERE provider = ? AND provider_subject = ?",
-                (provider, provider_subject),
-            ).fetchone()
-            if account:
-                now = utc_now()
+            self._lock_oauth_subject_hashes(conn, [(provider, subject_hash)])
+            blocked = self._capture_pending_oauth_login(
+                conn,
+                provider,
+                subject_hash,
+                access_token=access_token,
+                refresh_token=refresh_token,
+            )
+            if not blocked:
+                result = self._upsert_oauth_account_locked(
+                    conn,
+                    provider=provider,
+                    provider_subject=provider_subject,
+                    normalized_display_name=normalized_display_name,
+                    refresh_token=refresh_token,
+                )
+        if blocked:
+            raise AppError(423, "account deletion is in progress")
+        if result is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("OAuth account upsert did not produce a result")
+        return result
+
+    def _upsert_oauth_account_locked(
+        self,
+        conn: Any,
+        *,
+        provider: str,
+        provider_subject: str,
+        normalized_display_name: str,
+        refresh_token: str,
+    ) -> dict[str, Any]:
+        encrypted_refresh_token = self._encrypt_oauth_token(refresh_token)
+        account = conn.execute(
+            "SELECT * FROM oauth_accounts WHERE provider = ? AND provider_subject = ?",
+            (provider, provider_subject),
+        ).fetchone()
+        if account:
+            now = utc_now()
+            if encrypted_refresh_token:
+                conn.execute(
+                    """
+                    UPDATE oauth_accounts
+                    SET display_name = ?, last_login_at = ?,
+                        refresh_token_ciphertext = ?, token_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_display_name,
+                        now,
+                        encrypted_refresh_token,
+                        now,
+                        account["id"],
+                    ),
+                )
+            else:
                 conn.execute(
                     "UPDATE oauth_accounts SET display_name = ?, last_login_at = ? WHERE id = ?",
                     (normalized_display_name, now, account["id"]),
                 )
-                conn.execute(
-                    "UPDATE users SET display_name = ?, updated_at = ? WHERE id = ? AND status = 'active'",
-                    (normalized_display_name, now, account["user_id"]),
-                )
-                user = conn.execute("SELECT * FROM users WHERE id = ?", (account["user_id"],)).fetchone()
-                if user is None or user["status"] != "active":
-                    raise AppError(403, "user account is not active")
-                refreshed_account = conn.execute(
-                    "SELECT * FROM oauth_accounts WHERE id = ?", (account["id"],)
-                ).fetchone()
-                return {"user": dict(user), "oauth_account": dict(refreshed_account), "created": False}
-            cur_user = conn.execute(
-                "INSERT INTO users (display_name) VALUES (?)",
-                (normalized_display_name,),
+            conn.execute(
+                "UPDATE users SET display_name = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+                (normalized_display_name, now, account["user_id"]),
             )
-            user_id = int(cur_user.lastrowid)
-            cur_account = conn.execute(
+            user = conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (account["user_id"],),
+            ).fetchone()
+            if user is None or user["status"] != "active":
+                raise AppError(403, "user account is not active")
+            refreshed_account = conn.execute(
+                "SELECT * FROM oauth_accounts WHERE id = ?", (account["id"],)
+            ).fetchone()
+            return {
+                "user": dict(user),
+                "oauth_account": self._oauth_account_payload(refreshed_account),
+                "created": False,
+            }
+        cur_user = conn.execute(
+            "INSERT INTO users (display_name) VALUES (?)",
+            (normalized_display_name,),
+        )
+        user_id = int(cur_user.lastrowid)
+        now = utc_now()
+        cur_account = conn.execute(
+            """
+            INSERT INTO oauth_accounts
+              (user_id, provider, provider_subject, display_name, last_login_at,
+               refresh_token_ciphertext, token_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                provider,
+                provider_subject,
+                normalized_display_name,
+                now,
+                encrypted_refresh_token,
+                now if encrypted_refresh_token else None,
+            ),
+        )
+        self._audit(
+            conn,
+            "system",
+            "oauth_account_create",
+            "user",
+            user_id,
+            after={"provider": provider},
+            reason_codes=["SSO_CREATE"],
+        )
+        return {
+            "user": dict(
+                conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            ),
+            "oauth_account": self._oauth_account_payload(
+                conn.execute(
+                    "SELECT * FROM oauth_accounts WHERE id = ?",
+                    (cur_account.lastrowid,),
+                ).fetchone()
+            ),
+            "created": True,
+        }
+
+    def _capture_pending_oauth_login(
+        self,
+        conn: Any,
+        provider: str,
+        subject_hash: str,
+        *,
+        access_token: str,
+        refresh_token: str,
+    ) -> bool:
+        lifecycle_job = conn.execute(
+            """
+            SELECT * FROM oauth_lifecycle_jobs
+            WHERE provider = ? AND subject_hmac = ?
+              AND status IN ('queued', 'running', 'retry_wait', 'awaiting_token', 'manual_review')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (provider, subject_hash),
+        ).fetchone()
+        if lifecycle_job is None:
+            return False
+        supplied_token = refresh_token or access_token
+        token_ciphertext = self._encrypt_oauth_token(supplied_token)
+        if token_ciphertext:
+            now = utc_now()
+            conn.execute(
                 """
-                INSERT INTO oauth_accounts
-                  (user_id, provider, provider_subject, display_name, last_login_at)
-                VALUES (?, ?, ?, ?, ?)
+                UPDATE oauth_lifecycle_jobs
+                SET token_ciphertext = ?, token_type_hint = ?,
+                    status = CASE
+                      WHEN status = 'manual_review' THEN 'manual_review'
+                      ELSE 'queued'
+                    END,
+                    worker_id = NULL,
+                    next_attempt_at = CASE
+                      WHEN status = 'manual_review' THEN NULL
+                      ELSE ?
+                    END,
+                    last_error_code = CASE
+                      WHEN status = 'manual_review' THEN last_error_code
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE id = ?
                 """,
-                (user_id, provider, provider_subject, normalized_display_name, utc_now()),
+                (
+                    token_ciphertext,
+                    "refresh_token" if refresh_token else "access_token",
+                    now,
+                    now,
+                    lifecycle_job["id"],
+                ),
+            )
+        return True
+
+    def _oauth_account_payload(self, account: Any) -> dict[str, Any]:
+        return {
+            "id": int(account["id"]),
+            "user_id": int(account["user_id"]),
+            "provider": str(account["provider"]),
+            "display_name": account["display_name"],
+            "created_at": account["created_at"],
+            "last_login_at": account["last_login_at"],
+        }
+
+    def _oauth_ciphertext_status(self, ciphertexts: list[str]) -> dict[str, int]:
+        if self.oauth_token_cipher is None:
+            raise AppError(503, "OAuth token encryption is not configured")
+        primary = 0
+        non_primary = 0
+        unreadable = 0
+        for ciphertext in ciphertexts:
+            try:
+                self.oauth_token_cipher.decrypt(ciphertext)
+            except ValueError:
+                unreadable += 1
+                continue
+            if self.oauth_token_cipher.uses_primary_key(ciphertext):
+                primary += 1
+            else:
+                non_primary += 1
+        return {
+            "total": len(ciphertexts),
+            "primary": primary,
+            "non_primary": non_primary,
+            "unreadable": unreadable,
+        }
+
+    def oauth_token_encryption_status(self) -> dict[str, Any]:
+        with self.database.session() as conn:
+            account_rows = conn.execute(
+                """
+                SELECT refresh_token_ciphertext
+                FROM oauth_accounts
+                WHERE refresh_token_ciphertext IS NOT NULL
+                """
+            ).fetchall()
+            job_rows = conn.execute(
+                """
+                SELECT token_ciphertext
+                FROM oauth_lifecycle_jobs
+                WHERE token_ciphertext IS NOT NULL
+                """
+            ).fetchall()
+        accounts = self._oauth_ciphertext_status(
+            [str(row["refresh_token_ciphertext"]) for row in account_rows]
+        )
+        jobs = self._oauth_ciphertext_status(
+            [str(row["token_ciphertext"]) for row in job_rows]
+        )
+        return {
+            "oauth_accounts": accounts,
+            "oauth_lifecycle_jobs": jobs,
+            "total": accounts["total"] + jobs["total"],
+            "non_primary": accounts["non_primary"] + jobs["non_primary"],
+            "unreadable": accounts["unreadable"] + jobs["unreadable"],
+        }
+
+    def rotate_oauth_token_ciphertexts(self) -> dict[str, Any]:
+        if self.oauth_token_cipher is None:
+            raise AppError(503, "OAuth token encryption is not configured")
+        with self.database.session() as conn:
+            account_rows = conn.execute(
+                """
+                SELECT id, refresh_token_ciphertext
+                FROM oauth_accounts
+                WHERE refresh_token_ciphertext IS NOT NULL
+                FOR UPDATE
+                """
+            ).fetchall()
+            job_rows = conn.execute(
+                """
+                SELECT id, token_ciphertext
+                FROM oauth_lifecycle_jobs
+                WHERE token_ciphertext IS NOT NULL
+                FOR UPDATE
+                """
+            ).fetchall()
+            before_accounts = self._oauth_ciphertext_status(
+                [str(row["refresh_token_ciphertext"]) for row in account_rows]
+            )
+            before_jobs = self._oauth_ciphertext_status(
+                [str(row["token_ciphertext"]) for row in job_rows]
+            )
+            if before_accounts["unreadable"] or before_jobs["unreadable"]:
+                raise AppError(409, "OAuth token ciphertext could not be decrypted")
+
+            rotated_accounts = 0
+            for row in account_rows:
+                ciphertext = str(row["refresh_token_ciphertext"])
+                if self.oauth_token_cipher.uses_primary_key(ciphertext):
+                    continue
+                conn.execute(
+                    "UPDATE oauth_accounts SET refresh_token_ciphertext = ? WHERE id = ?",
+                    (self.oauth_token_cipher.rotate(ciphertext), row["id"]),
+                )
+                rotated_accounts += 1
+
+            rotated_jobs = 0
+            now = utc_now()
+            for row in job_rows:
+                ciphertext = str(row["token_ciphertext"])
+                if self.oauth_token_cipher.uses_primary_key(ciphertext):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE oauth_lifecycle_jobs
+                    SET token_ciphertext = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (self.oauth_token_cipher.rotate(ciphertext), now, row["id"]),
+                )
+                rotated_jobs += 1
+
+            verified_account_rows = conn.execute(
+                """
+                SELECT refresh_token_ciphertext
+                FROM oauth_accounts
+                WHERE refresh_token_ciphertext IS NOT NULL
+                """
+            ).fetchall()
+            verified_job_rows = conn.execute(
+                """
+                SELECT token_ciphertext
+                FROM oauth_lifecycle_jobs
+                WHERE token_ciphertext IS NOT NULL
+                """
+            ).fetchall()
+            after_accounts = self._oauth_ciphertext_status(
+                [str(row["refresh_token_ciphertext"]) for row in verified_account_rows]
+            )
+            after_jobs = self._oauth_ciphertext_status(
+                [str(row["token_ciphertext"]) for row in verified_job_rows]
+            )
+            if (
+                after_accounts["non_primary"]
+                or after_accounts["unreadable"]
+                or after_jobs["non_primary"]
+                or after_jobs["unreadable"]
+            ):
+                raise RuntimeError("OAuth token key rotation verification failed")
+        return {
+            "oauth_accounts": {
+                **after_accounts,
+                "rotated": rotated_accounts,
+            },
+            "oauth_lifecycle_jobs": {
+                **after_jobs,
+                "rotated": rotated_jobs,
+            },
+            "total": after_accounts["total"] + after_jobs["total"],
+            "rotated": rotated_accounts + rotated_jobs,
+            "non_primary": 0,
+            "unreadable": 0,
+        }
+
+    def oauth_lifecycle_jobs(self, limit: int = 100) -> dict[str, Any]:
+        capped_limit = max(1, min(int(limit or 100), 200))
+        with self.database.session() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, provider, source, status, local_delete_completed,
+                       attempts, next_attempt_at, last_error_code,
+                       created_at, updated_at, completed_at
+                FROM oauth_lifecycle_jobs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (capped_limit,),
+            ).fetchall()
+            counts = conn.execute(
+                """
+                SELECT
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN status IN ('queued', 'running', 'retry_wait') THEN 1 ELSE 0 END) AS pending,
+                  SUM(CASE WHEN status = 'awaiting_token' THEN 1 ELSE 0 END) AS awaiting_token,
+                  SUM(CASE WHEN status = 'manual_review' THEN 1 ELSE 0 END) AS manual_review
+                FROM oauth_lifecycle_jobs
+                """
+            ).fetchone()
+        return {
+            "jobs": [self._public_oauth_lifecycle_job(row) for row in rows],
+            "counts": {key: int(value or 0) for key, value in dict(counts).items()},
+        }
+
+    def retry_oauth_lifecycle_job(
+        self,
+        job_id: int,
+        *,
+        actor_user_id: int,
+    ) -> dict[str, Any]:
+        with self.database.session() as conn:
+            actor = conn.execute(
+                "SELECT id FROM users WHERE id = ? AND role = 'admin' AND status = 'active'",
+                (actor_user_id,),
+            ).fetchone()
+            if actor is None:
+                raise AppError(403, "admin access required")
+            job = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise AppError(404, "OAuth lifecycle job not found")
+            if job["status"] == "completed":
+                raise AppError(409, "completed OAuth lifecycle jobs cannot be retried")
+            next_status = "queued" if job["token_ciphertext"] else "awaiting_token"
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET status = ?, next_attempt_at = ?, last_error_code = NULL,
+                    worker_id = NULL, started_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_status, now if next_status == "queued" else None, now, job_id),
             )
             self._audit(
                 conn,
-                "system",
-                "oauth_account_create",
-                "user",
-                user_id,
-                after={"provider": provider},
-                reason_codes=["SSO_CREATE"],
+                "admin",
+                "oauth_lifecycle_retry",
+                "oauth_lifecycle_job",
+                job_id,
+                after={"status": next_status},
+                reason_codes=["ADMIN_OAUTH_LIFECYCLE_RETRY"],
             )
-            return {
-                "user": dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()),
-                "oauth_account": dict(
-                    conn.execute("SELECT * FROM oauth_accounts WHERE id = ?", (cur_account.lastrowid,)).fetchone()
+            updated = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return self._public_oauth_lifecycle_job(updated)
+
+    def recover_oauth_lifecycle_jobs(self) -> int:
+        now = utc_now()
+        with self.database.session() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET status = 'retry_wait', next_attempt_at = ?, worker_id = NULL,
+                    started_at = NULL, last_error_code = 'worker_interrupted', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now, now),
+            )
+        return int(cursor.rowcount)
+
+    def process_next_oauth_lifecycle_job(
+        self,
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.database.session() as conn:
+            job = conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET status = 'running', worker_id = ?, attempts = attempts + 1,
+                    started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE id = (
+                  SELECT id FROM oauth_lifecycle_jobs
+                  WHERE (
+                    local_delete_completed = 0
+                    AND status IN ('queued', 'retry_wait', 'awaiting_token', 'manual_review')
+                    AND (
+                      status IN ('awaiting_token', 'manual_review')
+                      OR next_attempt_at IS NULL OR next_attempt_at <= ?
+                    )
+                  ) OR (
+                    local_delete_completed = 1
+                    AND status IN ('queued', 'retry_wait')
+                    AND token_ciphertext IS NOT NULL
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  )
+                  ORDER BY id
+                  LIMIT 1
+                )
+                  AND status IN ('queued', 'retry_wait', 'awaiting_token', 'manual_review')
+                RETURNING *
+                """,
+                (str(worker_id or "")[:160], now, now, now, now),
+            ).fetchone()
+        if job is None:
+            return None
+        job_id = int(job["id"])
+        if not bool(job["local_delete_completed"]):
+            try:
+                job = self._complete_oauth_local_delete(job_id)
+            except Exception:
+                delay = self._oauth_retry_delay_seconds(int(job["attempts"]))
+                retry_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay)
+                ).isoformat(timespec="seconds")
+                return self._finish_oauth_lifecycle_failure(
+                    job_id,
+                    status="retry_wait",
+                    error_code="local_delete_failed",
+                    next_attempt_at=retry_at,
+                )
+            if job["status"] != "running":
+                return self._public_oauth_lifecycle_job(job)
+        if self.oauth_token_cipher is None or self.naver_login_client is None:
+            return self._finish_oauth_lifecycle_failure(
+                job_id,
+                status="manual_review",
+                error_code="configuration_missing",
+            )
+        try:
+            token = self.oauth_token_cipher.decrypt(str(job["token_ciphertext"]))
+        except ValueError:
+            return self._finish_oauth_lifecycle_failure(
+                job_id,
+                status="manual_review",
+                error_code="token_decrypt_failed",
+            )
+        try:
+            self.naver_login_client.revoke_token(
+                token,
+                str(job["token_type_hint"] or "access_token"),
+            )
+        except IntegrationError as exc:
+            if exc.retryable:
+                delay = self._oauth_retry_delay_seconds(int(job["attempts"]))
+                retry_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay)
+                ).isoformat(timespec="seconds")
+                return self._finish_oauth_lifecycle_failure(
+                    job_id,
+                    status="retry_wait",
+                    error_code=(
+                        f"provider_{exc.status_code}"
+                        if exc.status_code is not None
+                        else "provider_unavailable"
+                    ),
+                    next_attempt_at=retry_at,
+                )
+            return self._finish_oauth_lifecycle_failure(
+                job_id,
+                status="manual_review",
+                error_code=(
+                    f"provider_{exc.status_code}"
+                    if exc.status_code is not None
+                    else "provider_rejected"
                 ),
-                "created": True,
-            }
+            )
+
+        completed_at = utc_now()
+        with self.database.session() as conn:
+            conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET status = 'completed', token_ciphertext = NULL,
+                    next_attempt_at = NULL, last_error_code = NULL,
+                    worker_id = NULL, completed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (completed_at, completed_at, job_id),
+            )
+            completed = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return self._public_oauth_lifecycle_job(completed)
+
+    def _complete_oauth_local_delete(self, job_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            job = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ? FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise AppError(404, "OAuth lifecycle job not found")
+            if bool(job["local_delete_completed"]):
+                return dict(job)
+            user = conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (job["user_id"],),
+            ).fetchone()
+            if user is not None and user["status"] != "deleted":
+                source = str(job["source"])
+                self._delete_account_record(
+                    conn,
+                    user,
+                    actor_type=(
+                        "provider"
+                        if source in {"provider_callback", "provider_callback_related"}
+                        else source
+                    ),
+                    action="oauth_lifecycle_local_delete",
+                    reason_code=f"OAUTH_LIFECYCLE_{source.upper()}",
+                )
+            refreshed = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            now = utc_now()
+            if refreshed["token_ciphertext"]:
+                next_status = "running"
+            elif refreshed["source"] == "provider_callback":
+                next_status = "completed"
+            else:
+                next_status = "awaiting_token"
+            conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET local_delete_completed = 1, status = ?,
+                    token_ciphertext = CASE WHEN ? = 'completed' THEN NULL ELSE token_ciphertext END,
+                    next_attempt_at = NULL,
+                    worker_id = CASE WHEN ? = 'running' THEN worker_id ELSE NULL END,
+                    completed_at = CASE WHEN ? = 'completed' THEN ? ELSE NULL END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    next_status,
+                    next_status,
+                    next_status,
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+            completed = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return dict(completed)
+
+    def _finish_oauth_lifecycle_failure(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        error_code: str,
+        next_attempt_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.session() as conn:
+            conn.execute(
+                """
+                UPDATE oauth_lifecycle_jobs
+                SET status = ?, next_attempt_at = ?, last_error_code = ?,
+                    worker_id = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (status, next_attempt_at, error_code[:80], now, job_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM oauth_lifecycle_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return self._public_oauth_lifecycle_job(updated)
+
+    @staticmethod
+    def _oauth_retry_delay_seconds(attempts: int) -> int:
+        if attempts <= 1:
+            return 60
+        if attempts == 2:
+            return 5 * 60
+        if attempts == 3:
+            return 15 * 60
+        return 60 * 60
+
+    @staticmethod
+    def _public_oauth_lifecycle_job(job: Any) -> dict[str, Any]:
+        return {
+            "job_id": int(job["id"]),
+            "provider": str(job["provider"]),
+            "source": str(job["source"]),
+            "status": str(job["status"]),
+            "local_delete_completed": bool(job["local_delete_completed"]),
+            "attempts": int(job["attempts"] or 0),
+            "next_attempt_at": job["next_attempt_at"],
+            "last_error_code": job["last_error_code"],
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+            "completed_at": job["completed_at"],
+        }
+
+    def register_session(
+        self,
+        user_id: int,
+        session_token: str,
+        *,
+        issued_at: int,
+        expires_at: int,
+    ) -> None:
+        issued = datetime.fromtimestamp(issued_at, tz=timezone.utc).isoformat(timespec="seconds")
+        expires = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(timespec="seconds")
+        session_hash = stable_hash("browser-session", session_token)
+        with self.database.session() as conn:
+            if conn.execute(
+                "SELECT id FROM users WHERE id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchone() is None:
+                raise AppError(401, "login required")
+            conn.execute(
+                """
+                INSERT INTO auth_sessions
+                  (session_hash, user_id, issued_at, expires_at, authenticated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_hash, user_id, issued, expires, issued),
+            )
+
+    def active_session_user(
+        self,
+        user_id: int,
+        session_token: str,
+    ) -> dict[str, Any] | None:
+        session_hash = stable_hash("browser-session", session_token)
+        now = utc_now()
+        with self.database.session() as conn:
+            user = conn.execute(
+                """
+                SELECT u.id, u.display_name, u.role, u.status
+                FROM auth_sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.session_hash = ? AND s.user_id = ?
+                  AND s.revoked_at IS NULL AND s.expires_at > ?
+                  AND u.status = 'active'
+                """,
+                (session_hash, user_id, now),
+            ).fetchone()
+        return dict(user) if user is not None else None
+
+    def revoke_session(self, session_token: str) -> None:
+        if not session_token:
+            return
+        with self.database.session() as conn:
+            conn.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked_at = ?
+                WHERE session_hash = ? AND revoked_at IS NULL
+                """,
+                (utc_now(), stable_hash("browser-session", session_token)),
+            )
+
+    def session_recently_authenticated(
+        self,
+        user_id: int,
+        session_token: str,
+        *,
+        max_age_seconds: int,
+    ) -> bool:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat(timespec="seconds")
+        with self.database.session() as conn:
+            row = conn.execute(
+                """
+                SELECT session_hash
+                FROM auth_sessions
+                WHERE session_hash = ? AND user_id = ?
+                  AND revoked_at IS NULL AND expires_at > ?
+                  AND authenticated_at >= ?
+                """,
+                (
+                    stable_hash("browser-session", session_token),
+                    user_id,
+                    utc_now(),
+                    cutoff,
+                ),
+            ).fetchone()
+        return row is not None
+
+    def issue_one_time_action_token(
+        self,
+        user_id: int,
+        session_token: str,
+        action: str,
+        *,
+        ttl_seconds: int,
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        session_hash = stable_hash("browser-session", session_token)
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        with self.database.session() as conn:
+            conn.execute(
+                "DELETE FROM action_tokens WHERE used_at IS NOT NULL OR expires_at <= ?",
+                (now.isoformat(timespec="seconds"),),
+            )
+            session = conn.execute(
+                """
+                SELECT session_hash
+                FROM auth_sessions
+                WHERE session_hash = ? AND user_id = ?
+                  AND revoked_at IS NULL AND expires_at > ?
+                """,
+                (session_hash, user_id, now.isoformat(timespec="seconds")),
+            ).fetchone()
+            if session is None:
+                raise AppError(401, "login required")
+            conn.execute(
+                """
+                INSERT INTO action_tokens
+                  (token_hash, session_hash, user_id, action, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    stable_hash("one-time-action", token),
+                    session_hash,
+                    user_id,
+                    action,
+                    expires_at,
+                ),
+            )
+        return token
+
+    def consume_one_time_action_token(
+        self,
+        user_id: int,
+        session_token: str,
+        action: str,
+        supplied_token: str,
+    ) -> bool:
+        if not supplied_token:
+            return False
+        now = utc_now()
+        with self.database.session() as conn:
+            updated = conn.execute(
+                """
+                UPDATE action_tokens
+                SET used_at = ?
+                WHERE token_hash = ? AND session_hash = ? AND user_id = ?
+                  AND action = ? AND used_at IS NULL AND expires_at > ?
+                  AND EXISTS (
+                    SELECT 1 FROM auth_sessions s
+                    WHERE s.session_hash = action_tokens.session_hash
+                      AND s.revoked_at IS NULL AND s.expires_at > ?
+                  )
+                """,
+                (
+                    now,
+                    stable_hash("one-time-action", supplied_token),
+                    stable_hash("browser-session", session_token),
+                    user_id,
+                    action,
+                    now,
+                    now,
+                ),
+            )
+        return updated.rowcount == 1
+
+    def enforce_security_rate_limit(
+        self,
+        scope: str,
+        subject: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=window_seconds)).isoformat(timespec="seconds")
+        prune_before = (now - timedelta(days=1)).isoformat(timespec="seconds")
+        subject_hash = stable_hash("security-rate-limit", scope, subject)
+        with self.database.session() as conn:
+            conn.execute(
+                "DELETE FROM security_rate_limit_events WHERE created_at < ?",
+                (prune_before,),
+            )
+            recent_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM security_rate_limit_events
+                    WHERE scope = ? AND subject_hash = ? AND created_at >= ?
+                    """,
+                    (scope, subject_hash, cutoff),
+                ).fetchone()["count"]
+            )
+            conn.execute(
+                """
+                INSERT INTO security_rate_limit_events (scope, subject_hash, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (scope, subject_hash, now.isoformat(timespec="seconds")),
+            )
+        if recent_count >= limit:
+            raise AppError(429, "too many security-sensitive requests")
 
     def get_active_user(self, user_id: int) -> dict[str, Any] | None:
         with self.database.session() as conn:
@@ -3804,7 +5291,14 @@ class RestaurantService:
         normalized_status = status.strip().lower()
         if normalized_role not in {"", "user", "admin"}:
             raise AppError(400, "invalid account role filter")
-        if normalized_status not in {"", "active", "suspended", "deleted", "merged"}:
+        if normalized_status not in {
+            "",
+            "active",
+            "suspended",
+            "deletion_pending",
+            "deleted",
+            "merged",
+        }:
             raise AppError(400, "invalid account status filter")
         limit = max(1, min(int(limit), 100))
         offset = max(0, int(offset))
@@ -3924,7 +5418,7 @@ class RestaurantService:
             ).fetchone()
             if account is None:
                 raise AppError(404, "user not found")
-            if account["status"] in {"deleted", "merged"}:
+            if account["status"] in {"deletion_pending", "deleted", "merged"}:
                 raise AppError(409, "closed accounts cannot be reactivated here")
             if user_id == actor_user_id and (
                 normalized_role != "admin" or normalized_status != "active"
@@ -4003,6 +5497,35 @@ class RestaurantService:
             target = conn.execute("SELECT * FROM users WHERE id = ?", (target_user_id,)).fetchone()
             if source is None or target is None:
                 raise AppError(404, "user not found")
+            linked_accounts = conn.execute(
+                """
+                SELECT provider, provider_subject
+                FROM oauth_accounts
+                WHERE user_id IN (?, ?)
+                """,
+                (user_id, target_user_id),
+            ).fetchall()
+            self._lock_oauth_subject_hashes(
+                conn,
+                [
+                    (
+                        str(account["provider"]),
+                        self._oauth_subject_hash(
+                            str(account["provider"]),
+                            str(account["provider_subject"]),
+                        ),
+                    )
+                    for account in linked_accounts
+                ],
+            )
+            source = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            target = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (target_user_id,)
+            ).fetchone()
+            if source["status"] in {"deletion_pending", "deleted", "merged"} or target[
+                "status"
+            ] in {"deletion_pending", "deleted", "merged"}:
+                raise AppError(409, "closed accounts cannot be merged")
             conn.execute("UPDATE oauth_accounts SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
             conn.execute("UPDATE restaurant_reviews SET user_id = ? WHERE user_id = ?", (target_user_id, user_id))
             conn.execute(

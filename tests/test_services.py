@@ -1314,12 +1314,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["groups"][0]["documents_collected"], 1)
 
     def test_review_rate_limit_report_and_admin_report_list(self) -> None:
-        restaurant_id = self.service.list_map_restaurants()[0]["id"]
+        restaurant_ids = [
+            int(item["id"])
+            for item in self.service.list_map_restaurants()[:3]
+        ]
+        self.assertEqual(len(restaurant_ids), 3)
         context = RequestContext(ip="203.0.113.10")
 
         created = [
             self.service.add_review(
-                restaurant_id,
+                restaurant_ids[index],
                 rating=5,
                 body=f"좋았습니다 {index}",
                 reviewer_label="테스터",
@@ -1329,13 +1333,23 @@ class ServiceTests(unittest.TestCase):
         ]
         with self.assertRaises(AppError) as raised:
             self.service.add_review(
-                restaurant_id,
+                restaurant_ids[0],
                 rating=4,
                 body="반복 리뷰",
                 reviewer_label="테스터",
                 context=context,
             )
         self.assertEqual(raised.exception.status, 429)
+
+        with self.assertRaises(AppError) as too_long:
+            self.service.add_review(
+                restaurant_ids[0],
+                rating=4,
+                body="가" * (self.service.REVIEW_BODY_MAX_LENGTH + 1),
+                reviewer_label="테스터",
+                context=RequestContext(ip="203.0.113.11"),
+            )
+        self.assertEqual(too_long.exception.status, 400)
 
         report = self.service.report_review(created[0]["id"], "spam_or_abuse", context)
         self.assertEqual(report["status"], "open")
@@ -1625,10 +1639,18 @@ class ServiceTests(unittest.TestCase):
             actor_user_id=int(admin.lastrowid),
         )
 
-        self.assertEqual(result["result"], "deleted")
-        self.assertEqual(result["oauth_accounts_deleted"], 1)
-        self.assertEqual(result["saved_restaurants_deleted"], 1)
-        self.assertEqual(result["reviews_anonymized"], 1)
+        self.assertEqual(result["result"], "deletion_pending")
+        self.assertEqual(result["provider_revocation"], "awaiting_token")
+        with self.db.session() as conn:
+            pending_user = conn.execute(
+                "SELECT status FROM users WHERE id = ?", (member_id,)
+            ).fetchone()
+        self.assertEqual(pending_user["status"], "deletion_pending")
+        local_delete = self.service.process_next_oauth_lifecycle_job(
+            "admin-delete-test-worker"
+        )
+        self.assertEqual(local_delete["status"], "awaiting_token")
+        self.assertTrue(local_delete["local_delete_completed"])
         with self.db.session() as conn:
             deleted_user = conn.execute(
                 "SELECT display_name, role, status FROM users WHERE id = ?",
@@ -1646,14 +1668,17 @@ class ServiceTests(unittest.TestCase):
                 "SELECT user_id, reviewer_label FROM restaurant_reviews WHERE id = ?",
                 (review.lastrowid,),
             ).fetchone()
-            audit = conn.execute(
+            audit_actions = {
+                str(row["action"])
+                for row in conn.execute(
                 """
                 SELECT action FROM decision_audit_logs
                 WHERE target_type = 'user' AND target_id = ?
-                ORDER BY id DESC LIMIT 1
+                ORDER BY id DESC
                 """,
                 (member_id,),
-            ).fetchone()
+                ).fetchall()
+            }
         self.assertEqual(dict(deleted_user), {
             "display_name": "탈퇴한 사용자",
             "role": "user",
@@ -1663,7 +1688,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(int(saved_count), 0)
         self.assertIsNone(anonymized_review["user_id"])
         self.assertEqual(anonymized_review["reviewer_label"], "탈퇴한 사용자")
-        self.assertEqual(audit["action"], "admin_account_delete")
+        self.assertIn("admin_account_delete_pending", audit_actions)
+        self.assertIn("oauth_lifecycle_local_delete", audit_actions)
 
         with self.assertRaises(AppError) as self_delete_error:
             self.service.admin_delete_account(
@@ -1738,10 +1764,35 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(photo["id"], saved["image_id"])
         self.assertEqual(photo["provider"], "user_upload")
         self.assertEqual(photo["alt_text"], "점심 음식 사진")
-        photo_path = self.service._admin_image_file_path(
-            photo["source_url"].removeprefix("/media/restaurant-images/")
+        self.assertNotIn("user_id", photo)
+        self.assertRegex(
+            photo["source_url"],
+            r"^/media/community-photos/[0-9a-f]{32}\.png$",
+        )
+        photo_path = self.service.public_user_image_file_path(
+            photo["source_url"].removeprefix("/media/community-photos/")
         )
         self.assertTrue(photo_path.exists())
+
+        public_name = photo_path.name
+        legacy_storage_key = (
+            f"user-{owner_id}/restaurant-{restaurant_id}/{public_name}"
+        )
+        legacy_photo_path = self.service._admin_image_file_path(legacy_storage_key)
+        legacy_photo_path.parent.mkdir(parents=True, exist_ok=True)
+        photo_path.replace(legacy_photo_path)
+        with self.db.session() as conn:
+            conn.execute(
+                "UPDATE restaurant_user_images SET storage_key = ? WHERE id = ?",
+                (legacy_storage_key, photo["id"]),
+            )
+
+        legacy_photo = self.service.get_restaurant(restaurant_id)[
+            "restaurant_images"
+        ][0]
+        self.assertEqual(legacy_photo["source_url"], photo["source_url"])
+        photo_path = self.service.public_user_image_file_path(public_name)
+        self.assertEqual(photo_path, legacy_photo_path)
 
         my_page = self.service.my_page(owner_id)
         self.assertEqual(my_page["counts"]["photos"], 1)
@@ -1946,8 +1997,8 @@ class ServiceTests(unittest.TestCase):
         )
         photo = self.service.get_restaurant(restaurant_id)["restaurant_images"][0]
         self.assertEqual(photo["id"], saved_photo["image_id"])
-        photo_path = self.service._admin_image_file_path(
-            photo["source_url"].removeprefix("/media/restaurant-images/")
+        photo_path = self.service.public_user_image_file_path(
+            photo["source_url"].removeprefix("/media/community-photos/")
         )
         review = self.service.add_review(
             restaurant_id,
@@ -1969,17 +2020,13 @@ class ServiceTests(unittest.TestCase):
 
         result = self.service.delete_account(user_id)
 
-        self.assertEqual(
-            result,
-            {
-                "result": "deleted",
-                "oauth_accounts_deleted": 1,
-                "saved_restaurants_deleted": 1,
-                "photos_deleted": 1,
-                "reviews_anonymized": 1,
-                "reports_anonymized": 1,
-            },
-        )
+        self.assertEqual(result["result"], "deletion_pending")
+        self.assertEqual(result["provider_revocation"], "awaiting_token")
+        self.assertGreater(int(result["lifecycle_job_id"]), 0)
+        self.assertTrue(photo_path.exists())
+        local_delete = self.service.process_next_oauth_lifecycle_job("service-test-worker")
+        self.assertEqual(local_delete["status"], "awaiting_token")
+        self.assertTrue(local_delete["local_delete_completed"])
         self.assertFalse(photo_path.exists())
         self.assertIsNone(self.service.get_active_user(user_id))
         with self.db.session() as conn:
@@ -2026,6 +2073,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(moderation["before_json"], "{}")
         self.assertEqual(moderation["after_json"], "{}")
 
+        with self.assertRaises(AppError) as blocked_rejoin:
+            self.service.upsert_oauth_account(
+                "naver", "delete-service-user", "재가입 사용자"
+            )
+        self.assertEqual(blocked_rejoin.exception.status, 423)
+
+        self.service.accept_naver_disconnect(
+            provider_subject="delete-service-user",
+            provider_timestamp=1,
+            event_digest="delete-service-user-event",
+        )
         new_account = self.service.upsert_oauth_account(
             "naver", "delete-service-user", "재가입 사용자"
         )

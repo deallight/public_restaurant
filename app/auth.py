@@ -22,6 +22,14 @@ def _base64url_decode(value: str) -> bytes:
 
 
 @dataclass(frozen=True)
+class SessionClaims:
+    user_id: int
+    issued_at: int
+    expires_at: int
+    nonce: str
+
+
+@dataclass(frozen=True)
 class SessionCodec:
     """Issue and verify compact, server-signed browser sessions."""
 
@@ -52,6 +60,14 @@ class SessionCodec:
         return f"{encoded}.{signature}"
 
     def verify(self, token: str, now: int | None = None) -> int | None:
+        claims = self.verify_claims(token, now=now)
+        return claims.user_id if claims is not None else None
+
+    def verify_claims(
+        self,
+        token: str,
+        now: int | None = None,
+    ) -> SessionClaims | None:
         if not token or not self.secret:
             return None
         try:
@@ -63,10 +79,26 @@ class SessionCodec:
                 return None
             payload = json.loads(_base64url_decode(encoded).decode("utf-8"))
             checked_at = int(time.time() if now is None else now)
-            if payload.get("v") != 1 or int(payload.get("exp", 0)) <= checked_at:
+            issued_at = int(payload.get("iat", 0))
+            expires_at = int(payload.get("exp", 0))
+            nonce = str(payload.get("nonce", ""))
+            if (
+                payload.get("v") != 1
+                or issued_at <= 0
+                or expires_at <= checked_at
+                or expires_at <= issued_at
+                or not nonce
+            ):
                 return None
             user_id = int(payload.get("uid", 0))
-            return user_id if user_id > 0 else None
+            if user_id <= 0:
+                return None
+            return SessionClaims(
+                user_id=user_id,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                nonce=nonce,
+            )
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return None
 

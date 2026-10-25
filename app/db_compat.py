@@ -94,7 +94,11 @@ class PostgresCursor:
 class PostgresConnection:
     backend = "postgresql"
     tables_without_id = {
+        "action_tokens",
         "app_schema_migrations",
+        "auth_sessions",
+        "oauth_disconnect_events",
+        "oauth_flow_intents",
         "restaurant_ai_summaries",
         "review_reactions",
         "user_saved_restaurants",

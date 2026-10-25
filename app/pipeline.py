@@ -26,6 +26,7 @@ from .agents import (
     is_food_context_purpose,
     name_similarity_with_branch,
     non_food_purpose_decision,
+    pre_api_manual_reject_decision,
     row_name_for_matching,
 )
 from .alias_memory import alias_memory_decision, remember_aliases
@@ -118,8 +119,14 @@ class RawExpenseRow:
 
 def clean_parsed_place_name(value: str) -> str:
     original = re.sub(r"\s+", " ", str(value or "")).strip()
-    cleaned = original
-    suffix_pattern = re.compile(r"(?:\s*외\s*\d+\s*(?:개소|개|곳|명)?|\s*등)\s*$")
+    cleaned = re.sub(
+        r"\s*\([^()]*(?:외|등)\s*\d+\s*(?:개소|개|곳|명|인|건)?[^()]*\)\s*$",
+        "",
+        original,
+    ).strip()
+    suffix_pattern = re.compile(
+        r"(?:\s*(?:외|등)\s*\d+\s*(?:개소|개|곳|명|인|건)?|\s*등)\s*$"
+    )
     while cleaned:
         without_suffix = suffix_pattern.sub("", cleaned).strip(" ,;，；/_·-")
         if without_suffix == cleaned or not without_suffix:
@@ -134,7 +141,8 @@ def split_raw_expense_row_places(raw_row: RawExpenseRow) -> list[RawExpenseRow]:
     parts: list[str] = []
     original_parts: dict[str, str] = {}
     seen: set[str] = set()
-    for value in re.split(r"[,;，；]+", raw_row.place_name or ""):
+    # 다중 집행 행의 줄바꿈 상호도 쉼표 구분과 동일하게 분리합니다.
+    for value in re.split(r"[,;，；\r\n]+", raw_row.place_name or ""):
         original_part = re.sub(r"\s+", " ", value).strip()
         part = clean_parsed_place_name(original_part)
         key = normalize_text(part).replace(" ", "")
@@ -1184,6 +1192,7 @@ class DailyPipeline:
                                 decision = (
                                     expense_scope_reject_decision(normalized)
                                     or non_food_purpose_decision(normalized)
+                                    or pre_api_manual_reject_decision(normalized)
                                     or alias_memory_decision(conn, normalized)
                                     or verifier.verify(normalized)
                                 )
@@ -2177,6 +2186,9 @@ class DailyPipeline:
                         if decision is None:
                             progress("purpose_rule", "음식점 목적 조건", 30)
                             decision = non_food_purpose_decision(normalized)
+                        if decision is None:
+                            progress("manual_feedback", "수동검토 학습 조건", 36)
+                            decision = pre_api_manual_reject_decision(normalized)
                         if decision is None:
                             progress("existing_success", "기존 승인 근거 확인", 42)
                             decision = existing_success_verification_decision(conn, candidate_id, normalized)

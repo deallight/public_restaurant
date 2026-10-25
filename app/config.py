@@ -57,6 +57,8 @@ class Settings:
     naver_login_client_secret: str = ""
     naver_login_redirect_uri: str = ""
     session_secret: str = ""
+    oauth_token_encryption_keys: str = ""
+    oauth_subject_hmac_secret: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""
@@ -79,6 +81,9 @@ def load_settings() -> Settings:
     if not database_url.startswith(("postgresql://", "postgres://")):
         raise ValueError("DATABASE_URL must use postgresql:// or postgres://")
     privacy_contact_email = os.getenv("PRIVACY_CONTACT_EMAIL", "").strip()
+    session_secret = os.getenv("APP_SESSION_SECRET", "").strip()
+    oauth_token_encryption_keys = os.getenv("OAUTH_TOKEN_ENCRYPTION_KEYS", "").strip()
+    oauth_subject_hmac_secret = os.getenv("OAUTH_SUBJECT_HMAC_SECRET", "").strip()
     email_local, email_separator, email_domain = privacy_contact_email.partition("@")
     if app_env == "production" and (
         not email_local
@@ -88,6 +93,20 @@ def load_settings() -> Settings:
         or any(character.isspace() for character in privacy_contact_email)
     ):
         raise ValueError("APP_ENV=production requires PRIVACY_CONTACT_EMAIL")
+    if app_env == "production":
+        missing_security_settings = [
+            name
+            for name, value in (
+                ("APP_SESSION_SECRET", session_secret),
+                ("OAUTH_TOKEN_ENCRYPTION_KEYS", oauth_token_encryption_keys),
+                ("OAUTH_SUBJECT_HMAC_SECRET", oauth_subject_hmac_secret),
+            )
+            if not value
+        ]
+        if missing_security_settings:
+            raise ValueError(
+                "APP_ENV=production requires " + ", ".join(missing_security_settings)
+            )
     return Settings(
         database_url=database_url,
         restaurant_image_upload_dir=Path(
@@ -112,7 +131,9 @@ def load_settings() -> Settings:
             "NAVER_LOGIN_REDIRECT_URI",
             "http://127.0.0.1:8000/auth/callback/naver",
         ),
-        session_secret=os.getenv("APP_SESSION_SECRET", ""),
+        session_secret=session_secret,
+        oauth_token_encryption_keys=oauth_token_encryption_keys,
+        oauth_subject_hmac_secret=oauth_subject_hmac_secret,
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
         google_redirect_uri=os.getenv(

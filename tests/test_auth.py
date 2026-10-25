@@ -4,7 +4,9 @@ import http.client
 import json
 import re
 import threading
+import time
 import unittest
+from datetime import datetime
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
@@ -13,17 +15,21 @@ from urllib.parse import urlencode
 from app.auth import SessionCodec
 from app.config import Settings
 from app.http_server import (
+    ACCOUNT_DELETE_ACTION,
+    MAX_REGULAR_POST_BYTES,
     OAUTH_PROVIDER_COOKIE,
     OAUTH_RETURN_COOKIE,
     OAUTH_STATE_COOKIE,
     SESSION_COOKIE,
+    SESSION_CSRF_ACTION,
     PublicRestaurantApplication,
     make_handler,
 )
-from app.integrations import OAuthProfile
+from app.integrations import OAuthLoginResult, OAuthProfile
 from app.services import RequestContext
 from app.views import login_index, public_index
 from tests.postgres_test import fresh_postgres_database, postgres_test_url
+from tests.test_oauth_lifecycle import TEST_TOKEN_KEY, naver_disconnect_payload
 
 
 class SessionCodecTests(unittest.TestCase):
@@ -87,6 +93,9 @@ class NaverAuthHttpTests(unittest.TestCase):
             naver_login_client_id="test-client-id",
             naver_login_client_secret="test-client-secret",
             naver_login_redirect_uri="http://127.0.0.1/auth/callback/naver",
+            session_secret="auth-http-test-session-secret",
+            oauth_token_encryption_keys=TEST_TOKEN_KEY,
+            oauth_subject_hmac_secret="auth-http-test-subject-hmac-secret",
             privacy_contact_email="privacy@example.test",
         )
         self.app = PublicRestaurantApplication(settings)
@@ -126,6 +135,20 @@ class NaverAuthHttpTests(unittest.TestCase):
     def cookie_header(self, values: dict[str, str]) -> str:
         return "; ".join(f"{name}={value}" for name, value in values.items())
 
+    def session_headers(
+        self,
+        session_token: str,
+        extra: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        return {
+            "Cookie": f"{SESSION_COOKIE}={session_token}",
+            "X-CSRF-Token": self.app.session_codec.issue_action_token(
+                session_token,
+                SESSION_CSRF_ACTION,
+            ),
+            **(extra or {}),
+        }
+
     def multipart_photo(
         self,
         fields: dict[str, str],
@@ -161,6 +184,19 @@ class NaverAuthHttpTests(unittest.TestCase):
 
         self.assertEqual(status, 302)
         self.assertEqual(headers["Location"], "/login")
+
+    def test_regular_post_body_is_limited_before_parsing(self) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.putrequest("POST", "/not-found")
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(MAX_REGULAR_POST_BYTES + 1))
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual(response.status, 413)
+            response.read()
+        finally:
+            connection.close()
 
     def test_privacy_and_terms_are_public(self) -> None:
         for path, marker in [
@@ -209,18 +245,49 @@ class NaverAuthHttpTests(unittest.TestCase):
         self.assertEqual(session_status, 200)
         self.assertEqual(json.loads(session_body)["user"]["display_name"], "네이버 테스터")
 
-        home_status, _, home_body = self.request(
+        home_status, home_headers, home_body = self.request(
             "GET", "/", headers={"Cookie": f"{SESSION_COOKIE}={session_cookie}"}
         )
         self.assertEqual(home_status, 200)
         self.assertIn("네이버 테스터", home_body.decode("utf-8"))
+        self.assertEqual(home_headers["Cache-Control"], "no-store")
+        self.assertEqual(home_headers["X-Frame-Options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", home_headers["Content-Security-Policy"])
+        self.assertIn('name="csrf-token"', home_body.decode("utf-8"))
+
+        missing_csrf_status, _, _ = self.request(
+            "POST",
+            "/auth/logout",
+            headers={"Cookie": f"{SESSION_COOKIE}={session_cookie}"},
+        )
+        self.assertEqual(missing_csrf_status, 403)
+        still_signed_in_status, _, still_signed_in_body = self.request(
+            "GET",
+            "/auth/session",
+            headers={"Cookie": f"{SESSION_COOKIE}={session_cookie}"},
+        )
+        self.assertEqual(still_signed_in_status, 200)
+        self.assertIsNotNone(json.loads(still_signed_in_body)["user"])
 
         logout_status, logout_headers, _ = self.request(
-            "POST", "/auth/logout", headers={"Cookie": f"{SESSION_COOKIE}={session_cookie}"}
+            "POST",
+            "/auth/logout",
+            headers=self.session_headers(
+                session_cookie,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+            body=urlencode({"return_to": "//evil.example"}).encode("utf-8"),
         )
         self.assertEqual(logout_status, 303)
         self.assertEqual(logout_headers["Location"], "/")
         self.assertIn("Max-Age=0", "\n".join(logout_headers.get_all("Set-Cookie", [])))
+        revoked_status, _, revoked_body = self.request(
+            "GET",
+            "/auth/session",
+            headers={"Cookie": f"{SESSION_COOKIE}={session_cookie}"},
+        )
+        self.assertEqual(revoked_status, 200)
+        self.assertIsNone(json.loads(revoked_body)["user"])
 
     def test_callback_rejects_mismatched_state(self) -> None:
         cookies = {
@@ -241,6 +308,102 @@ class NaverAuthHttpTests(unittest.TestCase):
         exchange_code.assert_not_called()
         self.assertEqual(self.app.database.count("users"), 0)
 
+    def test_oauth_json_callback_never_exposes_subject_or_tokens(self) -> None:
+        start_status, start_headers, start_body = self.request(
+            "GET",
+            "/auth/naver/start?return_to=/",
+            headers={"Accept": "application/json"},
+        )
+        self.assertEqual(start_status, 200)
+        self.assertTrue(json.loads(start_body)["configured"])
+        oauth_cookies = self.response_cookies(start_headers)
+        state = oauth_cookies[OAUTH_STATE_COOKIE]
+        with patch(
+            "app.http_server.NaverLoginClient.exchange_code",
+            return_value=OAuthLoginResult(
+                OAuthProfile("naver", "private-provider-subject", "JSON 사용자"),
+                access_token="private-access-token",
+                refresh_token="private-refresh-token",
+            ),
+        ):
+            status, _, body = self.request(
+                "GET",
+                f"/auth/callback/naver?code=json-code&state={state}",
+                headers={
+                    "Accept": "application/json",
+                    "Cookie": self.cookie_header(oauth_cookies),
+                },
+            )
+        self.assertEqual(status, 200)
+        serialized = body.decode("utf-8")
+        self.assertNotIn("private-provider-subject", serialized)
+        self.assertNotIn("private-access-token", serialized)
+        self.assertNotIn("private-refresh-token", serialized)
+        self.assertEqual(json.loads(body)["user"]["display_name"], "JSON 사용자")
+        with self.app.database.session() as conn:
+            account = conn.execute(
+                "SELECT refresh_token_ciphertext FROM oauth_accounts"
+            ).fetchone()
+            login_intent = conn.execute(
+                "SELECT purpose, user_id, expected_subject_hmac, used_at FROM oauth_flow_intents"
+            ).fetchone()
+        self.assertNotEqual(account["refresh_token_ciphertext"], "private-refresh-token")
+        self.assertEqual(login_intent["purpose"], "login")
+        self.assertIsNone(login_intent["user_id"])
+        self.assertIsNone(login_intent["expected_subject_hmac"])
+        self.assertIsNotNone(login_intent["used_at"])
+
+        with patch("app.http_server.NaverLoginClient.exchange_code") as exchange_code:
+            replay_status, _, _ = self.request(
+                "GET",
+                f"/auth/callback/naver?code=replayed-code&state={state}",
+                headers={
+                    "Accept": "application/json",
+                    "Cookie": self.cookie_header(oauth_cookies),
+                },
+            )
+        self.assertEqual(replay_status, 401)
+        exchange_code.assert_not_called()
+
+    def test_naver_disconnect_callback_deletes_account_revokes_session_and_is_idempotent(self) -> None:
+        account = self.app.service.upsert_oauth_account(
+            "naver", "disconnect-http-user", "철회 HTTP 사용자"
+        )
+        user_id = int(account["user"]["id"])
+        session = self.app.issue_session(user_id)
+        payload = naver_disconnect_payload(
+            "disconnect-http-user",
+            client_id="test-client-id",
+            client_secret="test-client-secret",
+            timestamp=int(time.time()),
+        )
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        status, _, body = self.request(
+            "POST",
+            "/auth/naver/deauthorize",
+            headers=headers,
+            body=urlencode(payload).encode("utf-8"),
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
+        self.assertIsNone(self.app.service.get_active_user(user_id))
+        self.assertIsNone(self.app.session_user(session))
+
+        duplicate_status, _, _ = self.request(
+            "POST",
+            "/auth/naver/deauthorize",
+            headers=headers,
+            body=urlencode(payload).encode("utf-8"),
+        )
+        self.assertEqual(duplicate_status, 204)
+        tampered_status, _, _ = self.request(
+            "POST",
+            "/auth/naver/deauthorize",
+            headers=headers,
+            body=urlencode({**payload, "signature": payload["signature"] + "x"}).encode("utf-8"),
+        )
+        self.assertEqual(tampered_status, 403)
+
     def test_my_page_requires_login_and_manages_saved_place_and_review(self) -> None:
         anonymous_status, anonymous_headers, _ = self.request("GET", "/mypage")
         self.assertEqual(anonymous_status, 302)
@@ -251,12 +414,13 @@ class NaverAuthHttpTests(unittest.TestCase):
             "naver", "mypage-http-user", "마이페이지 테스터"
         )
         user_id = int(account["user"]["id"])
+        unregistered_legacy_session = self.app.session_codec.issue(user_id)
+        self.assertIsNone(self.app.session_user(unregistered_legacy_session))
         session = self.app.issue_session(user_id)
-        auth_headers = {
-            "Cookie": f"{SESSION_COOKIE}={session}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        auth_headers = self.session_headers(
+            session,
+            {"Content-Type": "application/json", "Accept": "application/json"},
+        )
         restaurant_id = int(self.app.service.list_map_restaurants()[0]["id"])
 
         save_status, _, save_body = self.request(
@@ -318,6 +482,22 @@ class NaverAuthHttpTests(unittest.TestCase):
         self.assertIn("저장 해제", page)
         self.assertIn('class="mypage-review-delete"', page)
         self.assertIn('src="/static/mypage.js"', page)
+        self.assertIn('name="csrf_token"', page)
+
+        other = self.app.service.upsert_oauth_account(
+            "naver", "review-http-other", "다른 리뷰 사용자"
+        )
+        other_session = self.app.issue_session(int(other["user"]["id"]))
+        forbidden_delete_status, _, _ = self.request(
+            "POST",
+            f"/api/reviews/{review['id']}/delete",
+            headers=self.session_headers(
+                other_session,
+                {"Content-Type": "application/json", "Accept": "application/json"},
+            ),
+            body=b"{}",
+        )
+        self.assertEqual(forbidden_delete_status, 404)
 
         delete_status, _, delete_body = self.request(
             "POST",
@@ -345,7 +525,7 @@ class NaverAuthHttpTests(unittest.TestCase):
         )
         owner_id = int(owner["user"]["id"])
         owner_session = self.app.issue_session(owner_id)
-        owner_cookie = {"Cookie": f"{SESSION_COOKIE}={owner_session}"}
+        owner_cookie = self.session_headers(owner_session)
 
         page_status, _, page_body = self.request(
             "GET", upload_path, headers=owner_cookie
@@ -383,6 +563,22 @@ class NaverAuthHttpTests(unittest.TestCase):
         photo = detail["restaurant_images"][0]
         self.assertEqual(photo["provider"], "user_upload")
         self.assertEqual(photo["alt_text"], "사용자가 등록한 점심")
+        self.assertNotIn("user_id", photo)
+        self.assertRegex(
+            photo["source_url"],
+            r"^/media/community-photos/[0-9a-f]{32}\.png$",
+        )
+        self.assertNotIn(f"user-{owner_id}", photo["source_url"])
+        self.assertNotIn(f"restaurant-{restaurant_id}", photo["source_url"])
+
+        with self.app.database.session() as conn:
+            stored_image = conn.execute(
+                "SELECT storage_key FROM restaurant_user_images WHERE id = ?",
+                (photo["id"],),
+            ).fetchone()
+        self.assertIsNotNone(stored_image)
+        storage_key = str(stored_image["storage_key"])
+        self.assertRegex(storage_key, r"^community/[0-9a-f]{32}\.png$")
 
         media_status, media_headers, media_body = self.request(
             "GET", photo["source_url"]
@@ -390,6 +586,11 @@ class NaverAuthHttpTests(unittest.TestCase):
         self.assertEqual(media_status, 200)
         self.assertEqual(media_headers.get_content_type(), "image/png")
         self.assertEqual(media_body, png)
+
+        raw_media_status, _, _ = self.request(
+            "GET", f"/media/restaurant-images/{storage_key}"
+        )
+        self.assertEqual(raw_media_status, 404)
 
         mypage_status, _, mypage_body = self.request(
             "GET", "/mypage", headers=owner_cookie
@@ -406,7 +607,7 @@ class NaverAuthHttpTests(unittest.TestCase):
         forbidden_status, _, _ = self.request(
             "POST",
             f"/api/photos/{photo['id']}/delete",
-            headers={"Cookie": f"{SESSION_COOKIE}={other_session}"},
+            headers=self.session_headers(other_session),
         )
         self.assertEqual(forbidden_status, 404)
 
@@ -473,6 +674,9 @@ class NaverAuthHttpTests(unittest.TestCase):
             headers={
                 "Cookie": f"{SESSION_COOKIE}={session}",
                 "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-Token": self.app.session_codec.issue_action_token(
+                    session, SESSION_CSRF_ACTION
+                ),
             },
             body=urlencode(
                 {"action_token": "invalid", "confirmation": "계정 삭제"}
@@ -487,6 +691,9 @@ class NaverAuthHttpTests(unittest.TestCase):
             headers={
                 "Cookie": f"{SESSION_COOKIE}={session}",
                 "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-Token": self.app.session_codec.issue_action_token(
+                    session, SESSION_CSRF_ACTION
+                ),
             },
             body=urlencode(
                 {"action_token": action_token, "confirmation": "삭제"}
@@ -501,14 +708,41 @@ class NaverAuthHttpTests(unittest.TestCase):
             headers={
                 "Cookie": f"{SESSION_COOKIE}={session}",
                 "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-Token": self.app.session_codec.issue_action_token(
+                    session, SESSION_CSRF_ACTION
+                ),
             },
             body=urlencode(
                 {"action_token": action_token, "confirmation": "계정 삭제"}
             ).encode("utf-8"),
         )
-        self.assertEqual(delete_status, 303)
-        self.assertEqual(delete_headers["Location"], "/login?account_deleted=1")
-        self.assertIn("Max-Age=0", "\n".join(delete_headers.get_all("Set-Cookie", [])))
+        self.assertEqual(delete_status, 302)
+        self.assertTrue(delete_headers["Location"].startswith("https://nid.naver.com/oauth2.0/authorize?"))
+        self.assertIn("auth_type=reauthenticate", delete_headers["Location"])
+        self.assertIsNotNone(self.app.service.get_active_user(user_id))
+        oauth_cookies = self.response_cookies(delete_headers)
+        state = oauth_cookies[OAUTH_STATE_COOKIE]
+
+        with patch(
+            "app.http_server.NaverLoginClient.exchange_code",
+            return_value=OAuthLoginResult(
+                OAuthProfile("naver", "delete-http-user", "탈퇴 테스터"),
+                access_token="delete-access-token",
+                refresh_token="delete-refresh-token",
+            ),
+        ):
+            callback_status, callback_headers, _ = self.request(
+                "GET",
+                f"/auth/callback/naver?code=delete-code&state={state}",
+                headers={"Cookie": self.cookie_header(oauth_cookies)},
+            )
+
+        self.assertEqual(callback_status, 303)
+        self.assertEqual(
+            callback_headers["Location"],
+            "/login?account_deleted=1&provider_revocation=pending",
+        )
+        self.assertIn("Max-Age=0", "\n".join(callback_headers.get_all("Set-Cookie", [])))
 
         session_status, _, session_body = self.request(
             "GET",
@@ -517,9 +751,173 @@ class NaverAuthHttpTests(unittest.TestCase):
         )
         self.assertEqual(session_status, 200)
         self.assertIsNone(json.loads(session_body)["user"])
-        login_status, _, login_body = self.request("GET", "/login?account_deleted=1")
+        login_status, _, login_body = self.request(
+            "GET", "/login?account_deleted=1&provider_revocation=pending"
+        )
         self.assertEqual(login_status, 200)
-        self.assertIn("계정과 네이버 연결 정보가 삭제되었습니다", login_body.decode("utf-8"))
+        self.assertIn("네이버 연결 철회를 처리 중", login_body.decode("utf-8"))
+
+    def test_account_action_token_is_short_lived_one_time_and_rejects_legacy_token(self) -> None:
+        account = self.app.service.upsert_oauth_account(
+            "naver", "one-time-action-user", "1회 토큰 테스터"
+        )
+        user_id = int(account["user"]["id"])
+        session = self.app.issue_session(user_id)
+        action_token = self.app.issue_account_action_token(user_id, session)
+
+        with self.app.database.session() as conn:
+            stored = conn.execute(
+                "SELECT created_at, expires_at, used_at FROM action_tokens"
+            ).fetchone()
+        self.assertIsNotNone(stored)
+        self.assertIsNone(stored["used_at"])
+        lifetime = (
+            datetime.fromisoformat(str(stored["expires_at"]))
+            - datetime.fromisoformat(str(stored["created_at"]))
+        ).total_seconds()
+        self.assertGreater(lifetime, 0)
+        self.assertLessEqual(lifetime, 301)
+        other_session = self.app.issue_session(user_id)
+        self.assertFalse(
+            self.app.service.consume_one_time_action_token(
+                user_id, other_session, ACCOUNT_DELETE_ACTION, action_token
+            )
+        )
+        self.assertTrue(
+            self.app.service.consume_one_time_action_token(
+                user_id, session, ACCOUNT_DELETE_ACTION, action_token
+            )
+        )
+        self.assertFalse(
+            self.app.service.consume_one_time_action_token(
+                user_id, session, ACCOUNT_DELETE_ACTION, action_token
+            )
+        )
+        legacy_token = self.app.session_codec.issue_action_token(
+            session,
+            ACCOUNT_DELETE_ACTION,
+        )
+        self.assertFalse(
+            self.app.service.consume_one_time_action_token(
+                user_id, session, ACCOUNT_DELETE_ACTION, legacy_token
+            )
+        )
+
+    def test_account_delete_forces_naver_reauthentication_even_with_stale_session(self) -> None:
+        account = self.app.service.upsert_oauth_account(
+            "naver", "stale-delete-user", "재로그인 테스터"
+        )
+        user_id = int(account["user"]["id"])
+        session = self.app.issue_session(user_id)
+        action_token = self.app.issue_account_action_token(user_id, session)
+        with self.app.database.session() as conn:
+            conn.execute(
+                "UPDATE auth_sessions SET authenticated_at = ? WHERE user_id = ?",
+                ("2000-01-01T00:00:00+00:00", user_id),
+            )
+
+        status, headers, _ = self.request(
+            "POST",
+            "/account/delete",
+            headers=self.session_headers(
+                session,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+            body=urlencode(
+                {"action_token": action_token, "confirmation": "계정 삭제"}
+            ).encode("utf-8"),
+        )
+        self.assertEqual(status, 302)
+        self.assertIn("auth_type=reauthenticate", headers["Location"])
+        self.assertIsNotNone(self.app.service.get_active_user(user_id))
+        self.assertIsNotNone(self.app.session_user(session))
+
+    def test_cancelled_delete_reauthentication_keeps_account_and_session_active(self) -> None:
+        account = self.app.service.upsert_oauth_account(
+            "naver", "cancel-delete-user", "취소 사용자"
+        )
+        user_id = int(account["user"]["id"])
+        session = self.app.issue_session(user_id)
+        action_token = self.app.issue_account_action_token(user_id, session)
+
+        start_status, start_headers, _ = self.request(
+            "POST",
+            "/account/delete",
+            headers=self.session_headers(
+                session,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            ),
+            body=urlencode(
+                {"action_token": action_token, "confirmation": "계정 삭제"}
+            ).encode("utf-8"),
+        )
+        self.assertEqual(start_status, 302)
+        oauth_cookies = self.response_cookies(start_headers)
+        state = oauth_cookies[OAUTH_STATE_COOKIE]
+
+        callback_status, callback_headers, _ = self.request(
+            "GET",
+            f"/auth/callback/naver?error=access_denied&state={state}",
+            headers={"Cookie": self.cookie_header(oauth_cookies)},
+        )
+        self.assertEqual(callback_status, 303)
+        self.assertEqual(callback_headers["Location"], "/login?error=cancelled")
+        self.assertIsNotNone(self.app.service.get_active_user(user_id))
+        self.assertIsNotNone(self.app.session_user(session))
+        self.assertEqual(self.app.service.oauth_lifecycle_jobs()["counts"]["total"], 0)
+
+    def test_account_delete_attempts_are_rate_limited(self) -> None:
+        account = self.app.service.upsert_oauth_account(
+            "naver", "delete-rate-user", "삭제 제한 테스터"
+        )
+        user_id = int(account["user"]["id"])
+        session = self.app.issue_session(user_id)
+        headers = self.session_headers(
+            session,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        body = urlencode(
+            {"action_token": "invalid", "confirmation": "계정 삭제"}
+        ).encode("utf-8")
+
+        for _ in range(5):
+            status, _, _ = self.request("POST", "/account/delete", headers=headers, body=body)
+            self.assertEqual(status, 403)
+        limited_status, _, _ = self.request(
+            "POST", "/account/delete", headers=headers, body=body
+        )
+        self.assertEqual(limited_status, 429)
+        self.assertIsNotNone(self.app.service.get_active_user(user_id))
+
+    def test_mypage_escapes_user_controlled_display_name_and_review_body(self) -> None:
+        self.app.run_daily()
+        account = self.app.service.upsert_oauth_account(
+            "naver",
+            "mypage-xss-user",
+            '<img src=x onerror="alert(1)">',
+        )
+        user_id = int(account["user"]["id"])
+        restaurant_id = int(self.app.service.list_map_restaurants()[0]["id"])
+        self.app.service.add_review(
+            restaurant_id,
+            5,
+            '<script>alert("stored")</script> 안전한 리뷰',
+            "표시 이름",
+            RequestContext(user_id=user_id, ip="203.0.113.144"),
+        )
+        session = self.app.issue_session(user_id)
+
+        status, _, body = self.request(
+            "GET",
+            "/mypage",
+            headers={"Cookie": f"{SESSION_COOKIE}={session}"},
+        )
+        page = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertNotIn('<img src=x onerror="alert(1)">', page)
+        self.assertNotIn('<script>alert("stored")</script>', page)
+        self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", page)
+        self.assertIn("&lt;script&gt;alert(&quot;stored&quot;)&lt;/script&gt;", page)
 
 
 if __name__ == "__main__":

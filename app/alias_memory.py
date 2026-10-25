@@ -8,9 +8,14 @@ from .agents import (
     VerificationDecision,
     alias_keys_for_place,
     candidate_address_similarity,
+    clean_place_name_for_matching,
     is_verifiable_place_name,
     name_similarity_with_branch,
 )
+
+
+# 여러 음식 브랜드를 운영하는 법인명은 주소가 없으면 학습 별칭만으로 점포를 특정할 수 없습니다.
+ADDRESS_REQUIRED_LEGAL_NAMES = {"비안에프엔비", "이에이치엠에스"}
 
 
 def remember_aliases(
@@ -41,6 +46,11 @@ def remember_aliases(
 
 
 def alias_memory_decision(conn: Any, row) -> VerificationDecision | None:
+    legal_name = normalize_text(
+        clean_place_name_for_matching(row.place_name or row.normalized_place_name)
+    ).replace(" ", "")
+    if not row.normalized_address and legal_name in ADDRESS_REQUIRED_LEGAL_NAMES:
+        return None
     aliases = alias_keys_for_place(row.normalized_place_name) + alias_keys_for_place(row.place_name)
     for value in [row.normalized_place_name, row.place_name]:
         normalized = normalize_text(value)

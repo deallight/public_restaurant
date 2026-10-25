@@ -14,11 +14,25 @@ from app.agents import (
     VerifierAgent,
     alias_keys_for_place,
     expense_scope_reject_decision,
+    franchise_brand,
+    has_conflicting_branch_hint,
+    has_franchise_branch_hint,
+    has_multiple_distinct_place_names,
+    manual_feedback_reject_decision,
+    name_similarity_with_branch,
     non_food_purpose_reason,
     parse_place_name,
+    prefer_unique_busan_candidate,
 )
 from app.config import Settings
-from app.integrations import DataGoKrPermitClient, _category_from_naver, _place_rank, _search_queries
+from app.alias_memory import alias_memory_decision
+from app.integrations import (
+    DataGoKrPermitClient,
+    _category_from_naver,
+    _place_query_variants,
+    _place_rank,
+    _search_queries,
+)
 from app.pipeline import (
     CachedPermitClient,
     CollectionTarget,
@@ -486,12 +500,61 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(all(row.amount == 0 for row in split_rows))
         self.assertTrue(all(row.source_amount == 100000 for row in split_rows))
 
+    def test_split_place_names_handles_multiline_expense_cells(self) -> None:
+        raw_row = RawExpenseRow(
+            row_number=1,
+            department_name="관광마이스산업과",
+            used_date="2026-03-03",
+            place_name=(
+                "유가네닭갈비 하단역점\n"
+                "북창동순두부 부산서면점\n"
+                "스시리\n"
+                "나정순할매쭈꾸미볶음"
+            ),
+            address="",
+            purpose="현장 실사 관련 간담회",
+            amount=201900,
+        )
+
+        split_rows = split_raw_expense_row_places(raw_row)
+
+        self.assertEqual(
+            [row.place_name for row in split_rows],
+            [
+                "유가네닭갈비 하단역점",
+                "북창동순두부 부산서면점",
+                "스시리",
+                "나정순할매쭈꾸미볶음",
+            ],
+        )
+        self.assertTrue(all(row.amount == 0 for row in split_rows))
+        self.assertTrue(all(row.source_amount == 201900 for row in split_rows))
+        self.assertTrue(has_multiple_distinct_place_names(raw_row.place_name))
+        self.assertTrue(
+            {
+                "유가네닭갈비 하단역점",
+                "북창동순두부 부산서면점",
+                "스시리",
+                "나정순할매쭈꾸미볶음",
+            }.issubset(set(_place_query_variants(raw_row.place_name)))
+        )
+        self.assertNotIn(
+            "유가네닭갈비 하단역점 북창동순두부 부산서면점 스시리 나정순할매쭈꾸미볶음",
+            _place_query_variants(raw_row.place_name),
+        )
+        self.assertEqual(_place_query_variants("6692(육육구이)")[0], "육육구이")
+
     def test_parse_removes_only_trailing_companion_suffixes(self) -> None:
         cases = {
             "해운대식당 등": "해운대식당",
             "해운대식당등": "해운대식당",
             "해운대식당 외 1": "해운대식당",
             "해운대식당외1개소": "해운대식당",
+            "해운대식당 외 1건": "해운대식당",
+            "해운대식당 외1인": "해운대식당",
+            "해운대식당 등 2개소": "해운대식당",
+            "뚜레쥬르(외1)": "뚜레쥬르",
+            "놀유니버스티켓(문화비외1)": "놀유니버스티켓",
             "해운대식당 외 2곳 등": "해운대식당",
             "등촌샤브칼국수": "등촌샤브칼국수",
             "해운대등대횟집": "해운대등대횟집",
@@ -500,6 +563,499 @@ class PipelineTests(unittest.TestCase):
         for original, expected in cases.items():
             with self.subTest(original=original):
                 self.assertEqual(clean_parsed_place_name(original), expected)
+
+    def test_baskin_robbins_spelling_variants_share_franchise_rule(self) -> None:
+        self.assertEqual(franchise_brand("스탁벅스"), "starbucks")
+        self.assertEqual(franchise_brand("배스킨라빈스 부산시청점"), "baskin_robbins")
+        self.assertEqual(franchise_brand("베스킨라빈스"), "baskin_robbins")
+        self.assertEqual(franchise_brand("명랑핫도그"), "myungrang_hotdog")
+        self.assertEqual(franchise_brand("김종구식맛치킨"), "kim_jonggu_chicken")
+        self.assertEqual(franchise_brand("모모스커피"), "momos_coffee")
+        self.assertEqual(franchise_brand("외식1번가 서부산점"), "dining_first")
+        self.assertEqual(franchise_brand("양산도"), "yangsando")
+        self.assertEqual(franchise_brand("히얼이즈커피"), "here_is_coffee")
+        self.assertEqual(franchise_brand("히스피(HUSFFEE)장림점"), "husffee")
+        self.assertEqual(franchise_brand("히스피커피&디저트 장림점"), "husffee")
+        self.assertEqual(franchise_brand("오발탄 부산해운대점"), "obaltan")
+        self.assertEqual(franchise_brand("㈜오발탄에프에스"), "obaltan")
+        self.assertEqual(franchise_brand("오막집"), "omakjip")
+        self.assertEqual(franchise_brand("제주옥탑"), "jeju_rooftop")
+        self.assertEqual(franchise_brand("삿뽀로"), "sapporo")
+        self.assertEqual(franchise_brand("블루샥"), "blueshaak")
+        self.assertEqual(franchise_brand("맛찬들왕소금구이"), "matchandeul")
+        self.assertEqual(franchise_brand("버거킹"), "burger_king")
+        self.assertEqual(franchise_brand("㈜부산어묵고래사"), "goraesa")
+        self.assertEqual(franchise_brand("아웃백스테이크하우스"), "outback")
+        self.assertEqual(franchise_brand("옵스"), "ops_bakery")
+        self.assertEqual(franchise_brand("교동면옥"), "gyodong_myeonok")
+        self.assertEqual(franchise_brand("도미노피자"), "dominos_pizza")
+        self.assertEqual(franchise_brand("크리스털제이드"), "crystal_jade")
+        self.assertEqual(
+            franchise_brand("크리스탈제이드 롯데백화점 부산본점"),
+            "crystal_jade",
+        )
+        self.assertEqual(franchise_brand("엔제리너스"), "angelinus")
+        self.assertEqual(franchise_brand("김가네김밥 부산시청점"), "kimgane")
+        self.assertEqual(franchise_brand("샐러디"), "salady")
+        self.assertEqual(franchise_brand("샤브20 부산광안리점"), "shabu_20")
+        self.assertEqual(franchise_brand("피자에땅"), "pizza_etang")
+        self.assertEqual(franchise_brand("고디바베이커리 커넥트현대점"), "godiva")
+        self.assertEqual(franchise_brand("더벤티"), "the_venti")
+        self.assertEqual(franchise_brand("청오디피케이㈜연산점"), "dominos_pizza")
+        self.assertEqual(franchise_brand("금수복국 해운대본점"), "geumsu_bokguk")
+        self.assertEqual(franchise_brand("수제국수 부산시청점"), "handmade_noodles")
+        self.assertEqual(franchise_brand("이재모피자"), "lee_jaemo_pizza")
+        self.assertEqual(franchise_brand("취원"), "chwiwon")
+        self.assertEqual(franchise_brand("루시앙 베이커리 부산시청점"), "lucien_bakery")
+        self.assertEqual(franchise_brand("루시앙"), "lucien_bakery")
+        self.assertEqual(franchise_brand("읍천리382"), "eupcheonri_382")
+        self.assertEqual(franchise_brand("장산다방 부산시청점"), "jangsan_dabang")
+        self.assertEqual(franchise_brand("부자회관 부산시청점"), "buja_hoegwan")
+        self.assertEqual(franchise_brand("가마치통닭"), "gamachi_chicken")
+        self.assertEqual(franchise_brand("뚜레쥬르"), "tous_les_jours")
+        self.assertEqual(franchise_brand("이흥용베이커리"), "lee_heung_yong_bakery")
+        self.assertEqual(franchise_brand("경복궁앤도시락"), "gyeongbokgung_dosirak")
+        self.assertEqual(franchise_brand("주식회사 더블유더파티 시청지점"), "the_party")
+        self.assertEqual(franchise_brand("하이오 커피"), "hio_coffee")
+        self.assertEqual(franchise_brand("비비큐 부산아델라호텔점"), "bbq_chicken")
+        self.assertEqual(franchise_brand("BBQ치킨 부산중앙점"), "bbq_chicken")
+        self.assertEqual(franchise_brand("백년불고기물갈비"), "baeknyeon_bulgogi")
+        self.assertEqual(franchise_brand("샤브마니아만덕점"), "shabu_mania")
+        self.assertEqual(franchise_brand("처갓집양념치킨"), "cheogatjip_chicken")
+        self.assertEqual(franchise_brand("동키치킨"), "donkey_chicken")
+        self.assertEqual(franchise_brand("이화수육개장"), "ihwasu_yukgaejang")
+        self.assertEqual(franchise_brand("현풍닭칼국수"), "hyeonpung_chicken_noodles")
+        self.assertEqual(franchise_brand("커피베이"), "coffee_bay")
+        self.assertEqual(franchise_brand("이우철삼계탕"), "lee_woocheol_samgyetang")
+        self.assertEqual(franchise_brand("월남면반"), "wolnam_myeonban")
+        self.assertEqual(franchise_brand("삼동소바"), "samdong_soba")
+        self.assertEqual(franchise_brand("베지나랑 광안점"), "vegenarang")
+        self.assertEqual(franchise_brand("와플대학"), "waffle_university")
+        self.assertEqual(franchise_brand("프레드피자"), "fred_pizza")
+        self.assertEqual(franchise_brand("떡보의하루"), "tteokbo_haru")
+        self.assertEqual(franchise_brand("명지첫집 오션시티점"), "myeongji_cheotjip")
+        self.assertEqual(franchise_brand("블루보틀커피코리아 유한회사"), "blue_bottle")
+        self.assertFalse(has_franchise_branch_hint("블루샥 커피"))
+        self.assertEqual(franchise_brand("솔솥"), "solsot")
+
+    def test_naver_hanjeongsik_category_is_food(self) -> None:
+        self.assertEqual(_category_from_naver("한정식"), "restaurant")
+        self.assertEqual(_category_from_naver("아이스크림"), "cafe")
+        self.assertEqual(_category_from_naver("곱창,막창,양"), "restaurant")
+        self.assertEqual(_category_from_naver("떡,한과"), "cafe")
+        self.assertEqual(_category_from_naver("족발,보쌈"), "restaurant")
+        self.assertEqual(_category_from_naver("덮밥"), "restaurant")
+        self.assertEqual(_category_from_naver("김밥"), "restaurant")
+        self.assertEqual(_category_from_naver("스파게티,파스타전문"), "restaurant")
+        self.assertEqual(_category_from_naver("이자카야"), "bar")
+        self.assertEqual(_category_from_naver("쌈밥"), "restaurant")
+
+    def test_compact_franchise_branch_search_uses_readable_spacing(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="폴바셋연산점",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="폴바셋연산점",
+            normalized_address="",
+        )
+
+        self.assertEqual(_search_queries(row)[:6], [
+            "폴 바셋 연산점",
+            "폴 바셋 연산점 부산",
+            "폴 바셋 부산 연산역점",
+            "폴 바셋 부산 연산역점 부산",
+            "폴 바셋",
+            "폴 바셋 부산",
+        ])
+        self.assertIn("폴바셋연산점", _search_queries(row))
+
+    def test_franchise_station_wording_is_the_same_branch(self) -> None:
+        self.assertFalse(has_conflicting_branch_hint(
+            "폴바셋연산점",
+            "폴 바셋 부산 연산역점",
+        ))
+        self.assertGreaterEqual(
+            name_similarity_with_branch("폴바셋연산점", "폴 바셋 부산 연산역점"),
+            0.96,
+        )
+        self.assertFalse(has_conflicting_branch_hint(
+            "히스피(HUSFFEE)장림점",
+            "히스피커피&디저트 장림점",
+        ))
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "히스피(HUSFFEE)장림점",
+                "히스피커피&디저트 장림점",
+            ),
+            0.96,
+        )
+        self.assertFalse(has_conflicting_branch_hint(
+            "부산토곡 파리바게트",
+            "파리바게뜨 부산토곡점",
+        ))
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "부산토곡 파리바게트",
+                "파리바게뜨 부산토곡점",
+            ),
+            0.96,
+        )
+
+    def test_repeated_suffix_merchant_uses_learned_short_name(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="제일옥곰탕",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="제일옥곰탕",
+            normalized_address="",
+        )
+
+        self.assertIn("제일옥", _search_queries(row))
+
+    def test_renamed_gwangbok_branch_uses_current_naver_name(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="이재모피자광복점",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="이재모피자광복점",
+            normalized_address="",
+        )
+
+        self.assertIn("이재모피자 광복", _search_queries(row))
+
+        self.assertFalse(has_conflicting_branch_hint(
+            "이재모피자광복점",
+            "이재모피자 본점 2",
+        ))
+        self.assertGreaterEqual(
+            name_similarity_with_branch("이재모피자광복점", "이재모피자 본점 2"),
+            0.96,
+        )
+        self.assertFalse(has_conflicting_branch_hint(
+            "장덕풍천산삼민물장어",
+            "장덕풍천장어 광안본점",
+        ))
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "장덕풍천산삼민물장어",
+                "장덕풍천장어 광안본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("웰빙선생오리", "웰빙선유황생오리"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("더83비프", "83비프 동래본점"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "고고365대게좋은날",
+                "외식365 대게좋은날 부산본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "피아크 카페앤베이커리",
+                "피아크 카페&베이커리",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "솥솥 해운대점",
+                "솔솥 해운대 해리단길점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "금수복국 센텀벡스코점",
+                "금수복국 센텀점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "샤브마니아만덕점",
+                "샤브마니아 부산만덕점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "베지나랑 광안점",
+                "베지나랑 광안리점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "명지첫집 오션시티점",
+                "명지첫집 오션시티직영점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "모모스커피 온천장점",
+                "모모스커피 본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "로터리집",
+                "로타리집",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "연제 제일식당",
+                "연제제일식당닭한마리",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "식당3선 덕척점",
+                "식당3선 덕천점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "심길선 총송양곱창",
+                "심길선청송양곱창",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "백만김밥도시락",
+                "백만김밥 부산본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "303화덕온천",
+                "303화덕 동래온천장본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "고더커피 부산대학교병원점",
+                "고더커피 부산대학병원점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "세일기업(주) 수안커피컴퍼니",
+                "수안커피컴퍼니 커피하우스",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "명지 일삼육고기집",
+                "일삼육고기집 명지본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("다은나루", "다온나루"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("다은나루 외 1", "다온나루"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("만호갈미조개", "만호갈미샤브샤브"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "주차장산꼼장어3호점",
+                "주차장산꼼장어 본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("진상주물럭", "진상 W스퀘어점"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch("투쉐프", "2Chef 중앙동 본점"),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "오현프로젝트 강경불고기 센텀시티점",
+                "고담현불고기 해운대센텀시티 본점",
+            ),
+            0.96,
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "강경불고기 해운대센텀시티점",
+                "고담현불고기 해운대센텀시티 본점",
+            ),
+            0.96,
+        )
+
+    def test_connect_hyundai_godiva_uses_current_naver_name(self) -> None:
+        self.assertIn(
+            "고디바베이커리 커넥트현대점",
+            _place_query_variants("커넥트현대 부산점 고디바베이커리"),
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "커넥트현대 부산점 고디바베이커리",
+                "고디바베이커리 커넥트현대점",
+            ),
+            0.96,
+        )
+
+    def test_seomyeon_rinseon_dining_uses_current_naver_name(self) -> None:
+        self.assertIn(
+            "린선다이닝 서면본점",
+            _place_query_variants("서면린선다이닝"),
+        )
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "서면린선다이닝",
+                "린선다이닝 서면본점",
+            ),
+            0.96,
+        )
+
+    def test_geographic_place_name_uses_restaurant_query_fallback(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="가시리",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="가시리",
+            normalized_address="",
+        )
+
+        self.assertIn("가시리 식당", _search_queries(row))
+
+    def test_repeated_prefix_merchant_uses_learned_short_name(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="명품용수떡집",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="명품용수떡집",
+            normalized_address="",
+        )
+
+        self.assertIn("용수떡집", _search_queries(row))
+
+    def test_branch_word_alone_is_not_used_as_a_search_query(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="지엔지 시청점",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="지엔지 시청점",
+            normalized_address="",
+        )
+
+        self.assertNotIn("시청점", _search_queries(row))
+
+    def test_parenthetical_brand_ampersand_is_not_split_as_multiple_places(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="",
+            used_date="2026-01-01",
+            place_name="지엔지(G&G)시청점",
+            address="",
+            purpose="간담회",
+            amount=10000,
+            normalized_place_name="지엔지(G&G)시청점",
+            normalized_address="",
+        )
+
+        self.assertFalse(has_multiple_distinct_place_names(row.place_name))
+        self.assertNotIn("지엔지(G", _search_queries(row))
+        self.assertNotIn("G)시청점", _search_queries(row))
+
+    def test_venue_label_and_current_store_name_are_equivalent(self) -> None:
+        self.assertGreaterEqual(
+            name_similarity_with_branch(
+                "㈜보리에 더베이101",
+                "보리에 베이커리 앤 델리",
+            ),
+            0.96,
+        )
+
+    def test_unique_busan_match_is_preferred_among_multiple_regions(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-05",
+            place_name="온천정",
+            address="",
+            purpose="업무협의 오찬",
+            amount=70000,
+            normalized_place_name="온천정",
+            normalized_address="",
+        )
+        candidates = [
+            PlaceCandidate(
+                provider_place_id="seoul-1",
+                name="온천정",
+                category="restaurant",
+                address="서울특별시 종로구 종로 1",
+                road_address="서울특별시 종로구 종로 1",
+                longitude=126.978,
+                latitude=37.566,
+            ),
+            PlaceCandidate(
+                provider_place_id="busan-1",
+                name="온천정",
+                category="restaurant",
+                address="부산광역시 동래구 온천장로 1",
+                road_address="부산광역시 동래구 온천장로 1",
+                longitude=129.081,
+                latitude=35.221,
+            ),
+        ]
+
+        selected = prefer_unique_busan_candidate(row, candidates)
+
+        self.assertEqual([candidate.provider_place_id for candidate in selected], ["busan-1"])
 
     def test_collection_plan_skips_previously_collected_documents(self) -> None:
         adapter = PlanningAdapter()
@@ -1647,7 +2203,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsNone(decision)
 
-    def test_branch_hint_with_unspecified_companion_stays_manual(self) -> None:
+    def test_branch_hint_with_unspecified_companion_auto_rejects(self) -> None:
         verifier = VerifierAgent(BranchNaverClient(), BranchPermitClient())
 
         decision = verifier.verify(
@@ -1664,11 +2220,11 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
-        self.assertEqual(len(decision.evidence["candidate_evidence"]), 1)
+        self.assertEqual(decision.evidence["candidate_evidence"], [])
 
-    def test_addressless_strong_naver_branch_with_companion_stays_manual(self) -> None:
+    def test_addressless_strong_naver_branch_with_companion_auto_rejects(self) -> None:
         verifier = VerifierAgent(BranchNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1685,7 +2241,7 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
 
     def test_short_exact_addressless_food_name_ignores_conflicting_active_permit(self) -> None:
@@ -1863,7 +2419,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decision.decision, "needs_review")
         self.assertEqual(decision.reason_codes, ["NAVER_OTHER_AMBIGUOUS_VENUE"])
 
-    def test_brand_and_companion_suffix_stays_manual_without_companion_identity(self) -> None:
+    def test_brand_and_companion_suffix_auto_rejects_without_companion_identity(self) -> None:
         verifier = VerifierAgent(EdiyaNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1880,10 +2436,10 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
 
-    def test_short_base_name_with_branch_suffix_can_auto_approve_addressless_candidate(self) -> None:
+    def test_addressless_franchise_without_branch_is_rejected_even_with_one_candidate(self) -> None:
         verifier = VerifierAgent(BaseSuffixNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -1900,8 +2456,8 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "approved")
-        self.assertIn("NAVER_BASE_NAME_ADDRESSLESS", decision.reason_codes)
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
 
     def test_addressless_fuzzy_food_name_can_auto_approve_without_permit(self) -> None:
         verifier = VerifierAgent(YeyijeNaverClient(), EmptyPermitClient())
@@ -2136,7 +2692,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(decision.decision, "needs_review")
         self.assertEqual(decision.reason_codes, ["PERMIT_NOT_ACTIVE_ADDRESSLESS"])
 
-    def test_famous_franchise_addressless_without_branch_stays_selectable(self) -> None:
+    def test_famous_franchise_addressless_with_companion_auto_rejects(self) -> None:
         verifier = VerifierAgent(StarbucksNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -2153,13 +2709,13 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["UNSPECIFIED_COMPANION_PLACES"])
         self.assertEqual(decision.category, "cafe")
-        self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
-        self.assertEqual(len(decision.evidence["candidate_evidence"]), 1)
+        self.assertIsNone(decision.selected_candidate)
+        self.assertEqual(decision.evidence["candidate_evidence"], [])
 
-    def test_vips_addressless_without_branch_without_result_stays_manual(self) -> None:
+    def test_vips_addressless_without_branch_without_result_auto_rejects(self) -> None:
         verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -2176,7 +2732,7 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
+        self.assertEqual(decision.decision, "rejected")
         self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
         self.assertEqual(decision.category, "restaurant")
         self.assertIsNone(decision.selected_candidate)
@@ -2223,7 +2779,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("NAVER_FRANCHISE_ADDRESS_MATCH", decision.reason_codes)
         self.assertEqual(decision.selected_candidate.name, "스타벅스 경성대점")
 
-    def test_legal_entity_without_search_result_stays_manual_review(self) -> None:
+    def test_learned_legal_entity_without_search_result_is_rejected(self) -> None:
         verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
 
         decision = verifier.verify(
@@ -2240,28 +2796,74 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(decision.decision, "needs_review")
-        self.assertEqual(decision.reason_codes, ["AI_NO_MAP_CANDIDATE"])
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_ADDRESSLESS_NO_MAP_MATCH"])
 
     def test_payment_processor_place_name_auto_rejects_before_api(self) -> None:
         verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
 
-        decision = verifier.verify(
-            NormalizedExpenseRow(
-                row_number=1,
-                department_name="총무과",
-                used_date="2026-06-05",
-                place_name="부산동백전_KICC_C외 3",
-                address="",
-                purpose="행사 관계자 간담회",
-                amount=45000,
-                normalized_place_name="부산동백전_KICC_C외 3",
-                normalized_address="",
-            )
-        )
+        for place_name in (
+            "부산동백전_KICC_C외 3",
+            "네이버파이낸셜",
+            "다날",
+            "에스에스지페이먼츠",
+            "에스에스지페이",
+            "한국결제_B",
+            "이니시스",
+            "(주)플래티넘페이먼츠",
+            "헥토파이낸셜_이지피쥐",
+            "KCP",
+            "BC카드(부산근현대역사관)",
+        ):
+            with self.subTest(place_name=place_name):
+                decision = verifier.verify(
+                    NormalizedExpenseRow(
+                        row_number=1,
+                        department_name="총무과",
+                        used_date="2026-06-05",
+                        place_name=place_name,
+                        address="",
+                        purpose="행사 관계자 간담회",
+                        amount=45000,
+                        normalized_place_name=place_name,
+                        normalized_address="",
+                    )
+                )
 
-        self.assertEqual(decision.decision, "rejected")
-        self.assertEqual(decision.reason_codes, ["PAYMENT_PROCESSOR_OR_CARD_PLACE_NAME"])
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(decision.reason_codes, ["PAYMENT_PROCESSOR_OR_CARD_PLACE_NAME"])
+
+    def test_anonymized_place_name_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        for place_name in (
+            "김OO",
+            "황OO",
+            "김*우",
+            "ㅇㅇ장례식장",
+            "ㅇㅇ결혼식장",
+            "00장례식장",
+            "00결혼식장",
+            "00웨딩홀",
+            "OO결혼식장",
+        ):
+            with self.subTest(place_name=place_name):
+                decision = verifier.verify(
+                    NormalizedExpenseRow(
+                        row_number=1,
+                        department_name="총무과",
+                        used_date="2026-06-05",
+                        place_name=place_name,
+                        address="",
+                        purpose="간담회",
+                        amount=45000,
+                        normalized_place_name=place_name,
+                        normalized_address="",
+                    )
+                )
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(decision.reason_codes, ["ANONYMIZED_PLACE_NAME"])
 
     def test_manual_feedback_closed_place_auto_rejects_before_api(self) -> None:
         verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
@@ -2286,7 +2888,12 @@ class PipelineTests(unittest.TestCase):
     def test_manual_feedback_non_restaurant_organization_auto_rejects_before_api(self) -> None:
         verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
 
-        for place_name in ("연제지역자활센터", "연제지역자할센터"):
+        for place_name in (
+            "연제지역자활센터",
+            "연제지역자할센터",
+            "부산수영지역자활센터",
+            "주식회사 큐매니지먼트",
+        ):
             with self.subTest(place_name=place_name):
                 decision = verifier.verify(
                     NormalizedExpenseRow(
@@ -2307,6 +2914,212 @@ class PipelineTests(unittest.TestCase):
                     decision.reason_codes,
                     ["MANUAL_FEEDBACK_NON_RESTAURANT_ORGANIZATION"],
                 )
+
+    def test_repeated_unlisted_airport_store_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+        place_name = "풀무원푸드앤컬처 김해공항 말똥도넛"
+
+        decision = verifier.verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-26",
+                place_name=place_name,
+                address="",
+                purpose="회의 다과 구입",
+                amount=30000,
+                normalized_place_name=place_name,
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["MANUAL_FEEDBACK_ADDRESSLESS_NO_MAP_MATCH"])
+
+    def test_manual_feedback_non_restaurant_retail_auto_rejects_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        for place_name in ("다드림마트", "(주)메가마트덕천점"):
+            with self.subTest(place_name=place_name):
+                decision = verifier.verify(
+                    NormalizedExpenseRow(
+                        row_number=1,
+                        department_name="총무과",
+                        used_date="2026-06-26",
+                        place_name=place_name,
+                        address="",
+                        purpose="간담회",
+                        amount=50000,
+                        normalized_place_name=place_name,
+                        normalized_address="",
+                    )
+                )
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(
+                    decision.reason_codes,
+                    ["MANUAL_FEEDBACK_NON_RESTAURANT_RETAIL"],
+                )
+
+    def test_repeated_addressless_manual_rejections_apply_before_api(self) -> None:
+        verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
+
+        for place_name in (
+            "풍미",
+            "픙미",
+            "지앤지 시청점",
+            "지엔지 시청점",
+            "비스트로",
+            "미락",
+            "삼봉맥주",
+            "바로테이스티",
+            "북경",
+            "토종먹거리",
+            "한화커넥트",
+            "한화케넥트㈜",
+            "화담",
+            "영남식육식당",
+            "토곡식육식당",
+            "반상",
+            "명소",
+            "온정",
+            "이도식당",
+            "수정궁",
+            "고래",
+            "한화호텔앤드리조트",
+            "이랜드파크 켄싱턴호텔 여의도",
+            "에이치엘비",
+            "댄싱컵 부산시청점",
+            "(주)신세계프라퍼티 코엑스몰",
+            "비원 옛 해운대",
+            "삼환축산 해운대직영점",
+            "승승집 양정점",
+            "홍미당 광안리점",
+            "유가네한우곰탕 명지점",
+            "원조지구촌암소숯불생고기",
+            "자갈치옛날과자점",
+            "떡의궁전",
+            "풍어참가자미횟집",
+            "바다원횟집",
+            "㈜신화케이푸드",
+            "남지강변횟집",
+            "화지회관 식육식당",
+            "묘묘당",
+            "아키노히",
+            "구일비 시청점",
+            "몫몫",
+            "주식회사 월링워커스 몫몫",
+            "백마김씨네",
+            "울진후포리청솔물회",
+            "영광미소네집",
+            "박수 에프엔비",
+            "주식회사 갓솥비바에이",
+            "소잡은어부",
+            "고반식당",
+            "카페젤라떼리아",
+            "청춘횟집",
+            "주식회사 우리의맛남 정성순대",
+            "소제이연산점",
+            "풍문 2층",
+            "연화리해녀집장씨해녀집",
+            "정초밥 솔티라이엇",
+            "수제국수 부산시청점 블루샥 부산시청점",
+            "규가 카페에쯔",
+            "메이리 웁스",
+            "주식회사 탑월드후레쉬",
+            "주식회사 대상크리스탈시상품",
+            "라온그루홈",
+            "(주)라온사람들 서울안심정육",
+            "마키노차야 더가우",
+            "부용당 로우라이즈",
+            "주식회사 에프지케이",
+            "㈜아르프스튜디오",
+            "도프커피 서여의도점",
+            "모리 호수공원점",
+            "주식회사 디케이씨에스",
+            "카페드롭탑국제여객터미널",
+            "㈜조선호텔앤리조트 그래드조선",
+            "주식회사 아난티 오시리아 제1지점",
+            "마당쇠민속보쌈",
+            "130 팔선생",
+            "주식회사 별무리애프앤비",
+            "주식회사 뚜리삼",
+            "Albert Hejin 3138",
+            "BAVET ANTWERPEN",
+            "De Blaauwe Kamer Wageningen NL",
+            "RADISSON BLU OS OSLO",
+            "A377 NO OSL Olearys int AGardemoen",
+            "MITSUIFUDOUSANGURU-PUU Tokyo JPN",
+            "NURSET STEAKHOUSE SAND",
+            "TAVERNA DEL TEATRE",
+            "CANALCITYPOA",
+            "BLACK TAP",
+        ):
+            with self.subTest(place_name=place_name):
+                decision = verifier.verify(
+                    NormalizedExpenseRow(
+                        row_number=1,
+                        department_name="총무과",
+                        used_date="2026-06-26",
+                        place_name=place_name,
+                        address="",
+                        purpose="업무협의 간담회",
+                        amount=50000,
+                        normalized_place_name=place_name,
+                        normalized_address="",
+                    )
+                )
+
+                self.assertEqual(decision.decision, "rejected")
+                self.assertEqual(decision.evidence["manual_review_passes"], 3)
+
+    def test_reapproved_jeilok_is_not_blocked_by_old_manual_feedback(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-26",
+            place_name="제일옥곰탕",
+            address="",
+            purpose="업무협의 간담회",
+            amount=50000,
+            normalized_place_name="제일옥곰탕",
+            normalized_address="",
+        )
+
+        self.assertIsNone(manual_feedback_reject_decision(row))
+
+    def test_repeated_manual_name_with_address_is_not_overgeneralized(self) -> None:
+        row = NormalizedExpenseRow(
+            row_number=1,
+            department_name="총무과",
+            used_date="2026-06-26",
+            place_name="풍미",
+            address="부산광역시 연제구 중앙대로 1001",
+            purpose="업무협의 간담회",
+            amount=50000,
+            normalized_place_name="풍미",
+            normalized_address="부산광역시 연제구 중앙대로 1001",
+        )
+
+        self.assertIsNone(manual_feedback_reject_decision(row))
+
+    def test_tenpercent_addressless_without_branch_auto_rejects(self) -> None:
+        decision = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient()).verify(
+            NormalizedExpenseRow(
+                row_number=1,
+                department_name="총무과",
+                used_date="2026-06-26",
+                place_name="텐퍼센트",
+                address="",
+                purpose="회의 다과 구입",
+                amount=25000,
+                normalized_place_name="텐퍼센트",
+                normalized_address="",
+            )
+        )
+
+        self.assertEqual(decision.decision, "rejected")
+        self.assertEqual(decision.reason_codes, ["FRANCHISE_ADDRESSLESS_NO_BRANCH"])
 
     def test_unknown_place_address_mismatch_auto_rejects(self) -> None:
         verifier = VerifierAgent(UnknownMismatchNaverClient(), EmptyPermitClient())
@@ -2339,7 +3152,38 @@ class PipelineTests(unittest.TestCase):
         cases = [
             ("사무용품 구입", "업무협의", "PURCHASE_WORD_IN_PLACE_NAME"),
             ("쿠팡", "업무협의", "COUPANG_PLACE_NAME"),
+            ("11번가", "업무협의", "ONLINE_MARKETPLACE_PLACE_NAME"),
+            ("홈플러스㈜", "업무협의", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+            ("롯데마트 사상점", "내방객 차류 구입", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+            ("지에스25 뉴부산시청점", "다과류 구입", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+            ("빅 식자재마트", "업무협의", "NON_RESTAURANT_RETAIL_PLACE_NAME"),
+            ("인터넷상거래", "업무협의", "ONLINE_COMMERCE_PLACE_NAME"),
+            ("CJ CGV_예매(문화비)_오프라인 제휴", "업무협의", "NON_RESTAURANT_CULTURE_EXPENSE"),
+            ("놀유니버스티켓(문화비외1)", "업무협의", "NON_RESTAURANT_CULTURE_EXPENSE"),
+            ("동래소방서", "업무협의", "NON_RESTAURANT_PUBLIC_FACILITY"),
+            ("덕산정수사업소", "업무협의", "NON_RESTAURANT_PUBLIC_FACILITY"),
+            ("라온그룹홈", "업무협의", "NON_RESTAURANT_SOCIAL_WELFARE_FACILITY"),
+            ("HDC현대산업개발㈜", "업무협의", "NON_RESTAURANT_CORPORATE_PLACE_NAME"),
+            ("덕산정수사업소 인근 식당", "업무협의", "NON_RESTAURANT_PUBLIC_FACILITY"),
+            ("관내 음식점", "업무협의", "GENERIC_LOCAL_RESTAURANT_PLACE_NAME"),
+            ("토곡로 7", "업무협의", "ADDRESS_ONLY_PLACE_NAME"),
+            ("고분로 13번길 43", "업무협의", "ADDRESS_ONLY_PLACE_NAME"),
+            ("연제구 월드컵대로145번길 19", "업무협의", "ADDRESS_ONLY_PLACE_NAME"),
+            ("6692", "업무협의", "NUMERIC_ONLY_PLACE_NAME"),
             ("부산식당", "직원 경조사 지원", "CEREMONIAL_EVENT_EXPENSE"),
+            ("김혜성", "경조금 지출", "CEREMONIAL_EVENT_EXPENSE"),
+            ("대한적십자사", "특별회비 납부", "NON_RESTAURANT_MEMBERSHIP_FEE"),
+            (
+                "RADISSON BLU OSLO SCANDIN",
+                "북극항로 선도도시 전략 마련을 위한 현지간담회",
+                "MANUAL_FEEDBACK_OUT_OF_REGION_VENUE",
+            ),
+            ("제용기", "행사 격려금 지급", "PERSONAL_RECIPIENT_PLACE_NAME"),
+            (
+                "제용기",
+                "중부소방서 러닝크루 동호회 활동비 지급 요청",
+                "PERSONAL_RECIPIENT_PLACE_NAME",
+            ),
         ]
 
         for place_name, purpose, expected_reason in cases:
@@ -2365,7 +3209,10 @@ class PipelineTests(unittest.TestCase):
         verifier = VerifierAgent(ExplodingNaverClient(), ExplodingPermitClient())
         cases = {
             "공무원매점": "NON_RESTAURANT_RETAIL_PLACE_NAME",
+            "킹할인마트": "NON_RESTAURANT_RETAIL_PLACE_NAME",
             "만객당, 히얼이즈커피": "MULTIPLE_PLACE_NAMES_UNSUPPORTED",
+            "샐러드와을숙도/창원식자재마트": "MULTIPLE_PLACE_NAMES_UNSUPPORTED",
+            "미를담다&미담삼계탕": "MULTIPLE_PLACE_NAMES_UNSUPPORTED",
         }
         for place_name, expected_reason in cases.items():
             with self.subTest(place_name=place_name):
@@ -2386,6 +3233,19 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(decision.decision, "rejected")
                 self.assertEqual(decision.reason_codes, [expected_reason])
 
+        duplicate_legal_name = NormalizedExpenseRow(
+            row_number=1,
+            department_name="공원도시과",
+            used_date="2026-05-12",
+            place_name="소소수산/주식회사소소수산",
+            address="",
+            purpose="간담회",
+            amount=100000,
+            normalized_place_name="소소수산/주식회사소소수산",
+            normalized_address="",
+        )
+        self.assertIsNone(expense_scope_reject_decision(duplicate_legal_name))
+
     def test_addressless_legal_entity_without_storefront_info_is_searched(self) -> None:
         verifier = VerifierAgent(EmptyNaverClient(), EmptyPermitClient())
 
@@ -2394,11 +3254,11 @@ class PipelineTests(unittest.TestCase):
                 row_number=1,
                 department_name="총무과",
                 used_date="2026-05-12",
-                place_name="주식회사 별무리애프앤비",
+                place_name="주식회사 예시푸드컴퍼니",
                 address="",
                 purpose="업무협의 간담회",
                 amount=100000,
-                normalized_place_name="주식회사 별무리애프앤비",
+                normalized_place_name="주식회사 예시푸드컴퍼니",
                 normalized_address="",
             )
         )
@@ -2497,6 +3357,68 @@ class PipelineTests(unittest.TestCase):
             "주식회사 이흥용과자점 칠암사계": "칠암사계",
             "벌교궁꼬막한정식외 1": "궁꼬막한정식",
             "연제지역자활센터, 카페가온비": "카페가온비",
+            "트레이더스 연산점 등 2개소": "트레이더스 연산점",
+            "(주)보리에 더베이101": "보리에",
+            "주식회사 더블유더파티 시청지점": "더파티 시청점",
+            "솥솥 해운대점": "솔솥 해운대 해리단길점",
+            "금수복국 센텀벡스코점": "금수복국 센텀점",
+            "CJ CGV_씨네드쉐프_오프라인": "씨네드쉐프",
+            "한국결제_B": "한국결제",
+            "베지나랑 광안점": "베지나랑",
+            "명지첫집 오션시티점": "명지첫집",
+            "모모스커피 온천장점": "모모스커피",
+            "이비가짬뽕(센텀2로29)": "이비가짬뽕 부산 해운대 센텀점",
+            "로터리집(민락동 소재)": "로타리집",
+            "청오디피케이㈜연산점": "도미노피자 연산점",
+            "㈜오발탄에프에스": "오발탄",
+            "연제 제일식당": "연제제일식당닭한마리",
+            "식당3선 덕척점": "식당3선 덕천점",
+            "심길선 총송양곱창": "청송양곱창",
+            "백만김밥도시락": "백만김밥",
+            "백만김밥 부산본점": "백만김밥",
+            "주식회사303화덕온천": "303화덕 동래점",
+            "주식회사 봉림 루시앙 부산시청점": "루시앙베이커리 부산시청점",
+            "고더커피 부산대학교병원점": "고더커피 부산대학병원점",
+            "엠즈씨드(주)폴바셋": "폴 바셋",
+            "세일기업(주) 수안커피컴퍼니": "수안커피컴퍼니 커피하우스",
+            "푸드웨이 목장원": "목장원",
+            "만수산돼지국밥II": "만수산돼지국밥",
+            "오현프로젝트 강경불고기 센텀시티점": "고담현불고기 해운대센텀시티 본점",
+            "우적해운대점": "우적 센텀점",
+            "장박사양곱창전문점": "장박사양곱창 센텀점",
+            "마파람 해물짐 해물탕 시청직영점": "마파람해물찜해물탕 시청직영점",
+            "문화의물결까사부사노부산근현대역사관점": "까사부사노 부산근현대역사관점",
+            "도너츠윤 부산서구점": "도너츠윤 부산점",
+            "명지일삼육고기": "일삼육고기집 명지본점",
+            "첸차이나 금곡점": "첸차이나",
+            "백구당외": "백구당",
+            "순사이쿠보": "슌사이쿠보 화명",
+            "풀무원푸드 한국공항공사부산지역본부": "풀무원푸드앤컬처 한국공항공사김해공항카페",
+            "메가엠지씨커피포레나점": "메가MGC커피 포레나점",
+            "장군성숯불갈비": "장군성",
+            "활스시": "스시활",
+            "후스 시청점": "후스",
+            "맛!이슈": "맛이슈 부산북구점",
+            "주식회사 글로벌양상국": "양상국 해운대점",
+            "나폴레옹베이커리 여의도 아이에프씨몰점": "나폴레옹제과점 IFC몰점",
+            "(주)학산 테라로사커피 세종지점": "테라로사 세종점",
+            "㈜빅바이트컴퍼니 잠바주스 서울역점": "잠바주스 서울역점",
+            "꿈앤카페지방자치회관점": "꿈엔카페 지방자치회관점",
+            "농업회사법인 (주)동백1917": "동백1917우리술양조장",
+            "주식회사 더젬코리아": "제이엠커피로스터스 부산 본점",
+            "언양불고기 부산집본": "언양불고기 부산집본가",
+            "뚜레쥬르 부산센텀대로점": "뚜레쥬르 부산센텀점",
+            "와카바 서부산유통단지점": "와카바 부산",
+            "푸드카페삐뽀랑냠냠": "삐뽀랑냠냠 부산",
+            "정동각": "정동각 여의도",
+            "천해로207호": "cafe천해로207",
+            "꽃가람한식당": "꽃가람 본점",
+            "더소울규니꾸": "규니꾸 우마카세",
+            "영진인삼어탕국수": "영진인삼추어탕",
+            "육관소양재역본점": "육즙관리소 양재역점",
+            "해씨라래": "해싸라래 커피로스터리",
+            "LATELIER MARRON": "아뜰리에마롱",
+            "우수미회센타별관": "덕승식당 제주 연동",
         }
         for place_name, expected in cases.items():
             with self.subTest(place_name=place_name):
@@ -2513,6 +3435,26 @@ class PipelineTests(unittest.TestCase):
                 )
 
                 self.assertIn(f"{expected} 부산", _search_queries(row))
+
+    def test_addressless_multibrand_legal_name_does_not_use_alias_memory(self) -> None:
+        class UnexpectedQuery:
+            def execute(self, *args, **kwargs):
+                raise AssertionError("addressless legal name must not query alias memory")
+
+        for place_name in ("(주)비안 에프엔비", "주식회사 이에이치엠에스"):
+            with self.subTest(place_name=place_name):
+                row = NormalizedExpenseRow(
+                    row_number=1,
+                    department_name="총무과",
+                    used_date="2026-06-05",
+                    place_name=place_name,
+                    address="",
+                    purpose="간담",
+                    amount=100000,
+                    normalized_place_name=normalize_text(place_name),
+                    normalized_address="",
+                )
+                self.assertIsNone(alias_memory_decision(UnexpectedQuery(), row))
 
     def test_naver_search_queries_prioritize_food_part_from_mixed_org_name(self) -> None:
         row = NormalizedExpenseRow(

@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 from app.config import Settings
 from app.http_server import (
     SESSION_COOKIE,
+    SESSION_CSRF_ACTION,
     PublicRestaurantApplication,
     _trusted_proxy_client_ip,
     make_handler,
@@ -44,6 +45,31 @@ class HttpServerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_invalid_numeric_path_is_400_and_unhandled_errors_hide_details(self) -> None:
+        with self.assertRaises(HTTPError) as invalid_error:
+            urlopen(f"{self.base_url}/api/restaurants/not-a-number", timeout=5)
+        invalid_body = invalid_error.exception.read()
+        invalid_error.exception.close()
+        self.assertEqual(invalid_error.exception.code, 400)
+        self.assertEqual(json.loads(invalid_body)["error"], "invalid request")
+
+        with self.assertLogs("app.http_server", level="ERROR") as captured_logs:
+            with patch.object(
+                self.app.service,
+                "list_map_restaurants",
+                side_effect=RuntimeError("sensitive database detail"),
+            ):
+                with self.assertRaises(HTTPError) as server_error:
+                    urlopen(f"{self.base_url}/api/map/restaurants", timeout=5)
+        error_body = server_error.exception.read()
+        server_error.exception.close()
+        payload = json.loads(error_body)
+        self.assertEqual(server_error.exception.code, 500)
+        self.assertEqual(payload["error"], "internal server error")
+        self.assertIn("request_id", payload)
+        self.assertNotIn("sensitive database detail", error_body.decode("utf-8"))
+        self.assertNotIn("sensitive database detail", "\n".join(captured_logs.output))
 
     def get_json(self, path: str, headers: dict[str, str] | None = None) -> dict:
         request_headers = {"Accept": "application/json"}
@@ -129,7 +155,13 @@ class HttpServerTests(unittest.TestCase):
                 (f"{role} test user", role),
             )
         token = self.app.issue_session(int(user.lastrowid))
-        return {"Cookie": f"{SESSION_COOKIE}={token}"}
+        return {
+            "Cookie": f"{SESSION_COOKIE}={token}",
+            "X-CSRF-Token": self.app.session_codec.issue_action_token(
+                token,
+                SESSION_CSRF_ACTION,
+            ),
+        }
 
     def get_text(self, path: str, headers: dict[str, str] | None = None) -> str:
         request = Request(f"{self.base_url}{path}", headers=headers or {})
@@ -285,6 +317,8 @@ class HttpServerTests(unittest.TestCase):
         self.assertIn('event.preventDefault()', mypage_js)
         self.assertIn('headers: { Accept: "application/json" }', mypage_js)
         self.assertIn("card.remove()", mypage_js)
+        self.assertNotIn("innerHTML", mypage_js)
+        self.assertIn("textContent", mypage_js)
         documents_admin = self.get_text("/admin/documents", admin_headers)
         self.assertIn("기관별 수집 문서", documents_admin)
         self.assertIn("document-board-list", documents_admin)
@@ -601,7 +635,32 @@ class HttpServerTests(unittest.TestCase):
             {"confirmation": "계정 삭제", "action_token": action_token},
             headers=admin_headers,
         )
-        self.assertEqual(deleted["result"], "deleted")
+        self.assertEqual(deleted["result"], "deletion_pending")
+        with self.app.database.session() as conn:
+            account = conn.execute(
+                "SELECT display_name, role, status FROM users WHERE id = ?",
+                (member_id,),
+            ).fetchone()
+            oauth_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM oauth_accounts WHERE user_id = ?",
+                (member_id,),
+            ).fetchone()["count"]
+        self.assertEqual(account["display_name"], "실제 가입 회원")
+        self.assertEqual(account["role"], "admin")
+        self.assertEqual(account["status"], "deletion_pending")
+        self.assertEqual(int(oauth_count), 1)
+        with self.assertRaises(HTTPError) as reactivate_error:
+            self.post_json(
+                f"/admin/accounts/{member_id}",
+                {"role": "admin", "status": "active", "action_token": action_token},
+                headers=admin_headers,
+            )
+        self.assertEqual(reactivate_error.exception.code, 409)
+        reactivate_error.exception.close()
+        local_delete = self.app.service.process_next_oauth_lifecycle_job(
+            "http-server-test-worker"
+        )
+        self.assertEqual(local_delete["status"], "awaiting_token")
         with self.app.database.session() as conn:
             account = conn.execute(
                 "SELECT display_name, role, status FROM users WHERE id = ?",
@@ -615,6 +674,16 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(account["role"], "user")
         self.assertEqual(account["status"], "deleted")
         self.assertEqual(int(oauth_count), 0)
+        lifecycle = self.get_json("/ops/oauth-lifecycle", admin_headers)
+        lifecycle_serialized = json.dumps(lifecycle, ensure_ascii=False)
+        self.assertEqual(lifecycle["jobs"][0]["status"], "awaiting_token")
+        self.assertNotIn("private-subject", lifecycle_serialized)
+        self.assertNotIn("token_ciphertext", lifecycle_serialized)
+        retried = self.post_json(
+            f"/ops/oauth-lifecycle/{lifecycle['jobs'][0]['job_id']}/retry",
+            headers=admin_headers,
+        )
+        self.assertEqual(retried["status"], "awaiting_token")
 
     def test_admin_routes_require_admin_role(self) -> None:
         admin_headers = self.session_headers("admin")
@@ -624,6 +693,7 @@ class HttpServerTests(unittest.TestCase):
         protected_paths = [
             "/admin",
             "/ops/sources",
+            "/ops/oauth-lifecycle",
             "/review",
             "/admin/photos",
             "/admin/accounts",
@@ -662,6 +732,7 @@ class HttpServerTests(unittest.TestCase):
             "/review/1/reject",
             "/admin/accounts/1/merge",
             "/admin/accounts/1/delete",
+            "/ops/oauth-lifecycle/1/retry",
         ]
         for path in protected_posts:
             for headers, expected_status in [({}, 401), (user_headers, 403)]:

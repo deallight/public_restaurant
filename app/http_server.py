@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import html
 import hmac
 import json
+import logging
 import mimetypes
+import re
 import secrets
+import traceback
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -26,6 +30,8 @@ from .integrations import (
     NaverLoginClient,
     NaverMapsGeocodingClient,
     NaverSearchLocalClient,
+    OAuthLoginResult,
+    OAuthProfile,
 )
 from .pipeline import (
     COLLECTION_SCAN_SAFETY_MAX_DOCUMENTS,
@@ -34,6 +40,7 @@ from .pipeline import (
     DailyPipeline,
 )
 from .operation_jobs import ACTIVE_JOB_STATUSES, OperationJobQueue
+from .oauth_security import OAuthTokenCipher, verify_naver_disconnect_payload
 from .progress import VerificationProgressStore
 from .services import AppError, RequestContext, RestaurantService
 from .utils import stable_hash
@@ -61,9 +68,22 @@ SESSION_COOKIE = "public_restaurant_session"
 OAUTH_STATE_COOKIE = "public_restaurant_oauth_state"
 OAUTH_RETURN_COOKIE = "public_restaurant_oauth_return"
 OAUTH_PROVIDER_COOKIE = "public_restaurant_oauth_provider"
+OAUTH_PURPOSE_COOKIE = "public_restaurant_oauth_purpose"
+OAUTH_INTENT_COOKIE = "public_restaurant_oauth_intent"
 OAUTH_COOKIE_MAX_AGE_SECONDS = 10 * 60
 ACCOUNT_DELETE_ACTION = "account-delete"
 ADMIN_ACCOUNT_UPDATE_ACTION = "admin-account-update"
+SESSION_CSRF_ACTION = "session-csrf"
+ACCOUNT_ACTION_TOKEN_MAX_AGE_SECONDS = 5 * 60
+RECENT_AUTH_MAX_AGE_SECONDS = 5 * 60
+ACCOUNT_DELETE_RATE_LIMIT = 5
+ACCOUNT_DELETE_IP_RATE_LIMIT = 10
+ACCOUNT_DELETE_RATE_WINDOW_SECONDS = 10 * 60
+MAX_REGULAR_POST_BYTES = 1024 * 1024
+MAX_NAVER_DISCONNECT_POST_BYTES = 8 * 1024
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
@@ -82,6 +102,18 @@ def _trusted_proxy_client_ip(peer_ip: str, forwarded_ip: str) -> str:
 class PublicRestaurantApplication:
     def __init__(self, settings: Settings):
         self.settings = settings
+        if settings.app_env == "production":
+            missing = [
+                name
+                for name, value in (
+                    ("APP_SESSION_SECRET", settings.session_secret),
+                    ("OAUTH_TOKEN_ENCRYPTION_KEYS", settings.oauth_token_encryption_keys),
+                    ("OAUTH_SUBJECT_HMAC_SECRET", settings.oauth_subject_hmac_secret),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("APP_ENV=production requires " + ", ".join(missing))
         self.database = Database(settings.database_url)
         self.database.prepare()
         geocoding_client = None
@@ -105,6 +137,24 @@ class PublicRestaurantApplication:
                 settings.groq_api_key,
                 settings.groq_model,
             )
+        oauth_token_cipher = (
+            OAuthTokenCipher(settings.oauth_token_encryption_keys)
+            if settings.oauth_token_encryption_keys
+            else None
+        )
+        self.naver_login_client = (
+            NaverLoginClient(
+                settings.naver_login_client_id,
+                settings.naver_login_client_secret,
+                settings.naver_login_redirect_uri,
+            )
+            if (
+                settings.naver_login_client_id
+                and settings.naver_login_client_secret
+                and settings.naver_login_redirect_uri
+            )
+            else None
+        )
         self.service = RestaurantService(
             self.database,
             review_rate_limit_per_hour=settings.review_rate_limit_per_hour,
@@ -117,21 +167,44 @@ class PublicRestaurantApplication:
                 settings.restaurant_image_upload_dir
                 or BASE_DIR / "var" / "restaurant_images"
             ),
+            oauth_token_cipher=oauth_token_cipher,
+            oauth_subject_hmac_secret=settings.oauth_subject_hmac_secret,
+            naver_login_client=self.naver_login_client,
         )
         self.verification_progress = VerificationProgressStore()
         self.operation_jobs = OperationJobQueue(self.database)
-        self.session_codec = SessionCodec(
-            settings.session_secret
-            or settings.naver_login_client_secret
-            or settings.google_client_secret
-        )
+        # Development without an explicit key uses a process-local secret so it
+        # never falls back to an OAuth client credential. Production is
+        # rejected above unless APP_SESSION_SECRET is configured.
+        session_secret = settings.session_secret or secrets.token_urlsafe(48)
+        self.session_codec = SessionCodec(session_secret)
 
     def issue_session(self, user_id: int) -> str:
-        return self.session_codec.issue(user_id)
+        token = self.session_codec.issue(user_id)
+        claims = self.session_codec.verify_claims(token)
+        if claims is None:  # pragma: no cover - issue/verify invariant
+            raise RuntimeError("issued session could not be verified")
+        self.service.register_session(
+            user_id,
+            token,
+            issued_at=claims.issued_at,
+            expires_at=claims.expires_at,
+        )
+        return token
 
     def session_user(self, token: str) -> dict | None:
-        user_id = self.session_codec.verify(token)
-        return self.service.get_active_user(user_id) if user_id is not None else None
+        claims = self.session_codec.verify_claims(token)
+        if claims is None:
+            return None
+        return self.service.active_session_user(claims.user_id, token)
+
+    def issue_account_action_token(self, user_id: int, session_token: str) -> str:
+        return self.service.issue_one_time_action_token(
+            user_id,
+            session_token,
+            ACCOUNT_DELETE_ACTION,
+            ttl_seconds=ACCOUNT_ACTION_TOKEN_MAX_AGE_SECONDS,
+        )
 
     def run_daily(self) -> dict:
         return DailyPipeline(self.database, settings=self.settings).run()
@@ -578,6 +651,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             naver_configured=self._provider_configured("naver"),
                             return_to=return_to,
                             account_deleted=query.get("account_deleted") == "1",
+                            provider_revocation=str(query.get("provider_revocation", "")),
                         )
                     )
                 elif path == "/signup":
@@ -606,9 +680,9 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             mypage_index(
                                 app.settings.app_name,
                                 app.service.my_page(int(current_user["id"])),
-                                account_delete_token=app.session_codec.issue_action_token(
+                                account_delete_token=app.issue_account_action_token(
+                                    int(current_user["id"]),
                                     session_token,
-                                    ACCOUNT_DELETE_ACTION,
                                 ),
                                 account_error=str(query.get("account_error", "")),
                             )
@@ -718,6 +792,10 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(admin_document_detail_index())
                 elif path.startswith("/static/"):
                     self._static(path.removeprefix("/static/"))
+                elif path.startswith("/media/community-photos/"):
+                    self._restaurant_user_image_media(
+                        unquote(path.removeprefix("/media/community-photos/"))
+                    )
                 elif path.startswith("/media/restaurant-images/"):
                     self._restaurant_image_media(
                         unquote(path.removeprefix("/media/restaurant-images/"))
@@ -794,6 +872,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             limit=int(query.get("limit", "20") or "20"),
                         )
                     )
+                elif path == "/ops/oauth-lifecycle":
+                    self._json(
+                        app.service.oauth_lifecycle_jobs(
+                            limit=int(query.get("limit", "100") or "100")
+                        )
+                    )
                 elif path.startswith("/ops/jobs/"):
                     self._json(app.operation_job(self._path_int(path, "/ops/jobs/")))
                 elif path == "/ops/logs":
@@ -853,16 +937,22 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     raise AppError(404, "not found")
             except AppError as exc:
                 self._error(exc.status, exc.message)
+            except ValueError:
+                self._error(400, "invalid request")
             except Exception as exc:  # pragma: no cover - server guard
-                self._error(500, str(exc))
+                self._internal_error(exc)
 
         def do_POST(self) -> None:
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path
+                if path == "/auth/naver/deauthorize":
+                    self._naver_deauthorize()
+                    return
                 if self._is_admin_route(path):
                     self._admin_user()
                 payload = self._payload()
+                self._require_session_csrf(payload)
                 context = self._context(payload)
                 if path == "/ops/run-daily":
                     self._json(app.run_daily(), status=201)
@@ -873,6 +963,17 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             end_date=str(payload.get("end_date", "")),
                         ),
                         status=201,
+                    )
+                elif path.startswith("/ops/oauth-lifecycle/") and path.endswith("/retry"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4:
+                        raise AppError(404, "not found")
+                    current_user = self._admin_user()
+                    self._json(
+                        app.service.retry_oauth_lifecycle_job(
+                            int(parts[2]),
+                            actor_user_id=int(current_user["id"]),
+                        )
                     )
                 elif path == "/ops/collection-plans":
                     self._json(
@@ -1215,27 +1316,46 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 elif path == "/account/delete":
                     current_user = self._authenticated_user()
                     session_token = self._cookies().get(SESSION_COOKIE, "")
-                    if not app.session_codec.verify_action_token(
-                        session_token,
-                        ACCOUNT_DELETE_ACTION,
-                        str(payload.get("action_token", "")),
-                    ):
-                        raise AppError(403, "invalid account action token")
+                    app.service.enforce_security_rate_limit(
+                        "account-delete-user",
+                        str(int(current_user["id"])),
+                        limit=ACCOUNT_DELETE_RATE_LIMIT,
+                        window_seconds=ACCOUNT_DELETE_RATE_WINDOW_SECONDS,
+                    )
+                    app.service.enforce_security_rate_limit(
+                        "account-delete-ip",
+                        context.ip,
+                        limit=ACCOUNT_DELETE_IP_RATE_LIMIT,
+                        window_seconds=ACCOUNT_DELETE_RATE_WINDOW_SECONDS,
+                    )
                     if str(payload.get("confirmation", "")).strip() != "계정 삭제":
                         if self._wants_json():
                             raise AppError(400, "account deletion confirmation is required")
                         self._redirect("/mypage?account_error=confirmation")
                         return
-                    result = app.service.delete_account(int(current_user["id"]))
-                    expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
-                    if self._wants_json():
-                        self._json(result, cookies=[expired_session])
-                    else:
-                        self._redirect(
-                            "/login?account_deleted=1",
-                            cookies=[expired_session],
-                        )
+                    if not app.service.consume_one_time_action_token(
+                        int(current_user["id"]),
+                        session_token,
+                        ACCOUNT_DELETE_ACTION,
+                        str(payload.get("action_token", "")),
+                    ):
+                        raise AppError(403, "invalid or expired account action token")
+                    intent_token = app.service.create_account_delete_intent(
+                        int(current_user["id"]),
+                        return_to="/login?account_deleted=1&provider_revocation=pending",
+                    )
+                    self._auth_start(
+                        "naver",
+                        {
+                            "return_to": "/login?account_deleted=1&provider_revocation=pending",
+                            "purpose": "account_delete",
+                            "intent": intent_token,
+                        },
+                    )
+                    return
                 elif path == "/auth/logout":
+                    session_token = self._cookies().get(SESSION_COOKIE, "")
+                    app.service.revoke_session(session_token)
                     expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
                     if self._wants_json():
                         self._json(
@@ -1298,7 +1418,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             except ValueError:
                 self._error(400, "invalid request")
             except Exception as exc:  # pragma: no cover - server guard
-                self._error(500, str(exc))
+                self._internal_error(exc)
 
         def _provider_configured(self, provider: str) -> bool:
             if provider == "naver":
@@ -1319,6 +1439,12 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             if provider not in {"google", "naver"}:
                 raise AppError(404, "unsupported provider")
             return_to = self._safe_return_to(query.get("return_to", "/"))
+            purpose = str(query.get("purpose", "")).strip()
+            intent_token = str(query.get("intent", "")).strip()
+            if purpose and purpose != "account_delete":
+                raise AppError(400, "unsupported OAuth purpose")
+            if purpose == "account_delete" and (provider != "naver" or not intent_token):
+                raise AppError(400, "account deletion intent is required")
             if not self._provider_configured(provider):
                 if self._wants_json():
                     self._json(
@@ -1334,15 +1460,23 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 return
 
             state = secrets.token_urlsafe(16)
-            if provider == "naver":
-                params = urlencode(
-                    {
-                        "response_type": "code",
-                        "client_id": app.settings.naver_login_client_id,
-                        "redirect_uri": app.settings.naver_login_redirect_uri,
-                        "state": state,
-                    }
+            if purpose != "account_delete":
+                app.service.create_oauth_login_intent(
+                    provider,
+                    state,
+                    return_to=return_to,
+                    ttl_seconds=OAUTH_COOKIE_MAX_AGE_SECONDS,
                 )
+            if provider == "naver":
+                authorization_params = {
+                    "response_type": "code",
+                    "client_id": app.settings.naver_login_client_id,
+                    "redirect_uri": app.settings.naver_login_redirect_uri,
+                    "state": state,
+                }
+                if purpose == "account_delete":
+                    authorization_params["auth_type"] = "reauthenticate"
+                params = urlencode(authorization_params)
                 authorization_url = f"https://nid.naver.com/oauth2.0/authorize?{params}"
             else:
                 params = urlencode(
@@ -1377,6 +1511,18 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
                     path=callback_path,
                 ),
+                self._set_cookie(
+                    OAUTH_PURPOSE_COOKIE,
+                    purpose,
+                    max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
+                    path=callback_path,
+                ),
+                self._set_cookie(
+                    OAUTH_INTENT_COOKIE,
+                    intent_token,
+                    max_age=OAUTH_COOKIE_MAX_AGE_SECONDS,
+                    path=callback_path,
+                ),
             ]
             if self._wants_json():
                 self._json(
@@ -1399,6 +1545,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             stored_state = cookies.get(OAUTH_STATE_COOKIE, "")
             returned_state = query.get("state", "")
             stored_provider = cookies.get(OAUTH_PROVIDER_COOKIE, "")
+            purpose = cookies.get(OAUTH_PURPOSE_COOKIE, "")
+            intent_token = cookies.get(OAUTH_INTENT_COOKIE, "")
             if (
                 not stored_state
                 or not returned_state
@@ -1407,6 +1555,13 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             ):
                 self._auth_failure("expired", oauth_cookies, status=401)
                 return
+
+            if purpose != "account_delete":
+                try:
+                    app.service.consume_oauth_login_intent(provider, returned_state)
+                except AppError:
+                    self._auth_failure("expired", oauth_cookies, status=401)
+                    return
 
             if query.get("error"):
                 self._auth_failure("cancelled", oauth_cookies, status=400)
@@ -1417,13 +1572,13 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
 
             try:
                 if provider == "naver":
-                    profile = NaverLoginClient(
-                        app.settings.naver_login_client_id,
-                        app.settings.naver_login_client_secret,
-                        app.settings.naver_login_redirect_uri,
-                    ).exchange_code(query["code"], returned_state)
+                    if app.naver_login_client is None:
+                        raise IntegrationError("Naver Login is not configured")
+                    login_response = app.naver_login_client.exchange_code(
+                        query["code"], returned_state
+                    )
                 else:
-                    profile = GoogleOAuthClient(
+                    login_response = GoogleOAuthClient(
                         app.settings.google_client_id,
                         app.settings.google_client_secret,
                         app.settings.google_redirect_uri,
@@ -1432,11 +1587,64 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 self._auth_failure("provider_error", oauth_cookies, status=502)
                 return
 
-            account = app.service.upsert_oauth_account(
-                provider=profile.provider,
-                provider_subject=profile.subject,
-                display_name=profile.display_name,
-            )
+            if isinstance(login_response, OAuthProfile):
+                login_result = OAuthLoginResult(login_response, access_token="")
+            else:
+                login_result = login_response
+            profile = login_result.profile
+
+            if purpose == "account_delete":
+                if provider != "naver" or not intent_token:
+                    self._auth_failure("expired", oauth_cookies, status=401)
+                    return
+                try:
+                    result = app.service.complete_account_delete_intent(
+                        intent_token,
+                        provider_subject=profile.subject,
+                        access_token=login_result.access_token,
+                        refresh_token=login_result.refresh_token,
+                    )
+                except AppError as exc:
+                    error = "account_mismatch" if exc.status == 409 else "expired"
+                    self._auth_failure(error, oauth_cookies, status=exc.status)
+                    return
+                expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
+                response_cookies = [*oauth_cookies, expired_session]
+                if self._wants_json():
+                    self._json(
+                        {
+                            "result": "deletion_pending",
+                            "provider_revocation": result.get("provider_revocation"),
+                            "lifecycle_job_id": result.get("lifecycle_job_id"),
+                        },
+                        status=HTTPStatus.ACCEPTED,
+                        cookies=response_cookies,
+                    )
+                    return
+                return_to = self._safe_return_to(
+                    unquote(cookies.get(OAUTH_RETURN_COOKIE, "/login?account_deleted=1"))
+                )
+                self._redirect(return_to, cookies=response_cookies)
+                return
+
+            try:
+                account = app.service.upsert_oauth_account(
+                    provider=profile.provider,
+                    provider_subject=profile.subject,
+                    display_name=profile.display_name,
+                    access_token=login_result.access_token,
+                    refresh_token=login_result.refresh_token,
+                )
+            except AppError as exc:
+                if exc.status == 423:
+                    expired_session = self._expire_cookie(SESSION_COOKIE, path="/")
+                    self._auth_failure(
+                        "account_deletion_pending",
+                        [*oauth_cookies, expired_session],
+                        status=423,
+                    )
+                    return
+                raise
             session_cookie = self._set_cookie(
                 SESSION_COOKIE,
                 app.issue_session(int(account["user"]["id"])),
@@ -1445,7 +1653,19 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             )
             response_cookies = [*oauth_cookies, session_cookie]
             if self._wants_json():
-                self._json(account, cookies=response_cookies)
+                user = account["user"]
+                self._json(
+                    {
+                        "user": {
+                            "id": int(user["id"]),
+                            "display_name": user["display_name"],
+                            "role": user["role"],
+                            "status": user["status"],
+                        },
+                        "created": bool(account["created"]),
+                    },
+                    cookies=response_cookies,
+                )
                 return
             return_to = self._safe_return_to(
                 unquote(cookies.get(OAUTH_RETURN_COOKIE, "/"))
@@ -1470,8 +1690,44 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     OAUTH_STATE_COOKIE,
                     OAUTH_RETURN_COOKIE,
                     OAUTH_PROVIDER_COOKIE,
+                    OAUTH_PURPOSE_COOKIE,
+                    OAUTH_INTENT_COOKIE,
                 )
             ]
+
+        def _naver_deauthorize(self) -> None:
+            if not (
+                app.settings.naver_login_client_id
+                and app.settings.naver_login_client_secret
+                and app.settings.oauth_subject_hmac_secret
+            ):
+                raise AppError(503, "Naver disconnect is not configured")
+            content_type = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if (
+                length <= 0
+                or length > MAX_NAVER_DISCONNECT_POST_BYTES
+                or not content_type.startswith("application/x-www-form-urlencoded")
+            ):
+                raise AppError(400, "invalid Naver disconnect request")
+            payload = self._payload()
+            try:
+                verified = verify_naver_disconnect_payload(
+                    {key: str(value) for key, value in payload.items()},
+                    client_id=app.settings.naver_login_client_id,
+                    client_secret=app.settings.naver_login_client_secret,
+                    subject_hmac_secret=app.settings.oauth_subject_hmac_secret,
+                )
+            except PermissionError as exc:
+                raise AppError(403, "forbidden Naver disconnect request") from exc
+            except ValueError as exc:
+                raise AppError(400, "invalid Naver disconnect request") from exc
+            app.service.accept_naver_disconnect(
+                provider_subject=verified.provider_subject,
+                provider_timestamp=verified.provider_timestamp,
+                event_digest=verified.event_digest,
+            )
+            self._no_content()
 
         def _static(self, relative_path: str) -> None:
             safe_path = (STATIC_DIR / relative_path).resolve()
@@ -1480,21 +1736,29 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             body = safe_path.read_bytes()
             content_type = mimetypes.guess_type(str(safe_path))[0] or "application/octet-stream"
             self.send_response(200)
+            self._security_headers()
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def _restaurant_image_media(self, storage_key: str) -> None:
-            safe_path = app.service._admin_image_file_path(storage_key)
+            safe_path = app.service.public_admin_image_file_path(storage_key)
+            self._image_media(safe_path)
+
+        def _restaurant_user_image_media(self, public_name: str) -> None:
+            safe_path = app.service.public_user_image_file_path(public_name)
+            self._image_media(safe_path)
+
+        def _image_media(self, safe_path: Path) -> None:
             if not safe_path.exists() or not safe_path.is_file():
                 raise AppError(404, "restaurant image not found")
             body = safe_path.read_bytes()
             content_type = mimetypes.guess_type(str(safe_path))[0] or "application/octet-stream"
             self.send_response(200)
+            self._security_headers()
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1512,6 +1776,8 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 if length > max_length:
                     raise AppError(413, "image upload request is too large")
                 return self._multipart_payload(length, content_type)
+            if length > MAX_REGULAR_POST_BYTES:
+                raise AppError(413, "request body is too large")
             raw = self.rfile.read(length).decode("utf-8")
             if content_type.startswith("application/x-www-form-urlencoded"):
                 return {key: values[-1] for key, values in parse_qs(raw).items()}
@@ -1573,6 +1839,21 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
         def _current_user(self) -> dict | None:
             token = self._cookies().get(SESSION_COOKIE, "")
             return app.session_user(token)
+
+        def _require_session_csrf(self, payload: dict) -> None:
+            session_token = self._cookies().get(SESSION_COOKIE, "")
+            if self._current_user() is None:
+                return
+            supplied_token = str(
+                self.headers.get("X-CSRF-Token", "")
+                or payload.get("csrf_token", "")
+            )
+            if not app.session_codec.verify_action_token(
+                session_token,
+                SESSION_CSRF_ACTION,
+                supplied_token,
+            ):
+                raise AppError(403, "invalid CSRF token")
 
         def _authenticated_user(self) -> dict:
             current_user = self._current_user()
@@ -1651,6 +1932,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
         ) -> None:
             body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
             self.send_response(status)
+            self._security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             for cookie in cookies or []:
@@ -1659,9 +1941,38 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             self.end_headers()
             self.wfile.write(body)
 
+        def _no_content(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._security_headers()
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _html(self, payload: str, status: int = 200) -> None:
+            session_token = self._cookies().get(SESSION_COOKIE, "")
+            if self._current_user() is not None:
+                csrf_token = app.session_codec.issue_action_token(
+                    session_token,
+                    SESSION_CSRF_ACTION,
+                )
+                escaped_token = html.escape(csrf_token, quote=True)
+                payload = payload.replace(
+                    "<head>",
+                    f'<head>\n  <meta name="csrf-token" content="{escaped_token}">',
+                    1,
+                )
+                payload = re.sub(
+                    r'(<form\b(?=[^>]*\bmethod=["\']post["\'])[^>]*>)',
+                    lambda match: (
+                        f'{match.group(1)}\n'
+                        f'        <input type="hidden" name="csrf_token" value="{escaped_token}">'
+                    ),
+                    payload,
+                    flags=re.IGNORECASE,
+                )
             body = payload.encode("utf-8")
             self.send_response(status)
+            self._security_headers()
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
@@ -1675,6 +1986,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             status: int = 303,
         ) -> None:
             self.send_response(status)
+            self._security_headers()
             self.send_header("Location", location)
             self.send_header("Cache-Control", "no-store")
             for cookie in cookies or []:
@@ -1682,8 +1994,43 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def _security_headers(self) -> None:
+            self.send_header(
+                "Content-Security-Policy",
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+            )
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+            self.send_header(
+                "Permissions-Policy",
+                "camera=(), microphone=(), geolocation=()",
+            )
+
         def _error(self, status: int, message: str) -> None:
             self._json({"error": message, "status": status}, status=status)
+
+        def _internal_error(self, exc: Exception) -> None:
+            request_id = secrets.token_urlsafe(9)
+            # PostgreSQL errors may echo bound values. Keep the exception type
+            # and traceback for diagnosis without recording its potentially
+            # sensitive message (OAuth subjects and tokens must never leak).
+            LOGGER.error(
+                "Unhandled request error request_id=%s method=%s path=%s type=%s traceback=%s",
+                request_id,
+                self.command,
+                urlparse(self.path).path,
+                type(exc).__name__,
+                "".join(traceback.format_tb(exc.__traceback__)),
+            )
+            self._json(
+                {
+                    "error": "internal server error",
+                    "status": 500,
+                    "request_id": request_id,
+                },
+                status=500,
+            )
 
     return Handler
 

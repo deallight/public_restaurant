@@ -1,9 +1,42 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from io import BytesIO
+from urllib.error import HTTPError
+from unittest.mock import MagicMock, patch
 
-from app.integrations import NaverImageSearchClient
+from app.integrations import IntegrationError, NaverImageSearchClient, _get_json_with_retry
+
+
+class GetJsonRetryTests(unittest.TestCase):
+    def test_rate_limit_retries_with_backoff(self) -> None:
+        rate_limit = HTTPError("https://example.com", 429, "rate limit", {}, BytesIO(b""))
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true}'
+
+        with (
+            patch("app.integrations.urlopen", side_effect=[rate_limit, response]) as urlopen_mock,
+            patch("app.integrations.time.sleep") as sleep_mock,
+        ):
+            payload = _get_json_with_retry("https://example.com", {})
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(urlopen_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(0.75)
+
+    def test_non_retryable_http_error_fails_immediately(self) -> None:
+        unauthorized = HTTPError("https://example.com", 401, "unauthorized", {}, BytesIO(b""))
+        with (
+            patch("app.integrations.urlopen", side_effect=unauthorized) as urlopen_mock,
+            patch("app.integrations.time.sleep") as sleep_mock,
+            self.assertRaises(IntegrationError) as raised,
+        ):
+            _get_json_with_retry("https://example.com", {})
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(urlopen_mock.call_count, 1)
+        sleep_mock.assert_not_called()
 
 
 class NaverImageSearchClientTests(unittest.TestCase):

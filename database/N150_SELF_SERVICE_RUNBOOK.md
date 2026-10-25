@@ -245,6 +245,10 @@ NAVER_SEARCH_CLIENT_SECRET='값'
 NAVER_MAPS_CLIENT_ID='값'
 NAVER_MAPS_CLIENT_SECRET='값'
 DATA_GO_KR_SERVICE_KEY='값'
+# OAuth 계정 수명주기 통합 테스트를 할 때만 테스트 전용 값을 별도로 설정한다.
+APP_SESSION_SECRET='테스트 전용 세션 키'
+OAUTH_TOKEN_ENCRYPTION_KEYS='테스트 전용 Fernet 키'
+OAUTH_SUBJECT_HMAC_SECRET='테스트 전용 HMAC 키'
 ```
 
 파일 권한을 확인한다.
@@ -431,7 +435,37 @@ NAVER_SEARCH_CLIENT_SECRET='값'
 NAVER_MAPS_CLIENT_ID='값'
 NAVER_MAPS_CLIENT_SECRET='값'
 DATA_GO_KR_SERVICE_KEY='값'
+PRIVACY_CONTACT_EMAIL='운영 개인정보 문의 주소'
+APP_SESSION_SECRET='운영 세션 전용 키'
+OAUTH_TOKEN_ENCRYPTION_KEYS='운영 Fernet 키 목록'
+OAUTH_SUBJECT_HMAC_SECRET='운영 OAuth 식별자 HMAC 키'
+NAVER_LOGIN_CLIENT_ID='값'
+NAVER_LOGIN_CLIENT_SECRET='값'
+NAVER_LOGIN_REDIRECT_URI='https://gonggibap.com/auth/callback/naver'
 ```
+
+세 키는 OAuth Client Secret과 서로 다른 값으로 secret 저장소에서 주입한다.
+`OAUTH_TOKEN_ENCRYPTION_KEYS`는 쉼표로 구분하며 첫 키가 현재 암호화 키다. 키를
+회전할 때는 `새 키,기존 키` 순서로 배포한다. DB 백업을 검증한 뒤 새 release와
+운영 환경파일을 사용해 다음 명령을 실행한다.
+
+```bash
+sudo -u deploy /bin/sh -c '
+  set -e
+  set -a
+  . /srv/app/shared/public_restaurant.env
+  set +a
+  cd /srv/app/current &&
+  .venv/bin/python -m scripts.rotate_oauth_tokens --apply &&
+  .venv/bin/python -m scripts.rotate_oauth_tokens
+'
+```
+
+두 결과에 토큰·사용자 식별자가 없어야 하며 최종 `non_primary=0`,
+`unreadable=0`을 확인한 뒤에만 환경파일에서 기존 키를 제거하고 Web·Worker를
+재시작한다. 회전 또는 검증 실패 시 기존 키를 유지한다. 이번 릴리스에서는 배포 전에 새 OAuth 키를 설정하고
+`APP_SESSION_SECRET`을 새 값으로 바꿔 모든 기존 로그인 세션을 폐기한다. 키 값은
+확인 명령이나 채팅 출력에 남기지 않는다.
 
 파일 권한:
 
@@ -471,6 +505,14 @@ sudo -u deploy bash -lc '
 ```
 
 `compatible`이 아닌 결과가 나오면 즉시 중단한다. 원인을 해결하기 전에는 앱을 시작하지 않는다.
+
+Web·Worker가 새 release에서 정상 동작한 뒤 네이버 개발자센터의 연결 끊기
+Callback에 `https://gonggibap.com/auth/naver/deauthorize`를 등록한다. 등록 전에는
+로그인 Callback과 연결 끊기 Callback을 혼동하지 않았는지 다시 확인한다.
+
+배포 후 관리자 세션으로 `/ops/oauth-lifecycle`을 조회해 `queued`, `retry_wait`,
+`awaiting_token`, `manual_review` 건수를 확인한다. 응답에 사용자 식별자,
+Provider Subject, 토큰이 포함되면 배포를 중단한다.
 
 ### 7-3. 새 데이터 수집 시작
 

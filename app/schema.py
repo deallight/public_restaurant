@@ -348,15 +348,92 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  session_hash TEXT PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  issued_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  authenticated_at TEXT NOT NULL,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS action_tokens (
+  token_hash TEXT PRIMARY KEY,
+  session_hash TEXT NOT NULL REFERENCES auth_sessions(session_hash) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS security_rate_limit_events (
+  id BIGSERIAL PRIMARY KEY,
+  scope TEXT NOT NULL,
+  subject_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS oauth_accounts (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id),
   provider TEXT NOT NULL,
   provider_subject TEXT NOT NULL,
   display_name TEXT,
+  refresh_token_ciphertext TEXT,
+  token_updated_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_login_at TEXT,
   UNIQUE (provider, provider_subject)
+);
+
+CREATE TABLE IF NOT EXISTS oauth_flow_intents (
+  token_hash TEXT PRIMARY KEY,
+  user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  expected_subject_hmac TEXT,
+  return_to TEXT NOT NULL DEFAULT '/',
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (purpose IN ('login', 'account_delete'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_lifecycle_jobs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT REFERENCES users(id),
+  provider TEXT NOT NULL,
+  subject_hmac TEXT NOT NULL,
+  token_ciphertext TEXT,
+  token_type_hint TEXT,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  local_delete_completed INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_error_code TEXT,
+  worker_id TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (source IN ('user', 'admin', 'provider_callback', 'provider_callback_related')),
+  CHECK (status IN ('queued', 'running', 'retry_wait', 'awaiting_token', 'manual_review', 'completed')),
+  CHECK (local_delete_completed IN (0, 1)),
+  CHECK (attempts >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS oauth_disconnect_events (
+  event_digest TEXT PRIMARY KEY,
+  lifecycle_job_id BIGINT REFERENCES oauth_lifecycle_jobs(id),
+  provider TEXT NOT NULL,
+  subject_hmac TEXT NOT NULL,
+  provider_timestamp BIGINT NOT NULL,
+  result TEXT NOT NULL DEFAULT 'accepted',
+  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  processed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS account_merge_requests (
@@ -477,6 +554,19 @@ CREATE INDEX IF NOT EXISTS idx_restaurant_user_images_owner
 CREATE INDEX IF NOT EXISTS idx_restaurant_admin_images_order
   ON restaurant_admin_images (restaurant_id, sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports (status);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_active
+  ON auth_sessions (user_id, revoked_at, expires_at);
+CREATE INDEX IF NOT EXISTS idx_action_tokens_session_action
+  ON action_tokens (session_hash, action, expires_at);
+CREATE INDEX IF NOT EXISTS idx_security_rate_limit_lookup
+  ON security_rate_limit_events (scope, subject_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_oauth_flow_intents_user
+  ON oauth_flow_intents (user_id, purpose, expires_at);
+CREATE INDEX IF NOT EXISTS idx_oauth_lifecycle_due
+  ON oauth_lifecycle_jobs (status, next_attempt_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_lifecycle_active_subject
+  ON oauth_lifecycle_jobs (provider, subject_hmac)
+  WHERE status IN ('queued', 'running', 'retry_wait', 'awaiting_token', 'manual_review');
 CREATE INDEX IF NOT EXISTS idx_expense_records_date ON expense_records (used_date);
 CREATE INDEX IF NOT EXISTS idx_candidates_status ON restaurant_candidates (status);
 CREATE INDEX IF NOT EXISTS idx_collection_plan_documents_status

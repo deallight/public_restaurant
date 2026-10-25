@@ -183,7 +183,9 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 | `DATABASE_URL` | PostgreSQL 접속 URL. 모든 환경에서 필수 |
 | `TEST_DATABASE_URL` | 이름에 `test`가 포함된 격리 PostgreSQL 테스트 DB. 생략 시 개발 DB 이름에 `_test`를 붙여 계산 |
 | `RESTAURANT_IMAGE_UPLOAD_DIR` | 관리자 보관 사진과 사용자 등록 사진 저장 경로 |
-| `APP_SESSION_SECRET` | 로그인 세션 서명 키 |
+| `APP_SESSION_SECRET` | 로그인 세션 전용 서명 키. 운영에서는 필수이며 OAuth Client Secret으로 대체하지 않음 |
+| `OAUTH_TOKEN_ENCRYPTION_KEYS` | OAuth Refresh Token 암호화용 Fernet 키 목록. 첫 번째 키로 새 토큰을 암호화하고 뒤의 키는 복호화·키 회전에 사용 |
+| `OAUTH_SUBJECT_HMAC_SECRET` | 삭제 대기 계정 식별자를 비가역 HMAC으로 저장하기 위한 전용 키 |
 | `PRIVACY_CONTACT_EMAIL` | 개인정보처리방침·이용약관 문의 이메일. 운영 환경에서는 필수 |
 | `NAVER_MAP_KEY` | Naver Maps JavaScript API Client ID |
 | `NAVER_MAPS_CLIENT_ID`, `NAVER_MAPS_CLIENT_SECRET` | NCP Maps 지오코딩 |
@@ -205,7 +207,26 @@ Naver Developers에 등록한 Callback URL과 `NAVER_LOGIN_REDIRECT_URI`가 정�
 - 로컬: `http://127.0.0.1:8000/auth/callback/naver`
 - 운영: `https://gonggibap.com/auth/callback/naver`
 
-로그인 관련 secret은 `.env` 또는 배포 secret으로만 주입합니다. 별도 회원가입 화면은 없으며, 네이버 인증 후 기존 계정은 로그인하고 신규 계정은 자동 생성됩니다.
+연결 끊기 Callback은 로그인 Callback과 별도로 다음 URL을 등록합니다.
+
+- 운영 연결 끊기: `https://gonggibap.com/auth/naver/deauthorize` (`POST`)
+
+로그인 관련 secret은 `.env` 또는 배포 secret으로만 주입합니다. 운영에서는
+`APP_SESSION_SECRET`, `OAUTH_TOKEN_ENCRYPTION_KEYS`,
+`OAUTH_SUBJECT_HMAC_SECRET`이 모두 없으면 서버가 시작되지 않습니다. 계정 탈퇴는
+네이버 강제 재인증 후 공기밥 접근을 즉시 차단하고, 네이버 연결 철회가 끝날 때까지
+같은 네이버 계정의 로그인을 거부합니다. 철회 완료 후 다시 동의하면 기존 데이터와
+연결되지 않은 새 계정으로 가입됩니다.
+
+OAuth 토큰 암호화 키를 교체할 때는 먼저
+`OAUTH_TOKEN_ENCRYPTION_KEYS=새키,기존키` 순서로 배포한 다음 저장 암호문을
+새 키로 다시 암호화합니다. 검증 결과의 `non_primary`와 `unreadable`이 모두 0인
+경우에만 기존 키를 제거합니다. 명령은 토큰이나 사용자 식별자를 출력하지 않습니다.
+
+```bash
+.venv/bin/python -m scripts.rotate_oauth_tokens --apply
+.venv/bin/python -m scripts.rotate_oauth_tokens
+```
 
 ## 데이터 처리 흐름
 
@@ -240,7 +261,9 @@ raw_documents
 - `alias_memory`: 수동 승인 뒤 재사용하는 음식점 별칭
 - `decision_audit_logs`: 승인·병합·반려 감사 로그
 - `dead_letter_queue`: 파싱·검증 실패 항목
-- `users`, `oauth_accounts`: 사용자와 OAuth 연결
+- `users`, `oauth_accounts`: 사용자와 OAuth 연결 및 암호화된 Refresh Token
+- `oauth_flow_intents`: 만료 시간이 있는 계정 삭제 재인증 의도
+- `oauth_lifecycle_jobs`, `oauth_disconnect_events`: 로컬 탈퇴·네이버 철회 작업과 검증된 연결 끊기 이벤트
 - `restaurant_reviews`, `review_reactions`, `review_reports`: 리뷰, 사용자별 추천·비추천, 신고
 - `user_saved_restaurants`: 사용자 저장 가게
 - `restaurant_ai_summaries`: 리뷰 AI 요약 캐시
@@ -324,6 +347,7 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `POST /api/reviews/{id}/delete`
 - `POST /account/delete`
 - `POST /auth/logout`
+- `POST /auth/naver/deauthorize` (네이버 서명 연결 끊기 Callback, form 본문만 허용)
 
 `saved_only=1`, 저장·해제, 본인 리뷰 삭제, 계정 탈퇴는 로그인이 필요합니다.
 
@@ -361,6 +385,8 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `GET /ops/verification-progress`
 - `GET /ops/api-usage`
 - `GET /ops/logs`
+- `GET /ops/oauth-lifecycle`
+- `POST /ops/oauth-lifecycle/{id}/retry`
 
 ## PostgreSQL 스키마와 마이그레이션
 
@@ -405,6 +431,9 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 - 후보 자동 검증과 관리자 승인·병합·반려
 - 공개 지도, 검색, 랭킹, 핀 군집화, 상세 응답
 - 리뷰 제한, 신고, AI 요약, 저장 가게, 마이페이지, 계정 탈퇴
+- OAuth 토큰 암호화·DB 키 회전, 강제 재인증, 연결 끊기 서명·만료·중복 검증
+- Callback 직후 재동의 경쟁 조건과 병합 계정의 복수 네이버 연결 전체 철회
+- 네이버 철회 실패 재시도, 삭제 대기 중 재로그인 차단, 완료 후 빈 새 계정 생성
 - 관리자 인증·권한과 운영 API 라우팅
 - 외부·관리자 사진 비노출, 사용자 사진 소유권과 등록·수정·삭제
 - PostgreSQL 스키마 드리프트 차단과 모든 환경의 PostgreSQL 강제
@@ -414,9 +443,12 @@ TEST_DATABASE_URL='postgresql://restaurant_app@127.0.0.1:5432/public_restaurant_
 - GitHub `main` 병합 후 N150 업데이트는 `sudo /srv/app/bin/deploy-public-restaurant`로 실행합니다. 최초 설치와 복구용 수동 절차는 [N150 자가 운영 절차서](database/N150_SELF_SERVICE_RUNBOOK.md)를 따릅니다.
 - 배포 스크립트는 테스트, PostgreSQL 백업·복원 목록 검증, release에 포함된 검토된 번호형 마이그레이션 적용, 운영 스키마 호환 검사, 별도 포트 사전 점검, 원자적 release 전환, HTTP 검증과 실패 시 코드 롤백을 수행합니다.
 - 운영 URL은 <https://gonggibap.com>이며 `APP_ENV=production`을 사용합니다.
-- 모든 환경은 PostgreSQL `DATABASE_URL` 없이는 시작하지 않으며, 운영 환경은 추가로 유효한 `PRIVACY_CONTACT_EMAIL`을 요구합니다.
+- 모든 환경은 PostgreSQL `DATABASE_URL` 없이는 시작하지 않으며, 운영 환경은 추가로 유효한 `PRIVACY_CONTACT_EMAIL`, `APP_SESSION_SECRET`, `OAUTH_TOKEN_ENCRYPTION_KEYS`, `OAUTH_SUBJECT_HMAC_SECRET`을 요구합니다.
 - DB 비밀번호, OAuth secret, API 키, 세션 키는 배포 환경의 secret으로만 주입합니다.
 - PostgreSQL 스키마 변경은 서버 시작과 분리되어 있습니다. 배포 시 운영 DB 백업 검증을 먼저 마친 뒤 저장소에 포함된 검토된 마이그레이션만 적용하고, 호환 결과와 HTTP 상태를 확인합니다.
+- 이 릴리스는 운영 secret에 새 OAuth 암호화 키를 먼저 설정하고 `APP_SESSION_SECRET`을 회전해 기존 세션을 폐기한 뒤 배포합니다. 코드와 worker 정상 동작 확인 후 네이버 개발자센터에 연결 끊기 Callback URL을 등록합니다.
+- 이후 OAuth 암호화 키를 교체할 때는 `새키,기존키` 키 링으로 배포하고 `scripts.rotate_oauth_tokens --apply`와 검증 모드를 통과한 뒤에만 기존 키를 제거합니다.
+- 배포 후 관리자 전용 `/ops/oauth-lifecycle`에서 `queued`, `retry_wait`, `awaiting_token`, `manual_review` 건수를 확인합니다. 이 API는 사용자 식별자·Provider Subject·토큰을 반환하지 않습니다.
 - 라이브 수집은 부산시 게시판 구조와 첨부 포맷에 의존합니다. 지원하지 않는 XLS, DRM, HWP, PDF는 DLQ에 남겨 parser 확장 대상으로 관리합니다.
 - 자동 검증은 근거가 부족한 후보를 공개하지 않고 관리자 검토로 넘깁니다.
 - 외부·관리자 사진은 공개하지 않습니다. 사용자 사진은 직접 촬영 또는 게시 권한 확인을 거쳐 등록하도록 안내합니다.

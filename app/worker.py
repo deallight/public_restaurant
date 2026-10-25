@@ -45,9 +45,15 @@ class OperationWorker:
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
 
     def recover_interrupted_jobs(self) -> int:
-        return self.queue.requeue_running()
+        return (
+            self.queue.requeue_running()
+            + self.app.service.recover_oauth_lifecycle_jobs()
+        )
 
     def run_once(self) -> dict[str, Any] | None:
+        oauth_job = self.app.service.process_next_oauth_lifecycle_job(self.worker_id)
+        if oauth_job is not None:
+            return oauth_job
         job = self.queue.claim_next(self.worker_id)
         if job is None:
             return None

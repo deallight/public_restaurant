@@ -359,13 +359,15 @@ function naverSearchUrl(restaurant) {
 }
 
 async function fetchJson(url, options = {}) {
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const response = await fetch(url, {
+    ...options,
     headers: {
       "Accept": "application/json",
       "Content-Type": "application/json",
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       ...(options.headers || {}),
     },
-    ...options,
   });
   const payload = await response.json();
   if (!response.ok) {

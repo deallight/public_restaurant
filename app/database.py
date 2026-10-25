@@ -20,6 +20,21 @@ from database.migrations.m0004_operation_jobs import (
     STATEMENTS as OPERATION_JOBS_STATEMENTS,
     VERSION as OPERATION_JOBS_VERSION,
 )
+from database.migrations.m0005_auth_security import (
+    DESCRIPTION as AUTH_SECURITY_DESCRIPTION,
+    STATEMENTS as AUTH_SECURITY_STATEMENTS,
+    VERSION as AUTH_SECURITY_VERSION,
+)
+from database.migrations.m0006_oauth_lifecycle import (
+    DESCRIPTION as OAUTH_LIFECYCLE_DESCRIPTION,
+    STATEMENTS as OAUTH_LIFECYCLE_STATEMENTS,
+    VERSION as OAUTH_LIFECYCLE_VERSION,
+)
+from database.migrations.m0007_oauth_lifecycle_hardening import (
+    DESCRIPTION as OAUTH_LIFECYCLE_HARDENING_DESCRIPTION,
+    STATEMENTS as OAUTH_LIFECYCLE_HARDENING_STATEMENTS,
+    VERSION as OAUTH_LIFECYCLE_HARDENING_VERSION,
+)
 
 from .db_compat import connect_postgres
 from .schema import APP_SCHEMA
@@ -28,6 +43,12 @@ from .utils import safe_json_dumps, utc_now
 
 
 APP_TABLES = [
+    "oauth_disconnect_events",
+    "oauth_lifecycle_jobs",
+    "oauth_flow_intents",
+    "action_tokens",
+    "auth_sessions",
+    "security_rate_limit_events",
     "operation_jobs",
     "review_moderation_logs",
     "review_reports",
@@ -72,6 +93,21 @@ REQUIRED_POSTGRES_MIGRATIONS = (
         OPERATION_JOBS_VERSION,
         OPERATION_JOBS_DESCRIPTION,
         OPERATION_JOBS_STATEMENTS,
+    ),
+    (
+        AUTH_SECURITY_VERSION,
+        AUTH_SECURITY_DESCRIPTION,
+        AUTH_SECURITY_STATEMENTS,
+    ),
+    (
+        OAUTH_LIFECYCLE_VERSION,
+        OAUTH_LIFECYCLE_DESCRIPTION,
+        OAUTH_LIFECYCLE_STATEMENTS,
+    ),
+    (
+        OAUTH_LIFECYCLE_HARDENING_VERSION,
+        OAUTH_LIFECYCLE_HARDENING_DESCRIPTION,
+        OAUTH_LIFECYCLE_HARDENING_STATEMENTS,
     ),
 )
 

@@ -142,6 +142,7 @@ def login_index(
     naver_configured: bool = True,
     return_to: str = "/",
     account_deleted: bool = False,
+    provider_revocation: str = "",
 ) -> str:
     escaped_app_name = html.escape(app_name)
     error_messages = {
@@ -149,13 +150,22 @@ def login_index(
         "expired": "로그인 요청이 만료되었어요. 네이버 로그인을 다시 시작해 주세요.",
         "not_configured": "네이버 로그인 설정이 아직 완료되지 않았습니다.",
         "provider_error": "네이버 로그인 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        "reauth_required": "계정 삭제 전 본인 확인을 위해 다시 로그인해 주세요.",
+        "account_mismatch": "계정 삭제를 요청한 네이버 계정과 다시 인증한 계정이 다릅니다.",
+        "account_deletion_pending": "이 계정은 삭제 처리 중입니다. 네이버 연결 철회가 끝난 뒤 새로 동의해 주세요.",
     }
     error_message = error_messages.get(error, "")
     alert_markup = (
         f'<div class="auth-alert" role="alert">{html.escape(error_message)}</div>'
         if error_message
         else (
-            '<div class="auth-alert auth-alert-success" role="status">계정과 네이버 연결 정보가 삭제되었습니다.</div>'
+            (
+                '<div class="auth-alert auth-alert-success" role="status">'
+                '공기밥 계정 접근이 차단되었고 네이버 연결 철회를 처리 중입니다.'
+                '</div>'
+                if provider_revocation == "pending"
+                else '<div class="auth-alert auth-alert-success" role="status">계정과 네이버 연결 정보가 삭제되었습니다.</div>'
+            )
             if account_deleted
             else ""
         )
@@ -416,7 +426,7 @@ def mypage_index(
       <div>
         <span class="mypage-eyebrow">ACCOUNT CONTROL</span>
         <h2 id="account-delete-title">계정 삭제</h2>
-        <p>네이버 연결 정보, 저장한 가게, 등록한 사진은 즉시 삭제됩니다. 작성한 리뷰는 작성자와 접속 식별값을 제거한 뒤 ‘탈퇴한 사용자’의 리뷰로 남습니다.</p>
+        <p>삭제를 확정하면 공기밥 접근과 모든 로그인 세션이 즉시 차단됩니다. 저장한 가게와 등록한 사진은 삭제되고, 네이버 연결 철회는 외부 서비스 상태에 따라 잠시 처리 중일 수 있습니다.</p>
         <p>리뷰 본문까지 삭제하려면 계정을 삭제하기 전에 위의 ‘리뷰 삭제’를 먼저 이용해 주세요. 백업 사본은 최대 30일 안에 순차 삭제됩니다.</p>
       </div>
       <form class="account-delete-form" action="/account/delete" method="post">
@@ -505,7 +515,8 @@ def privacy_index(app_name: str = "공기밥", contact_email: str = "") -> str:
     </section>
     <section><h2>2. 보유 및 파기</h2>
       <ul>
-        <li>계정과 네이버 연결 정보: 회원 탈퇴 시 즉시 삭제 또는 비식별화</li>
+        <li>계정 접근과 공기밥의 네이버 연결 정보: 회원 탈퇴 시 즉시 차단·삭제 또는 비식별화</li>
+        <li>네이버 측 서비스 연결: 회원 탈퇴와 동시에 철회를 요청하며, 일시 장애가 있으면 접근을 차단한 상태로 완료될 때까지 재시도</li>
         <li>저장한 가게와 등록한 음식 사진: 회원 탈퇴 시 즉시 삭제</li>
         <li>리뷰: 사용자가 삭제할 때까지 공개되며, 회원 탈퇴 시 작성자와 IP 식별값을 제거하여 익명화</li>
         <li>세션 쿠키: 로그인 후 최대 7일, OAuth 진행 쿠키: 최대 10분</li>
@@ -557,7 +568,7 @@ def terms_index(app_name: str = "공기밥", contact_email: str = "") -> str:
     <section><h2>2. 계정과 로그인</h2><p>네이버 인증이 완료되면 계정이 자동 생성됩니다. 이용자는 자신의 인증 수단을 안전하게 관리해야 하며, 타인의 계정을 사용하거나 서비스 운영을 방해해서는 안 됩니다.</p></section>
     <section><h2>3. 공공데이터와 서비스 정보</h2><p>음식점 방문 기록과 순위는 공개 자료를 수집·검증한 결과입니다. 원문 변경, 수집 시점, 외부 API 상태에 따라 실제 정보와 차이가 있을 수 있으므로 중요한 판단에는 원 출처를 함께 확인해 주세요.</p></section>
     <section><h2>4. 사용자 콘텐츠</h2><p>이용자는 자신이 작성한 리뷰와 등록한 사진에 대한 책임을 집니다. 사진은 직접 촬영했거나 게시 권한이 있고 다른 사람의 개인정보가 노출되지 않은 경우에만 등록할 수 있습니다. 불법 정보, 개인정보 침해, 명예훼손, 광고·스팸, 조작된 내용은 게시할 수 없습니다. 신고 또는 운영상 필요가 있으면 해당 콘텐츠를 숨기거나 삭제할 수 있습니다.</p></section>
-    <section><h2>5. 계정 삭제</h2><p>마이페이지에서 언제든 계정을 삭제할 수 있습니다. 네이버 연결 정보, 저장한 가게, 등록한 사진은 삭제되고, 공개 리뷰는 작성자 정보가 제거된 상태로 남습니다. 리뷰 본문까지 삭제하려면 탈퇴 전에 리뷰 삭제 기능을 이용해야 합니다.</p></section>
+    <section><h2>5. 계정 삭제</h2><p>마이페이지에서 언제든 계정을 삭제할 수 있습니다. 삭제 즉시 공기밥 접근과 세션이 차단되고 저장한 가게와 등록한 사진은 삭제됩니다. 네이버 연결 철회가 일시 장애로 지연되면 완료될 때까지 재시도하며, 공개 리뷰는 작성자 정보가 제거된 상태로 남습니다. 리뷰 본문까지 삭제하려면 탈퇴 전에 리뷰 삭제 기능을 이용해야 합니다.</p></section>
     <section><h2>6. 서비스 변경과 중단</h2><p>점검, 장애, 외부 서비스 변경, 천재지변 등으로 서비스 일부가 변경되거나 일시 중단될 수 있습니다. 중요한 변경은 가능한 범위에서 서비스 화면을 통해 안내합니다.</p></section>
     <section><h2>7. 책임의 범위</h2><p>고의 또는 중대한 과실이 없는 한 무료로 제공되는 정보의 최신성·완전성, 이용자의 선택 또는 외부 서비스 장애로 생긴 간접 손해를 보증하지 않습니다. 관계 법령에서 달리 정한 책임은 그 규정을 따릅니다.</p></section>
     <section><h2>8. 문의</h2><p>약관 및 서비스 문의 · {contact_markup}</p></section>
@@ -633,6 +644,7 @@ def admin_accounts_index(action_token: str) -> str:
             <option value="">전체 상태</option>
             <option value="active">활성</option>
             <option value="suspended">이용 정지</option>
+            <option value="deletion_pending">탈퇴 처리 중</option>
             <option value="deleted">탈퇴</option>
             <option value="merged">통합됨</option>
           </select>
