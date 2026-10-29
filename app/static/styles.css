@@ -2480,8 +2480,8 @@ button {
   top: 128px;
   height: auto;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  /* 방문 기록은 내용 높이로 두고, 아래 카드가 남는 높이를 채웁니다. */
-  grid-template-rows: max-content max-content minmax(max-content, 1fr) max-content;
+  /* 방문 기록은 내용 높이로 두고, 아래 두 줄이 남는 높이를 나눕니다. */
+  grid-template-rows: max-content max-content repeat(2, minmax(max-content, 1fr));
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -2972,7 +2972,6 @@ button {
 @media (min-width: 821px) {
   .detail-panel.detail-expanded .restaurant-photo-card,
   .detail-panel.detail-expanded .reviews {
-    align-self: start;
     min-height: 160px;
     overflow: visible;
   }
