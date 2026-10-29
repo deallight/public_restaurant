@@ -22,6 +22,7 @@ from database.migrations.m0006_oauth_lifecycle import VERSION as OAUTH_LIFECYCLE
 from database.migrations.m0007_oauth_lifecycle_hardening import (
     VERSION as OAUTH_LIFECYCLE_HARDENING_VERSION,
 )
+from database.migrations.m0008_notices import VERSION as NOTICES_VERSION
 from tests.postgres_test import postgres_test_url, reset_postgres_database
 
 
@@ -88,6 +89,22 @@ class PostgresIntegrationTests(unittest.TestCase):
                     (USER_INTERACTIONS_VERSION,),
                 ).fetchone()
             self.assertIsNotNone(migration)
+        finally:
+            self.db.initialize()
+
+    def test_existing_database_applies_notices_migration(self) -> None:
+        with self.db.session() as conn:
+            conn.execute("DROP TABLE IF EXISTS notices CASCADE")
+            conn.execute(
+                "DELETE FROM app_schema_migrations WHERE version = ?",
+                (NOTICES_VERSION,),
+            )
+        try:
+            issues = self.db.schema_issues()
+            self.assertTrue(any(NOTICES_VERSION in issue for issue in issues))
+            self.assertTrue(any("notices.id" in issue for issue in issues))
+            self.db.initialize()
+            self.assertEqual(self.db.schema_issues(), [])
         finally:
             self.db.initialize()
 

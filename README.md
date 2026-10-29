@@ -119,6 +119,7 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 - 로그인 사용자는 가게를 저장하거나 해제하고, 마이페이지에서 저장 가게와 본인 리뷰를 관리할 수 있습니다.
 - 외부 음식점 사진과 관리자 보관 사진은 공개하지 않으며 네이버 이미지 검색도 호출하지 않습니다. 로그인 사용자가 직접 등록하고 게시 권한을 확인한 음식 사진만 상세 화면에 표시합니다.
 - 상세 화면의 간단히 보기에는 사용자 사진을 최대 3장, 방문 정보 펼치기에는 2열로 표시합니다. 사진이 없으면 사진 등록 화면으로 이동하는 안내를 표시합니다.
+- 지도 상단의 공지사항에서 게시된 서비스 안내와 릴리즈 노트를 로그인 없이 확인할 수 있습니다.
 
 ### 사용자·인증
 
@@ -136,6 +137,7 @@ createdb -h /Users/deallight/develop/server_pc/.postgres/socket \
 - 검토: 후보 수정, 지오코딩, 신규 음식점 승인, 기존 음식점 병합, 반려를 처리합니다.
 - 문서: 수집 문서와 지출 행의 처리 상태를 조회합니다.
 - 사진: 관리자 업로드 파일을 추가·수정·삭제할 수 있습니다. 파일과 DB 정보는 보존하지만 현재 공개 화면에는 노출하지 않습니다.
+- 공지: 초안 작성, 게시·게시 취소, 복구 가능한 삭제·복원을 지원합니다. 게시 취소 후에만 본문을 수정할 수 있습니다.
 - 로그: 배치 이력, 외부 API 호출 결과, 실패 원인, 검증 진행 상태를 확인합니다.
 - 관리자 및 운영 경로는 서버에서 로그인과 `admin` 역할을 검사합니다.
 
@@ -331,6 +333,7 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `GET /`: 공개 지도
 - `GET /login`: 로그인
 - `GET /mypage`: 저장 가게·내 리뷰·계정 관리
+- `GET /notices`, `GET /notices/{id}`: 게시된 공지 목록·상세
 - `GET /privacy`: 개인정보처리방침
 - `GET /terms`: 이용약관
 
@@ -358,10 +361,16 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 - `/admin/parsing`: 파싱
 - `/admin/review`: 검토 작업판
 - `/admin/review/results`: 검증 결과 수정
+- `/admin/reviews`: 방문 후기·신고 관리 (숨김·복원·신고 기각)
 - `/admin/documents`: 문서 현황
 - `/admin/map-issues`: 지도 문제 항목
 - `/admin/photos`: 사진 관리
+- `/admin/notices`: 공지 관리 (`/admin/notices/new`, `/admin/notices/{id}`)
 - `/admin/logs`: 운영 로그
+
+방문 후기 관리 API는 `GET /admin/reviews/data`, `GET /admin/reviews/{id}`,
+`POST /admin/reviews/{id}/moderate`입니다. 모두 관리자 세션이 필요하며 변경 요청은
+CSRF 토큰과 1~500자의 처리 사유가 필요합니다. 실제 방문 인증은 제공하지 않습니다.
 
 ### 사용자 사진
 
@@ -391,6 +400,8 @@ curl -X POST http://127.0.0.1:8000/ops/verify-pending \
 ## PostgreSQL 스키마와 마이그레이션
 
 `app/schema.py`가 애플리케이션 데이터 모델의 기준입니다. 서버는 시작할 때 필수 테이블·컬럼·타입과 `app_schema_migrations`의 모든 필수 버전을 확인하고 불일치하면 중단합니다. 일반 서버 시작은 DDL을 자동 적용하지 않습니다.
+
+공지 기능은 `0008_notices` 마이그레이션이 필요합니다. 운영 DB에서는 아래 백업·검증 절차를 거친 뒤 적용합니다.
 
 마이그레이션 SQL 검토:
 

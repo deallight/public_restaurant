@@ -146,6 +146,8 @@ class RestaurantService:
         r"[0-9a-f]{32}\.(?:jpg|png|webp)"
     )
     REVIEW_BODY_MAX_LENGTH = 4_000
+    REPORT_RATE_LIMIT_PER_HOUR = 10
+    REPORT_REASONS = {"spam_or_abuse"}
 
     def __init__(
         self,
@@ -1238,15 +1240,8 @@ class RestaurantService:
                 ).fetchone()
                 if restaurant is None:
                     return {"status": "skipped", "reason": "restaurant_missing"}
-                review_count = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*) AS c
-                        FROM restaurant_reviews
-                        WHERE restaurant_id = ? AND status = 'visible'
-                        """,
-                        (restaurant_id,),
-                    ).fetchone()["c"]
+                review_count, source_reviews, source_hash = self._visible_review_snapshot(
+                    conn, restaurant_id
                 )
                 cached = conn.execute(
                     """
@@ -1260,19 +1255,10 @@ class RestaurantService:
                 if not self._ai_summary_is_due(row_to_dict(cached), review_count, now):
                     return {"status": "skipped", "reason": "threshold_or_cooldown"}
                 reviews = [
-                    dict(review)
-                    for review in conn.execute(
-                        """
-                        SELECT rating, body
-                        FROM restaurant_reviews
-                        WHERE restaurant_id = ? AND status = 'visible'
-                        ORDER BY created_at DESC, id DESC
-                        LIMIT ?
-                        """,
-                        (restaurant_id, self.AI_SUMMARY_MAX_SOURCE_REVIEWS),
-                    )
+                    {"rating": review["rating"], "body": review["body"]}
+                    for review in source_reviews
                 ]
-                attempted_at = now.isoformat(timespec="seconds")
+                attempted_at = now.isoformat(timespec="microseconds")
                 provider = str(getattr(self.ai_summary_client, "provider", "ai"))
                 model = str(getattr(self.ai_summary_client, "model", ""))
                 conn.execute(
@@ -1322,13 +1308,37 @@ class RestaurantService:
                         """
                         UPDATE restaurant_ai_summaries
                         SET status = 'error', updated_at = ?
-                        WHERE restaurant_id = ?
+                        WHERE restaurant_id = ? AND status = 'pending'
+                          AND last_attempted_at = ?
                         """,
-                        (attempted_at, restaurant_id),
+                        (attempted_at, restaurant_id, attempted_at),
                     )
                 return {"status": "error", "review_count": review_count}
             generated_at = self._ai_summary_current_time().isoformat(timespec="seconds")
             with self.database.session() as conn:
+                attempt = conn.execute(
+                    """
+                    SELECT restaurant_id FROM restaurant_ai_summaries
+                    WHERE restaurant_id = ? AND status = 'pending'
+                      AND last_attempted_at = ?
+                    FOR UPDATE
+                    """,
+                    (restaurant_id, attempted_at),
+                ).fetchone()
+                if attempt is None:
+                    return {"status": "skipped", "reason": "superseded"}
+                _, _, current_hash = self._visible_review_snapshot(conn, restaurant_id)
+                if current_hash != source_hash:
+                    conn.execute(
+                        """
+                        UPDATE restaurant_ai_summaries
+                        SET summary_text = '', summarized_review_count = 0,
+                            status = 'idle', updated_at = ?
+                        WHERE restaurant_id = ?
+                        """,
+                        (generated_at, restaurant_id),
+                    )
+                    return {"status": "skipped", "reason": "reviews_changed"}
                 conn.execute(
                     """
                     UPDATE restaurant_ai_summaries
@@ -1352,6 +1362,32 @@ class RestaurantService:
                 "review_count": review_count,
                 "summary_text": summary_text[:600],
             }
+
+    def _visible_review_snapshot(
+        self, conn: Any, restaurant_id: int
+    ) -> tuple[int, list[dict[str, Any]], str]:
+        """Capture the exact public review set used by an AI summary."""
+        count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM restaurant_reviews
+                WHERE restaurant_id = ? AND status = 'visible'
+                """,
+                (restaurant_id,),
+            ).fetchone()["c"]
+        )
+        reviews = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, rating, body FROM restaurant_reviews
+                WHERE restaurant_id = ? AND status = 'visible'
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (restaurant_id, self.AI_SUMMARY_MAX_SOURCE_REVIEWS),
+            )
+        ]
+        return count, reviews, stable_hash(count, reviews)
 
     def _record_api_call(
         self,
@@ -1580,20 +1616,46 @@ class RestaurantService:
         reason: str,
         context: RequestContext,
     ) -> dict[str, Any]:
-        if not reason:
-            raise AppError(400, "reason is required")
+        if not isinstance(reason, str) or reason not in self.REPORT_REASONS:
+            raise AppError(400, "invalid report reason")
+        reporter_ip_hash = stable_hash("ip", context.ip) if context.user_id is None else None
         with self.database.session() as conn:
-            if conn.execute("SELECT id FROM restaurant_reviews WHERE id = ?", (review_id,)).fetchone() is None:
+            review = conn.execute(
+                "SELECT id FROM restaurant_reviews WHERE id = ? AND status = 'visible' FOR UPDATE",
+                (review_id,),
+            ).fetchone()
+            if review is None:
                 raise AppError(404, "review not found")
+            identity_clause = (
+                "reporter_user_id = ?" if context.user_id is not None
+                else "reporter_user_id IS NULL AND reporter_ip_hash = ?"
+            )
+            identity = context.user_id if context.user_id is not None else reporter_ip_hash
+            if conn.execute(
+                f"SELECT id FROM review_reports WHERE review_id = ? AND status = 'open' "
+                f"AND {identity_clause} LIMIT 1",
+                (review_id, identity),
+            ).fetchone() is not None:
+                raise AppError(409, "review already reported")
+            recent_count = int(conn.execute(
+                f"""
+                SELECT COUNT(*) AS c FROM review_reports
+                WHERE {identity_clause}
+                  AND created_at >= datetime('now', '-1 hour')
+                """,
+                (identity,),
+            ).fetchone()["c"])
+            if recent_count >= self.REPORT_RATE_LIMIT_PER_HOUR:
+                raise AppError(429, "too many reports")
             cur = conn.execute(
                 """
                 INSERT INTO review_reports
                   (review_id, reason, reporter_user_id, reporter_ip_hash)
                 VALUES (?, ?, ?, ?)
                 """,
-                (review_id, reason, context.user_id, stable_hash("ip", context.ip)),
+                (review_id, reason, context.user_id, reporter_ip_hash),
             )
-            report = dict(conn.execute("SELECT * FROM review_reports WHERE id = ?", (cur.lastrowid,)).fetchone())
+            report = {"id": int(cur.lastrowid), "review_id": review_id, "status": "open"}
             self._audit(
                 conn,
                 "user",
@@ -1703,7 +1765,7 @@ class RestaurantService:
     def delete_own_review(self, user_id: int, review_id: int) -> dict[str, Any]:
         with self.database.session() as conn:
             review = conn.execute(
-                "SELECT * FROM restaurant_reviews WHERE id = ? AND user_id = ?",
+                "SELECT * FROM restaurant_reviews WHERE id = ? AND user_id = ? FOR UPDATE",
                 (review_id, user_id),
             ).fetchone()
             if review is None:
@@ -1723,6 +1785,13 @@ class RestaurantService:
             )
             conn.execute(
                 """
+                UPDATE review_reports SET status = 'resolved', resolved_at = ?
+                WHERE review_id = ? AND status = 'open'
+                """,
+                (utc_now(), review_id),
+            )
+            conn.execute(
+                """
                 UPDATE decision_audit_logs
                 SET before_json = '{}', after_json = '{}'
                 WHERE target_type = 'restaurant_review' AND target_id = ?
@@ -1732,7 +1801,7 @@ class RestaurantService:
             conn.execute(
                 """
                 UPDATE review_moderation_logs
-                SET before_json = '{}', after_json = '{}'
+                SET before_json = '{}', after_json = '{}', reason = NULL
                 WHERE review_id = ?
                 """,
                 (review_id,),
@@ -3603,16 +3672,199 @@ class RestaurantService:
             )
             return {"result": "rejected"}
 
+    # User review moderation is separate from the candidate verification queue.
+    def admin_reviews(
+        self, *, view: str = "open_reports", q: str = "", status: str = "all", page: int = 1
+    ) -> dict[str, Any]:
+        if view not in {"open_reports", "all"} or status not in {
+            "all", "visible", "hidden", "deleted"
+        }:
+            raise AppError(400, "invalid review filter")
+        if page < 1 or page > 100_000 or len(q) > 100:
+            raise AppError(400, "invalid review page or search")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if view == "open_reports":
+            clauses.append(
+                "EXISTS (SELECT 1 FROM review_reports rr "
+                "WHERE rr.review_id = rv.id AND rr.status = 'open')"
+            )
+        if status != "all":
+            clauses.append("rv.status = ?")
+            params.append(status)
+        if q.strip():
+            clauses.append(
+                "(POSITION(LOWER(?) IN LOWER(r.canonical_name)) > 0 "
+                "OR POSITION(LOWER(?) IN LOWER(rv.body)) > 0)"
+            )
+            params.extend((q.strip(), q.strip()))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.database.session() as conn:
+            total = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS c FROM restaurant_reviews rv
+                    JOIN restaurants r ON r.id = rv.restaurant_id {where_sql}
+                    """,
+                    tuple(params),
+                ).fetchone()["c"]
+            )
+            items = [dict(row) for row in conn.execute(
+                f"""
+                SELECT rv.id, rv.restaurant_id, r.canonical_name AS restaurant_name,
+                       rv.rating, LEFT(rv.body, 180) AS body_excerpt,
+                       rv.reviewer_label, rv.status, rv.created_at,
+                       (SELECT COUNT(*) FROM review_reports rr
+                        WHERE rr.review_id = rv.id AND rr.status = 'open') AS open_report_count
+                FROM restaurant_reviews rv
+                JOIN restaurants r ON r.id = rv.restaurant_id
+                {where_sql}
+                ORDER BY rv.created_at DESC, rv.id DESC
+                LIMIT 20 OFFSET ?
+                """,
+                (*params, (page - 1) * 20),
+            )]
+            counts = dict(conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE status = 'hidden') AS hidden,
+                       COUNT(*) FILTER (WHERE EXISTS (
+                           SELECT 1 FROM review_reports rr
+                           WHERE rr.review_id = rv.id AND rr.status = 'open'
+                       )) AS open_reports
+                FROM restaurant_reviews rv
+                """
+            ).fetchone())
+        return {"items": items, "total": total, "page": page, "page_size": 20, "counts": counts}
+
+    def admin_review_detail(self, review_id: int) -> dict[str, Any]:
+        with self.database.session() as conn:
+            review = conn.execute(
+                """
+                SELECT rv.id, rv.restaurant_id, r.canonical_name AS restaurant_name,
+                       rv.rating, rv.body, rv.reviewer_label, rv.status,
+                       rv.created_at, rv.updated_at
+                FROM restaurant_reviews rv
+                JOIN restaurants r ON r.id = rv.restaurant_id
+                WHERE rv.id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+            if review is None:
+                raise AppError(404, "review not found")
+            reports = [dict(row) for row in conn.execute(
+                """
+                SELECT id, reason, status, created_at, resolved_at
+                FROM review_reports WHERE review_id = ? ORDER BY created_at DESC, id DESC
+                """,
+                (review_id,),
+            )]
+            logs = []
+            for row in conn.execute(
+                """
+                SELECT id, action, moderator_id, reason, before_json, after_json, created_at
+                FROM review_moderation_logs WHERE review_id = ? ORDER BY id DESC
+                """,
+                (review_id,),
+            ):
+                before = (
+                    row["before_json"] if isinstance(row["before_json"], dict)
+                    else safe_json_loads(str(row["before_json"]), {})
+                )
+                after = (
+                    row["after_json"] if isinstance(row["after_json"], dict)
+                    else safe_json_loads(str(row["after_json"]), {})
+                )
+                logs.append({
+                    "id": row["id"], "action": row["action"],
+                    "moderator_id": row["moderator_id"], "reason": row["reason"],
+                    "before_status": before.get("status") if isinstance(before, dict) else None,
+                    "after_status": after.get("status") if isinstance(after, dict) else None,
+                    "created_at": row["created_at"],
+                })
+        return {"review": dict(review), "reports": reports, "moderation_logs": logs}
+
+    def moderate_review(
+        self, review_id: int, *, actor_user_id: int, action: str, reason: str
+    ) -> dict[str, Any]:
+        if not isinstance(action, str) or action not in {"hide", "restore", "dismiss_reports"}:
+            raise AppError(400, "invalid moderation action")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 500:
+            raise AppError(400, "moderation reason must be 1 to 500 characters")
+        with self.database.session() as conn:
+            review = conn.execute(
+                "SELECT id, restaurant_id, status FROM restaurant_reviews WHERE id = ? FOR UPDATE",
+                (review_id,),
+            ).fetchone()
+            if review is None:
+                raise AppError(404, "review not found")
+            before_status = str(review["status"])
+            expected_status = {"hide": "visible", "restore": "hidden"}.get(action)
+            if before_status not in {"visible", "hidden"} or (
+                expected_status and before_status != expected_status
+            ):
+                raise AppError(409, "review state changed")
+            report_ids = [int(row["id"]) for row in conn.execute(
+                "SELECT id FROM review_reports WHERE review_id = ? AND status = 'open' ORDER BY id FOR UPDATE",
+                (review_id,),
+            )]
+            if action == "dismiss_reports" and not report_ids:
+                raise AppError(409, "no open reports")
+            after_status = {"hide": "hidden", "restore": "visible"}.get(action, before_status)
+            now = utc_now()
+            if after_status != before_status:
+                conn.execute(
+                    "UPDATE restaurant_reviews SET status = ?, updated_at = ? WHERE id = ?",
+                    (after_status, now, review_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE restaurant_ai_summaries
+                    SET summary_text = '', summarized_review_count = 0, status = 'idle', updated_at = ?
+                    WHERE restaurant_id = ?
+                    """,
+                    (now, review["restaurant_id"]),
+                )
+            processed_report_ids = report_ids if action in {"hide", "dismiss_reports"} else []
+            if processed_report_ids:
+                report_status = "resolved" if action == "hide" else "dismissed"
+                conn.execute(
+                    """
+                    UPDATE review_reports SET status = ?, resolved_at = ?
+                    WHERE review_id = ? AND status = 'open'
+                    """,
+                    (report_status, now, review_id),
+                )
+            conn.execute(
+                """
+                INSERT INTO review_moderation_logs
+                  (review_id, action, moderator_id, reason, before_json, after_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id, action, str(actor_user_id), reason.strip(),
+                    safe_json_dumps({"status": before_status, "report_ids": processed_report_ids}),
+                    safe_json_dumps({"status": after_status, "report_ids": processed_report_ids}),
+                ),
+            )
+        return {
+            "review_id": review_id,
+            "status": after_status,
+            "processed_report_count": len(processed_report_ids),
+        }
+
     def review_reports(self) -> list[dict[str, Any]]:
         with self.database.session() as conn:
             return [
                 dict(row)
                 for row in conn.execute(
                     """
-                    SELECT rr.*, rv.restaurant_id, rv.body, rv.rating, rv.status AS review_status
+                    SELECT rr.id, rr.review_id, rr.reason, rr.status, rr.created_at,
+                           rr.resolved_at, rv.restaurant_id, rv.body, rv.rating,
+                           rv.status AS review_status
                     FROM review_reports rr
                     JOIN restaurant_reviews rv ON rv.id = rr.review_id
-                    ORDER BY rr.created_at DESC
+                    ORDER BY rr.created_at DESC, rr.id DESC LIMIT 100
                     """
                 )
             ]

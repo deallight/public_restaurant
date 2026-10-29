@@ -6,6 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.config import Settings
@@ -17,6 +18,7 @@ from app.http_server import (
     make_handler,
 )
 from app.worker import OperationWorker
+from app.services import AppError
 from http.server import ThreadingHTTPServer
 from tests.postgres_test import fresh_postgres_database, postgres_test_url
 
@@ -167,6 +169,189 @@ class HttpServerTests(unittest.TestCase):
         request = Request(f"{self.base_url}{path}", headers=headers or {})
         with urlopen(request, timeout=5) as response:
             return response.read().decode("utf-8")
+
+    def test_notice_publication_deletion_and_plain_text_security(self) -> None:
+        admin = self.session_headers("admin")
+        actor = self.app.session_user(admin["Cookie"].split("=", 1)[1])
+        self.assertIn('href="/notices"', self.get_text("/"))
+        self.assertIn("게시된 공지가 없습니다", self.get_text("/notices"))
+
+        title = "<script>공지</script>"
+        body = "첫 줄\n</textarea><script>alert(1)</script>"
+        status, created = self.post_json_response(
+            "/admin/notices", {"kind": "release", "title": title, "body": body}, admin
+        )
+        self.assertEqual(status, 201)
+        notice_id = created["id"]
+        self.assertEqual(created["status"], "draft")
+        self.assertNotIn(title, self.get_text("/notices"))
+        with self.assertRaises(HTTPError) as draft_error:
+            self.get_text(f"/notices/{notice_id}")
+        self.assertEqual(draft_error.exception.code, 404)
+        draft_error.exception.close()
+
+        editor = self.get_text(f"/admin/notices/{notice_id}", admin)
+        self.assertIn("&lt;/textarea&gt;&lt;script&gt;", editor)
+        self.assertNotIn(body, editor)
+        with self.assertRaises(HTTPError) as csrf_error:
+            self.post_json(
+                f"/admin/notices/{notice_id}/publish",
+                {"revision": 1},
+                {"Cookie": admin["Cookie"]},
+            )
+        self.assertEqual(csrf_error.exception.code, 403)
+        csrf_error.exception.close()
+
+        published = self.post_json(
+            f"/admin/notices/{notice_id}/publish", {"revision": 1}, admin
+        )
+        self.assertEqual(published["revision"], 2)
+        self.assertIn("&lt;script&gt;공지&lt;/script&gt;", self.get_text("/notices"))
+        detail = self.get_text(f"/notices/{notice_id}")
+        self.assertIn("&lt;/textarea&gt;&lt;script&gt;alert(1)&lt;/script&gt;", detail)
+        self.assertNotIn(body, detail)
+
+        with self.assertRaises(HTTPError) as published_edit_error:
+            self.post_json(
+                f"/admin/notices/{notice_id}/save",
+                {"revision": 2, "kind": "general", "title": "변경", "body": "본문"},
+                admin,
+            )
+        self.assertEqual(published_edit_error.exception.code, 409)
+        published_edit_error.exception.close()
+
+        unpublished = self.post_json(
+            f"/admin/notices/{notice_id}/unpublish", {"revision": 2}, admin
+        )
+        self.assertEqual(unpublished["status"], "draft")
+        with self.assertRaises(HTTPError) as unpublished_error:
+            self.get_text(f"/notices/{notice_id}")
+        self.assertEqual(unpublished_error.exception.code, 404)
+        unpublished_error.exception.close()
+
+        deleted = self.post_json(
+            f"/admin/notices/{notice_id}/delete",
+            {"revision": 3, "confirmation": "공지 삭제"},
+            admin,
+        )
+        self.assertTrue(deleted["deleted"])
+        self.assertNotIn(title, self.get_text("/admin/notices", admin))
+        self.assertIn("&lt;script&gt;공지&lt;/script&gt;", self.get_text("/admin/notices?deleted=1", admin))
+        restored = self.post_json(
+            f"/admin/notices/{notice_id}/restore", {"revision": 4}, admin
+        )
+        self.assertFalse(restored["deleted"])
+        self.assertEqual(restored["status"], "draft")
+        with self.assertRaises(HTTPError) as restored_error:
+            self.get_text(f"/notices/{notice_id}")
+        self.assertEqual(restored_error.exception.code, 404)
+        restored_error.exception.close()
+
+        with self.app.database.session() as conn:
+            audits = conn.execute(
+                "SELECT actor_id, action, before_json, after_json FROM decision_audit_logs "
+                "WHERE target_type = 'notice' AND target_id = ? ORDER BY id",
+                (notice_id,),
+            ).fetchall()
+        self.assertEqual(len(audits), 5)
+        self.assertTrue(all(row["actor_id"] == str(actor["id"]) for row in audits))
+        self.assertNotIn(body, json.dumps(audits, ensure_ascii=False))
+
+    def test_notice_permissions_validation_and_stale_revision(self) -> None:
+        admin = self.session_headers("admin")
+        user = self.session_headers("user")
+        for headers, code in [({}, 401), (user, 403)]:
+            with self.assertRaises(HTTPError) as read_error:
+                self.get_text("/admin/notices", headers)
+            self.assertEqual(read_error.exception.code, code)
+            read_error.exception.close()
+            with self.assertRaises(HTTPError) as write_error:
+                self.post_json(
+                    "/admin/notices",
+                    {"kind": "general", "title": "제목", "body": "본문"},
+                    headers,
+                )
+            self.assertEqual(write_error.exception.code, code)
+            write_error.exception.close()
+
+        for payload in [
+            {"kind": "invalid", "title": "제목", "body": "본문"},
+            {"kind": "general", "title": " ", "body": "본문"},
+            {"kind": "general", "title": "제목", "body": "x" * 10_001},
+            {"kind": "general", "title": "제\x00목", "body": "본문"},
+            {"kind": ["general"], "title": "제목", "body": "본문"},
+            ["not", "an", "object"],
+        ]:
+            with self.assertRaises(HTTPError) as invalid_error:
+                self.post_json("/admin/notices", payload, admin)
+            self.assertEqual(invalid_error.exception.code, 400)
+            invalid_error.exception.close()
+
+        created = self.post_json(
+            "/admin/notices", {"kind": "general", "title": "초안", "body": "본문"}, admin
+        )
+        notice_id = created["id"]
+        saved = self.post_json(
+            f"/admin/notices/{notice_id}/save",
+            {"revision": 1, "kind": "general", "title": "수정", "body": "본문"},
+            admin,
+        )
+        self.assertEqual(saved["revision"], 2)
+        with self.assertRaises(HTTPError) as bad_revision_error:
+            self.post_json(
+                f"/admin/notices/{notice_id}/publish", {"revision": {"invalid": True}}, admin
+            )
+        self.assertEqual(bad_revision_error.exception.code, 400)
+        bad_revision_error.exception.close()
+        with self.assertRaises(HTTPError) as stale_error:
+            self.post_json(
+                f"/admin/notices/{notice_id}/publish", {"revision": 1}, admin
+            )
+        self.assertEqual(stale_error.exception.code, 409)
+        stale_error.exception.close()
+        with self.assertRaises(HTTPError) as confirmation_error:
+            self.post_json(
+                f"/admin/notices/{notice_id}/delete",
+                {"revision": 2, "confirmation": "삭제"},
+                admin,
+            )
+        self.assertEqual(confirmation_error.exception.code, 400)
+        confirmation_error.exception.close()
+
+        actor_id = int(self.app.session_user(admin["Cookie"].split("=", 1)[1])["id"])
+        with self.app.database.session() as conn:
+            conn.execute("UPDATE users SET role = 'user' WHERE id = ?", (actor_id,))
+        with self.assertRaises(AppError) as revoked_error:
+            self.app.notice_service.transition(actor_id, notice_id, 2, "publish")
+        self.assertEqual(revoked_error.exception.status, 403)
+
+    def test_notice_browser_form_and_security_headers(self) -> None:
+        admin = self.session_headers("admin")
+        created = self.post_json(
+            "/admin/notices", {"kind": "general", "title": "초안", "body": "첫 본문"}, admin
+        )
+        notice_id = created["id"]
+        editor = self.get_text(f"/admin/notices/{notice_id}", admin)
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', editor)
+        self.assertIsNotNone(csrf)
+        form = urlencode(
+            {"kind": "general", "title": "수정한 초안", "body": "둘째 본문",
+             "revision": "1", "csrf_token": csrf.group(1)}
+        ).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/admin/notices/{notice_id}/save",
+            data=form,
+            method="POST",
+            headers={"Cookie": admin["Cookie"], "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn("수정한 초안", response.read().decode("utf-8"))
+
+        for path, headers in [("/notices", {}), (f"/admin/notices/{notice_id}", admin)]:
+            with urlopen(Request(f"{self.base_url}{path}", headers=headers), timeout=5) as response:
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                self.assertIn("script-src 'none'", response.headers["Content-Security-Policy"])
 
     def test_public_admin_and_ops_api(self) -> None:
         admin_headers = self.session_headers("admin")
@@ -824,6 +1009,66 @@ class HttpServerTests(unittest.TestCase):
             _trusted_proxy_client_ip("127.0.0.1", "not-an-ip"),
             "127.0.0.1",
         )
+
+    def test_admin_review_page_requires_admin_and_csrf(self) -> None:
+        with self.assertRaises(HTTPError) as anonymous:
+            self.get_text("/admin/reviews")
+        self.assertEqual(anonymous.exception.code, 401)
+        anonymous.exception.close()
+        member = self.session_headers("user")
+        with self.assertRaises(HTTPError) as forbidden:
+            self.get_json("/admin/reviews/data", member)
+        self.assertEqual(forbidden.exception.code, 403)
+        forbidden.exception.close()
+
+        admin = self.session_headers("admin")
+        self.post_json("/ops/run-daily", headers=admin)
+        restaurant_id = int(self.get_json("/api/map/restaurants")["restaurants"][0]["id"])
+        review = self.post_json(
+            f"/api/restaurants/{restaurant_id}/reviews",
+            {"rating": 5, "body": "<script>악성 후기</script>",
+             "reviewer_label": "방문자", "ai_processing_consent": True},
+            {"X-Real-IP": "203.0.113.120"},
+        )
+        review_id = int(review["id"])
+        report = self.post_json(
+            f"/api/reviews/{review_id}/report", {"reason": "spam_or_abuse"},
+            {"X-Real-IP": "203.0.113.121"},
+        )
+        self.assertEqual(set(report), {"id", "review_id", "status"})
+        page = self.get_text("/admin/reviews", admin)
+        self.assertIn("방문 후기 관리", page)
+        self.assertIn("/static/admin_reviews.js", page)
+        items = self.get_json("/admin/reviews/data", admin)
+        self.assertEqual(items["total"], 1)
+        detail = self.get_json(f"/admin/reviews/{review_id}", admin)
+        self.assertEqual(detail["review"]["body"], "<script>악성 후기</script>")
+        self.assertNotIn("reporter_ip_hash", detail["reports"][0])
+        script = self.get_text("/static/admin_reviews.js")
+        self.assertIn("reviewEscape(review.body)", script)
+
+        with self.assertRaises(HTTPError) as member_action:
+            self.post_json(
+                f"/admin/reviews/{review_id}/moderate",
+                {"action": "hide", "reason": "권한 없음"}, member,
+            )
+        self.assertEqual(member_action.exception.code, 403)
+        member_action.exception.close()
+
+        no_csrf = {"Cookie": admin["Cookie"]}
+        with self.assertRaises(HTTPError) as csrf_error:
+            self.post_json(
+                f"/admin/reviews/{review_id}/moderate",
+                {"action": "hide", "reason": "위반"}, no_csrf,
+            )
+        self.assertEqual(csrf_error.exception.code, 403)
+        csrf_error.exception.close()
+        hidden = self.post_json(
+            f"/admin/reviews/{review_id}/moderate",
+            {"action": "hide", "reason": "위반"}, admin,
+        )
+        self.assertEqual(hidden["status"], "hidden")
+        self.assertEqual(self.get_json("/admin/reviews/data", admin)["total"], 0)
 
 
 if __name__ == "__main__":

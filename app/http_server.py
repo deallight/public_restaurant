@@ -40,6 +40,7 @@ from .pipeline import (
     DailyPipeline,
 )
 from .operation_jobs import ACTIVE_JOB_STATUSES, OperationJobQueue
+from .notices import NoticeService
 from .oauth_security import OAuthTokenCipher, verify_naver_disconnect_payload
 from .progress import VerificationProgressStore
 from .services import AppError, RequestContext, RestaurantService
@@ -50,6 +51,7 @@ from .views import (
     admin_documents_index,
     admin_index,
     admin_review_index,
+    admin_reviews_index,
     admin_restaurant_images_index,
     admin_workflow_index,
     map_issues_index,
@@ -60,6 +62,11 @@ from .views import (
     restaurant_photo_upload_index,
     privacy_index,
     terms_index,
+    notices_index,
+    notice_detail_index,
+    admin_notices_index,
+    admin_notice_editor_index,
+    notice_error_index,
 )
 
 
@@ -171,6 +178,7 @@ class PublicRestaurantApplication:
             oauth_subject_hmac_secret=settings.oauth_subject_hmac_secret,
             naver_login_client=self.naver_login_client,
         )
+        self.notice_service = NoticeService(self.database)
         self.verification_progress = VerificationProgressStore()
         self.operation_jobs = OperationJobQueue(self.database)
         # Development without an explicit key uses a process-local secret so it
@@ -641,6 +649,15 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                             current_user=self._current_user(),
                         )
                     )
+                elif path == "/notices":
+                    page = int(query.get("page", "1"))
+                    self._html(notices_index(app.notice_service.public_list(page)), strict_notice_policy=True)
+                elif path.startswith("/notices/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 2:
+                        raise AppError(404, "not found")
+                    notice = app.notice_service.public_detail(int(parts[1]))
+                    self._html(notice_detail_index(notice), strict_notice_policy=True)
                 elif path == "/login":
                     return_to = self._safe_return_to(str(query.get("return_to", "/")))
                     self._html(
@@ -710,6 +727,21 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                         )
                 elif path in {"/admin", "/admin/dashboard"}:
                     self._html(admin_index())
+                elif path == "/admin/notices":
+                    actor = self._admin_user()
+                    page = int(query.get("page", "1"))
+                    deleted = query.get("deleted") == "1"
+                    data = app.notice_service.admin_list(int(actor["id"]), deleted=deleted, page=page)
+                    self._html(admin_notices_index(data, deleted=deleted), strict_notice_policy=True)
+                elif path == "/admin/notices/new":
+                    self._html(admin_notice_editor_index(), strict_notice_policy=True)
+                elif path.startswith("/admin/notices/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 3:
+                        raise AppError(404, "not found")
+                    actor = self._admin_user()
+                    notice = app.notice_service.admin_detail(int(actor["id"]), int(parts[2]))
+                    self._html(admin_notice_editor_index(notice), strict_notice_policy=True)
                 elif path == "/admin/accounts":
                     session_token = self._cookies().get(SESSION_COOKIE, "")
                     self._html(
@@ -740,6 +772,22 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                     self._html(admin_workflow_index("review"))
                 elif path in {"/admin/review/results", "/admin/review/queue"}:
                     self._html(admin_review_index())
+                elif path == "/admin/reviews":
+                    self._html(admin_reviews_index())
+                elif path == "/admin/reviews/data":
+                    self._json(
+                        app.service.admin_reviews(
+                            view=str(query.get("view", "open_reports")),
+                            q=str(query.get("q", "")),
+                            status=str(query.get("status", "all")),
+                            page=int(query.get("page", "1")),
+                        )
+                    )
+                elif path.startswith("/admin/reviews/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 3:
+                        raise AppError(404, "not found")
+                    self._json(app.service.admin_review_detail(int(parts[2])))
                 elif path == "/admin/map-issues":
                     self._html(map_issues_index())
                 elif path == "/admin/logs":
@@ -952,9 +1000,29 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 if self._is_admin_route(path):
                     self._admin_user()
                 payload = self._payload()
+                if (
+                    path.startswith("/admin/notices")
+                    or path.startswith("/admin/reviews/")
+                ) and not isinstance(payload, dict):
+                    raise AppError(400, "invalid admin request")
                 self._require_session_csrf(payload)
                 context = self._context(payload)
-                if path == "/ops/run-daily":
+                if path == "/admin/notices" or path.startswith("/admin/notices/"):
+                    self._notice_post(path, payload)
+                elif path.startswith("/admin/reviews/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4 or parts[3] != "moderate":
+                        raise AppError(404, "not found")
+                    actor = self._admin_user()
+                    self._json(
+                        app.service.moderate_review(
+                            int(parts[2]),
+                            actor_user_id=int(actor["id"]),
+                            action=payload.get("action", ""),
+                            reason=payload.get("reason", ""),
+                        )
+                    )
+                elif path == "/ops/run-daily":
                     self._json(app.run_daily(), status=201)
                 elif path == "/ops/run-busan-live":
                     self._json(
@@ -1414,7 +1482,10 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 else:
                     raise AppError(404, "not found")
             except AppError as exc:
-                self._error(exc.status, exc.message)
+                if path.startswith("/admin/notices") and not self._notice_wants_json():
+                    self._html(notice_error_index(exc.message), status=exc.status, strict_notice_policy=True)
+                else:
+                    self._error(exc.status, exc.message)
             except ValueError:
                 self._error(400, "invalid request")
             except Exception as exc:  # pragma: no cover - server guard
@@ -1766,6 +1837,59 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
         def _query(self, raw_query: str) -> dict[str, str]:
             return {key: values[-1] for key, values in parse_qs(raw_query).items()}
 
+        def _notice_post(self, path: str, payload: dict) -> None:
+            actor_user_id = int(self._admin_user()["id"])
+            if path == "/admin/notices":
+                notice = app.notice_service.create(
+                    actor_user_id,
+                    kind=payload.get("kind", ""),
+                    title=payload.get("title", ""),
+                    body=payload.get("body", ""),
+                )
+                status = HTTPStatus.CREATED
+            else:
+                parts = path.strip("/").split("/")
+                if len(parts) != 4 or parts[:2] != ["admin", "notices"]:
+                    raise AppError(404, "not found")
+                notice_id = int(parts[2])
+                action = parts[3]
+                raw_revision = payload.get("revision", 0)
+                if isinstance(raw_revision, bool):
+                    raise AppError(400, "invalid notice revision")
+                try:
+                    revision = int(raw_revision)
+                except (TypeError, ValueError) as exc:
+                    raise AppError(400, "invalid notice revision") from exc
+                if action == "save":
+                    notice = app.notice_service.update(
+                        actor_user_id,
+                        notice_id,
+                        revision,
+                        kind=payload.get("kind", ""),
+                        title=payload.get("title", ""),
+                        body=payload.get("body", ""),
+                    )
+                else:
+                    if action == "delete" and str(payload.get("confirmation", "")).strip() != "공지 삭제":
+                        raise AppError(400, "notice deletion confirmation is required")
+                    notice = app.notice_service.transition(actor_user_id, notice_id, revision, action)
+                status = HTTPStatus.OK
+            if self._notice_wants_json():
+                self._json(
+                    {
+                        "id": int(notice["id"]),
+                        "revision": int(notice["revision"]),
+                        "status": notice["status"],
+                        "deleted": notice["deleted_at"] is not None,
+                    },
+                    status=status,
+                )
+            else:
+                self._redirect(f'/admin/notices/{int(notice["id"])}')
+
+        def _notice_wants_json(self) -> bool:
+            return self._wants_json() or self.headers.get("Content-Type", "").startswith("application/json")
+
         def _payload(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length == 0:
@@ -1948,7 +2072,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _html(self, payload: str, status: int = 200) -> None:
+        def _html(self, payload: str, status: int = 200, *, strict_notice_policy: bool = False) -> None:
             session_token = self._cookies().get(SESSION_COOKIE, "")
             if self._current_user() is not None:
                 csrf_token = app.session_codec.issue_action_token(
@@ -1972,7 +2096,7 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
                 )
             body = payload.encode("utf-8")
             self.send_response(status)
-            self._security_headers()
+            self._security_headers(strict_notice_policy=strict_notice_policy)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
@@ -1994,10 +2118,15 @@ def make_handler(app: PublicRestaurantApplication) -> type[BaseHTTPRequestHandle
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _security_headers(self) -> None:
+        def _security_headers(self, *, strict_notice_policy: bool = False) -> None:
             self.send_header(
                 "Content-Security-Policy",
-                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+                (
+                    "default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self'; "
+                    "form-action 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+                    if strict_notice_policy else
+                    "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+                ),
             )
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("X-Content-Type-Options", "nosniff")

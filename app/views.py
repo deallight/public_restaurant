@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 
 def public_index(
@@ -93,6 +94,7 @@ def public_index(
               </svg>
             </button>
           </form>
+          <a class="notice-top-link" href="/notices"><span class="notice-top-full">공지사항</span><span class="notice-top-short">공지</span></a>
           {account_markup}
         </div>
         <div id="filter-index" class="filter-index" aria-label="필터 선택">
@@ -133,6 +135,167 @@ def public_index(
   <script src="/static/app.js"></script>
 </body>
 </html>"""
+
+
+# Notice pages keep all authored text as escaped plain text.
+def _notice_date(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        local = datetime.fromisoformat(str(value)).astimezone(ZoneInfo("Asia/Seoul"))
+        return local.strftime("%Y.%m.%d %H:%M")
+    except ValueError:
+        return ""
+
+
+def _notice_kind(kind: str) -> str:
+    return "릴리즈 노트" if kind == "release" else "일반 공지"
+
+
+def _notice_page(title: str, content: str, *, admin: bool = False) -> str:
+    back_link = (
+        '<a href="/admin/notices">공지 관리</a>'
+        if admin else '<a href="/">지도로 돌아가기</a>'
+    )
+    brand_link = "/admin" if admin else "/"
+    brand_label = "관리자 대시보드" if admin else "공기밥"
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)} | 공기밥</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="notice-page">
+  <header class="notice-header">
+    <a class="notice-brand" href="{brand_link}">{brand_label}</a>{back_link}
+  </header>
+  <main class="notice-shell">{content}</main>
+</body>
+</html>"""
+
+
+def notices_index(data: dict) -> str:
+    items = data["items"]
+    rows = "".join(
+        f'<li><a href="/notices/{int(item["id"])}">'
+        f'<span class="notice-kind">{_notice_kind(str(item["kind"]))}</span>'
+        f'<strong>{html.escape(str(item["title"]))}</strong>'
+        f'<time>{_notice_date(item["published_at"])}</time></a></li>'
+        for item in items
+    )
+    if not rows:
+        rows = '<li class="notice-empty">게시된 공지가 없습니다.</li>'
+    page = int(data["page"])
+    previous = f'<a href="/notices?page={page - 1}">이전</a>' if page > 1 else ""
+    following = f'<a href="/notices?page={page + 1}">다음</a>' if data["has_next"] else ""
+    content = f"""<h1>공지사항</h1>
+    <p class="notice-intro">공기밥의 서비스 안내와 릴리즈 노트를 확인하세요.</p>
+    <ul class="notice-list">{rows}</ul>
+    <nav class="notice-pagination" aria-label="공지 목록 페이지">{previous}{following}</nav>"""
+    return _notice_page("공지사항", content)
+
+
+def notice_detail_index(notice: dict) -> str:
+    content = f"""<article class="notice-article">
+      <span class="notice-kind">{_notice_kind(str(notice["kind"]))}</span>
+      <h1>{html.escape(str(notice["title"]))}</h1>
+      <time>{_notice_date(notice["published_at"])}</time>
+      <div class="notice-body">{html.escape(str(notice["body"]))}</div>
+      <a class="notice-back" href="/notices">← 공지 목록</a>
+    </article>"""
+    return _notice_page(str(notice["title"]), content)
+
+
+# Administrator pages use ordinary forms so notice content is never inserted by JavaScript.
+def admin_notices_index(data: dict, *, deleted: bool) -> str:
+    rows = "".join(
+        f'<li><a href="/admin/notices/{int(item["id"])}">'
+        f'<span class="notice-kind">{_notice_kind(str(item["kind"]))}</span>'
+        f'<strong>{html.escape(str(item["title"]))}</strong>'
+        f'<span>{"삭제됨" if deleted else "게시됨" if item["status"] == "published" else "초안"}</span>'
+        f'<time>{_notice_date(item["deleted_at"] or item["updated_at"])}</time></a></li>'
+        for item in data["items"]
+    ) or '<li class="notice-empty">해당하는 공지가 없습니다.</li>'
+    page = int(data["page"])
+    base = "/admin/notices?deleted=1&page=" if deleted else "/admin/notices?page="
+    previous = f'<a href="{base}{page - 1}">이전</a>' if page > 1 else ""
+    following = f'<a href="{base}{page + 1}">다음</a>' if data["has_next"] else ""
+    content = f"""<h1>공지 관리</h1>
+    <p class="notice-intro">초안 작성 후 게시하면 공개됩니다.</p>
+    <div class="notice-admin-actions">
+      <a href="/admin/notices/new">새 공지 작성</a>
+      <a href="/admin/notices">전체 목록</a>
+      <a href="/admin/notices?deleted=1">삭제된 공지</a>
+    </div>
+    <ul class="notice-list">{rows}</ul>
+    <nav class="notice-pagination" aria-label="관리자 공지 목록 페이지">{previous}{following}</nav>"""
+    return _notice_page("공지 관리", content, admin=True)
+
+
+def admin_notice_editor_index(notice: dict | None = None) -> str:
+    notice_id = int(notice["id"]) if notice else None
+    deleted = bool(notice and notice["deleted_at"])
+    status = str(notice["status"]) if notice else "draft"
+    revision = int(notice["revision"]) if notice else 0
+    action = f"/admin/notices/{notice_id}/save" if notice else "/admin/notices"
+    kind = str(notice["kind"]) if notice else "general"
+    title = html.escape(str(notice["title"]) if notice else "", quote=True)
+    body = html.escape(str(notice["body"]) if notice else "")
+    form = ""
+    if not deleted and status == "draft":
+        form = f"""<form class="notice-editor-form" action="{action}" method="post">
+          <input type="hidden" name="revision" value="{revision}">
+          <label>유형<select name="kind" required>
+            <option value="general" {"selected" if kind == "general" else ""}>일반 공지</option>
+            <option value="release" {"selected" if kind == "release" else ""}>릴리즈 노트</option>
+          </select></label>
+          <label>제목<input name="title" maxlength="120" value="{title}" required></label>
+          <label>본문<textarea name="body" maxlength="10000" rows="16" required>{body}</textarea></label>
+          <button type="submit">초안 저장</button>
+        </form>"""
+    elif notice:
+        form = f"""<div class="notice-readonly">
+          <span class="notice-kind">{_notice_kind(kind)}</span>
+          <h2>{title}</h2><div class="notice-body">{body}</div>
+        </div>"""
+    controls = ""
+    if notice:
+        if deleted:
+            next_actions = ["restore"]
+        elif status == "published":
+            next_actions = ["unpublish", "delete"]
+        else:
+            next_actions = ["publish", "delete"]
+        labels = {"publish": "게시", "unpublish": "게시 취소", "delete": "삭제", "restore": "복원"}
+        forms = []
+        for step in next_actions:
+            confirmation = (
+                '<label>삭제 확인<input name="confirmation" placeholder="공지 삭제" required></label>'
+                if step == "delete" else ""
+            )
+            forms.append(
+                f'<form action="/admin/notices/{notice_id}/{step}" method="post">'
+                f'<input type="hidden" name="revision" value="{revision}">'
+                f'{confirmation}<button type="submit">{labels[step]}</button></form>'
+            )
+        controls = "".join(forms)
+    heading = "새 공지 작성" if notice is None else "공지 편집"
+    state = "삭제됨" if deleted else "게시됨" if status == "published" else "초안"
+    content = f"""<h1>{heading}</h1>
+      <p class="notice-intro">상태: {state}. 게시된 글은 게시 취소 후 수정할 수 있습니다.</p>
+      {form}<div class="notice-editor-actions">{controls}</div>"""
+    return _notice_page(heading, content, admin=True)
+
+
+def notice_error_index(message: str) -> str:
+    content = (
+        '<h1>요청을 처리하지 못했습니다</h1>'
+        f'<p>{html.escape(message)}</p>'
+        '<a href="/admin/notices">공지 관리로 돌아가기</a>'
+    )
+    return _notice_page("공지 처리 오류", content, admin=True)
 
 
 def login_index(
@@ -273,7 +436,7 @@ def mypage_index(
 
     review_status_labels = {
         "visible": "공개 중",
-        "hidden": "검토 중",
+        "hidden": "비공개",
     }
     review_cards = "\n".join(
         f"""<article class="mypage-card review-card" data-review-card>
@@ -602,9 +765,11 @@ def admin_accounts_index(action_token: str) -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a class="active" href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -695,9 +860,11 @@ def admin_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -848,9 +1015,11 @@ def admin_restaurant_images_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a class="active" href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1129,9 +1298,11 @@ def admin_workflow_index(mode: str = "collection") -> str:
         <a__ACTIVE_COLLECTION__ href="/admin/collection">수집</a>
         <a__ACTIVE_PARSING__ href="/admin/parsing">파싱</a>
         <a__ACTIVE_REVIEW__ href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1248,9 +1419,11 @@ def admin_review_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1271,13 +1444,72 @@ def admin_review_index() -> str:
     <section class="manual-review-section">
       <h2>승인·수동검토·반려 항목 <small id="review-queue-summary"></small></h2>
       <div id="review-queue" class="admin-list"></div>
-      <section class="review-reports-section">
-        <h2>리뷰 신고</h2>
-        <div id="review-reports" class="admin-list"></div>
-      </section>
+      <p><a class="button-link secondary" href="/admin/reviews">방문 후기·신고 관리</a></p>
     </section>
   </main>
   <script src="/static/admin.js"></script>
+</body>
+</html>"""
+
+
+def admin_reviews_index() -> str:
+    """Administrator page for user reviews and reports."""
+    return """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>방문 후기 관리 | 관리자</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="admin-shell review-admin-shell">
+    <header class="dashboard-header">
+      <a class="dashboard-brand" href="/admin">관리자 대시보드</a>
+      <nav class="dashboard-nav" aria-label="관리자 메뉴">
+        <a href="/">운영 맵</a>
+        <a href="/admin">대시보드</a>
+        <a href="/admin/collection">수집</a>
+        <a href="/admin/parsing">파싱</a>
+        <a href="/admin/review">검토</a>
+        <a class="active" href="/admin/reviews">방문 후기</a>
+        <a href="/admin/documents">문서</a>
+        <a href="/admin/photos">사진</a>
+        <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
+        <a href="/admin/logs">로그</a>
+      </nav>
+    </header>
+    <section class="review-admin-head">
+      <span class="dashboard-eyebrow">사용자 콘텐츠</span>
+      <h1>방문 후기 관리</h1>
+      <p>신고를 검토하고 후기 공개 상태를 관리합니다. 실제 방문 인증 여부를 판단하는 화면은 아닙니다.</p>
+    </section>
+    <section class="review-admin-board" aria-label="후기 목록">
+      <div class="review-admin-tabs" role="group" aria-label="후기 목록 종류">
+        <button type="button" data-view="open_reports" aria-pressed="true">신고 대기 <span id="review-open-count">0</span></button>
+        <button type="button" data-view="all" aria-pressed="false">전체 후기 <span id="review-all-count">0</span></button>
+      </div>
+      <form id="review-admin-search" class="review-admin-filters">
+        <label>음식점명·후기 검색 <input id="review-query" type="search" maxlength="100"></label>
+        <label>공개 상태 <select id="review-status">
+          <option value="all">전체</option><option value="visible">공개</option>
+          <option value="hidden">비공개</option><option value="deleted">삭제</option>
+        </select></label>
+        <button type="submit">검색</button>
+      </form>
+      <p id="review-list-summary" role="status"></p>
+      <div id="review-admin-list" class="review-admin-list"></div>
+      <nav class="review-admin-pages" aria-label="후기 목록 페이지">
+        <button id="review-page-prev" type="button">이전</button>
+        <span id="review-page-label">1 / 1</span>
+        <button id="review-page-next" type="button">다음</button>
+      </nav>
+    </section>
+    <section id="review-admin-detail" class="review-admin-detail" aria-label="선택한 후기" hidden></section>
+    <p id="review-admin-message" role="status" aria-live="polite"></p>
+  </main>
+  <script src="/static/admin_reviews.js" defer></script>
 </body>
 </html>"""
 
@@ -1301,9 +1533,11 @@ def map_issues_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a class="active" href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1340,9 +1574,11 @@ def ops_logs_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a class="active" href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1406,9 +1642,11 @@ def admin_documents_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>
@@ -1521,9 +1759,11 @@ def admin_document_detail_index() -> str:
         <a href="/admin/collection">수집</a>
         <a href="/admin/parsing">파싱</a>
         <a href="/admin/review">검토</a>
+        <a href="/admin/reviews">방문 후기</a>
         <a class="active" href="/admin/documents">문서</a>
         <a href="/admin/photos">사진</a>
         <a href="/admin/accounts">계정</a>
+        <a href="/admin/notices">공지</a>
         <a href="/admin/logs">로그</a>
       </nav>
     </header>

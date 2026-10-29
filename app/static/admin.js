@@ -574,18 +574,6 @@ async function loadReviewQueue() {
   });
 }
 
-async function loadReports() {
-  const payload = await fetchJson("/admin/review-reports");
-  const node = document.querySelector("#review-reports");
-  node.innerHTML = payload.reports.map((item) => `
-    <article class="admin-item">
-      <strong>리뷰 #${item.review_id}</strong>
-      <p>${escapeHtml(item.reason)} · ${escapeHtml(item.body)}</p>
-      <small>${escapeHtml(item.status)}</small>
-    </article>
-  `).join("") || "<p class=\"empty\">신고가 없습니다.</p>";
-}
-
 function renderBatchResult(payload, label) {
   const node = document.querySelector("#batch-status");
   const summary = payload.summary || {};
@@ -931,7 +919,6 @@ const initialLoads = [];
 if (document.querySelector("#source-groups")) initialLoads.push(loadSources());
 if (document.querySelector("#verification-status")) initialLoads.push(loadVerificationStatus());
 if (document.querySelector("#review-queue")) initialLoads.push(loadReviewQueue());
-if (document.querySelector("#review-reports")) initialLoads.push(loadReports());
 if (document.querySelector("#collection-progress")) initialLoads.push(loadCollectionProgress());
 Promise.all(initialLoads).catch((error) => {
   const node = document.querySelector("#review-queue");

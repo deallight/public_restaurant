@@ -29,6 +29,10 @@ from database.migrations.m0006_oauth_lifecycle import (
     STATEMENTS as OAUTH_LIFECYCLE_STATEMENTS,
     VERSION as OAUTH_LIFECYCLE_VERSION,
 )
+from database.migrations.m0008_notices import (
+    STATEMENTS as NOTICES_STATEMENTS,
+    VERSION as NOTICES_VERSION,
+)
 
 
 class DatabaseCompatibilityTests(unittest.TestCase):
@@ -123,6 +127,18 @@ class DatabaseCompatibilityTests(unittest.TestCase):
             OAUTH_LIFECYCLE_VERSION,
             {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
         )
+
+    def test_notices_are_an_explicit_additive_migration(self) -> None:
+        ddl = "\n".join(NOTICES_STATEMENTS)
+        self.assertIn("CREATE TABLE IF NOT EXISTS notices", ddl)
+        self.assertIn("idx_notices_public", ddl)
+        self.assertNotRegex(ddl, r"(?im)^\s*(DROP|TRUNCATE|DELETE|ALTER)\b")
+        self.assertIn(
+            NOTICES_VERSION,
+            {version for version, _description, _statements in REQUIRED_POSTGRES_MIGRATIONS},
+        )
+        signature = expected_schema_signature(postgres_schema_statements())
+        self.assertEqual(signature["notices"]["revision"], "integer")
 
     def test_all_environments_require_postgres(self) -> None:
         with patch.dict(os.environ, {"APP_ENV": "production", "DATABASE_URL": ""}, clear=True):

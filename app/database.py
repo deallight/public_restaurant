@@ -35,6 +35,11 @@ from database.migrations.m0007_oauth_lifecycle_hardening import (
     STATEMENTS as OAUTH_LIFECYCLE_HARDENING_STATEMENTS,
     VERSION as OAUTH_LIFECYCLE_HARDENING_VERSION,
 )
+from database.migrations.m0008_notices import (
+    DESCRIPTION as NOTICES_DESCRIPTION,
+    STATEMENTS as NOTICES_STATEMENTS,
+    VERSION as NOTICES_VERSION,
+)
 
 from .db_compat import connect_postgres
 from .schema import APP_SCHEMA
@@ -43,6 +48,7 @@ from .utils import safe_json_dumps, utc_now
 
 
 APP_TABLES = [
+    "notices",
     "oauth_disconnect_events",
     "oauth_lifecycle_jobs",
     "oauth_flow_intents",
@@ -109,6 +115,7 @@ REQUIRED_POSTGRES_MIGRATIONS = (
         OAUTH_LIFECYCLE_HARDENING_DESCRIPTION,
         OAUTH_LIFECYCLE_HARDENING_STATEMENTS,
     ),
+    (NOTICES_VERSION, NOTICES_DESCRIPTION, NOTICES_STATEMENTS),
 )
 
 

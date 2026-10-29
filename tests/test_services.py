@@ -1355,6 +1355,120 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(report["status"], "open")
         self.assertEqual(len(self.service.review_reports()), 1)
 
+    def test_admin_review_moderation_and_author_deletion_close_reports(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        account = self.service.upsert_oauth_account("naver", "review-moderation-author", "작성자")
+        author_id = int(account["user"]["id"])
+        review = self.service.add_review(
+            restaurant_id, 4, "관리 대상 방문 후기", "작성자",
+            RequestContext(user_id=author_id, ip="203.0.113.40"),
+        )
+        review_id = int(review["id"])
+        report = self.service.report_review(review_id, "spam_or_abuse", RequestContext(ip="203.0.113.41"))
+        self.assertEqual(set(report), {"id", "review_id", "status"})
+        self.assertEqual(self.service.admin_reviews()["total"], 1)
+        self.assertEqual(self.service.admin_reviews(q="관리 대상", view="all")["total"], 1)
+        with self.db.session() as conn:
+            conn.execute(
+                """
+                INSERT INTO restaurant_ai_summaries
+                  (restaurant_id, summary_text, summarized_review_count, status)
+                VALUES (?, '관리 대상 후기를 포함한 요약', 5, 'ready')
+                """,
+                (restaurant_id,),
+            )
+
+        hidden = self.service.moderate_review(review_id, actor_user_id=77, action="hide", reason="광고성 내용")
+        self.assertEqual(hidden["status"], "hidden")
+        self.assertEqual(hidden["processed_report_count"], 1)
+        self.assertEqual(self.service.admin_reviews()["total"], 0)
+        self.assertEqual(self.service.get_restaurant(restaurant_id)["review_count"], 0)
+        self.assertEqual(self.service.get_restaurant(restaurant_id)["ai_summary"]["text"], "")
+        self.assertEqual(self.service.my_page(author_id)["reviews"][0]["status"], "hidden")
+        detail = self.service.admin_review_detail(review_id)
+        self.assertEqual(detail["reports"][0]["status"], "resolved")
+        self.assertEqual(detail["moderation_logs"][0]["moderator_id"], "77")
+        self.assertNotIn("reporter_ip_hash", detail["reports"][0])
+        with self.assertRaises(AppError) as repeated:
+            self.service.moderate_review(review_id, actor_user_id=77, action="hide", reason="반복")
+        self.assertEqual(repeated.exception.status, 409)
+        with self.assertRaises(AppError) as hidden_report:
+            self.service.report_review(review_id, "spam_or_abuse", RequestContext(ip="203.0.113.42"))
+        self.assertEqual(hidden_report.exception.status, 404)
+
+        self.service.moderate_review(review_id, actor_user_id=77, action="restore", reason="재검토 완료")
+        self.assertEqual(self.service.get_restaurant(restaurant_id)["review_count"], 1)
+        self.assertEqual(self.service.admin_review_detail(review_id)["reports"][0]["status"], "resolved")
+        self.service.report_review(review_id, "spam_or_abuse", RequestContext(ip="203.0.113.42"))
+        self.service.moderate_review(review_id, actor_user_id=77, action="dismiss_reports", reason="위반 없음")
+        self.assertEqual(self.service.admin_review_detail(review_id)["reports"][0]["status"], "dismissed")
+        self.service.report_review(review_id, "spam_or_abuse", RequestContext(ip="203.0.113.43"))
+        self.service.delete_own_review(author_id, review_id)
+        self.assertEqual(self.service.admin_reviews()["total"], 0)
+        self.assertEqual(self.service.admin_review_detail(review_id)["review"]["body"], "")
+        self.assertTrue(all(item["status"] != "open" for item in self.service.admin_review_detail(review_id)["reports"]))
+        self.assertTrue(all(item["reason"] is None for item in self.service.admin_review_detail(review_id)["moderation_logs"]))
+        with self.assertRaises(AppError) as deleted_restore:
+            self.service.moderate_review(review_id, actor_user_id=77, action="restore", reason="복원")
+        self.assertEqual(deleted_restore.exception.status, 409)
+
+    def test_review_report_duplicate_reason_and_hourly_limit(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        reviews = [
+            self.service.add_review(
+                restaurant_id, 5, f"신고 제한 후기 {index}", "방문자",
+                RequestContext(ip=f"203.0.113.{index + 60}"),
+            )
+            for index in range(11)
+        ]
+        reporter = RequestContext(ip="203.0.113.90")
+        with self.assertRaises(AppError) as bad_reason:
+            self.service.report_review(int(reviews[0]["id"]), "arbitrary", reporter)
+        self.assertEqual(bad_reason.exception.status, 400)
+        for review in reviews[:10]:
+            self.service.report_review(int(review["id"]), "spam_or_abuse", reporter)
+        with self.assertRaises(AppError) as duplicate:
+            self.service.report_review(int(reviews[0]["id"]), "spam_or_abuse", reporter)
+        self.assertEqual(duplicate.exception.status, 409)
+        with self.assertRaises(AppError) as limited:
+            self.service.report_review(int(reviews[10]["id"]), "spam_or_abuse", reporter)
+        self.assertEqual(limited.exception.status, 429)
+
+    def test_admin_review_listing_filters_and_pages(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        for index in range(21):
+            self.service.add_review(
+                restaurant_id, 4, f"페이지 확인 후기 {index}", "방문자",
+                RequestContext(ip=f"203.0.113.{index + 130}"),
+            )
+        first = self.service.admin_reviews(view="all", page=1)
+        second = self.service.admin_reviews(view="all", page=2)
+        self.assertEqual(first["total"], 21)
+        self.assertEqual(len(first["items"]), 20)
+        self.assertEqual(len(second["items"]), 1)
+        self.assertEqual(self.service.admin_reviews(view="all", q="후기 20")["total"], 1)
+        self.assertEqual(self.service.admin_reviews(view="all", status="hidden")["total"], 0)
+
+    def test_ai_summary_discards_review_hidden_during_generation(self) -> None:
+        restaurant_id = int(self.service.list_map_restaurants()[0]["id"])
+        review_ids = [int(self.service.add_review(
+            restaurant_id, 5, f"요약 대상 후기 {index}", "방문자",
+            RequestContext(ip=f"203.0.113.{index + 100}"),
+        )["id"]) for index in range(5)]
+
+        class HidingClient:
+            provider = "fake"
+            model = "hiding-client"
+
+            def summarize(self, _name, _reviews):
+                service.moderate_review(review_ids[0], actor_user_id=77, action="hide", reason="검토")
+                return "숨긴 후기 내용이 포함된 요약"
+
+        service = RestaurantService(self.db, ai_summary_client=HidingClient())
+        result = service.maybe_refresh_ai_summary(restaurant_id)
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(service.get_restaurant(restaurant_id)["ai_summary"]["text"], "")
+
     def test_restaurant_detail_counts_visible_reviews_by_user(self) -> None:
         restaurant_ids = [
             int(item["id"])
