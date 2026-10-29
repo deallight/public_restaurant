@@ -2477,8 +2477,11 @@ button {
 }
 
 .detail-panel.detail-expanded {
+  /* 내용 높이에 맞추고 화면보다 길면 패널 안에서 스크롤합니다. */
   top: 128px;
+  bottom: auto;
   height: auto;
+  max-height: calc(100% - 144px);
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   /* 방문 기록 행은 창 높이가 아니라 내용 높이에 맞춥니다. */
   grid-template-rows: repeat(4, max-content);
