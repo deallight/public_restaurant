@@ -2480,7 +2480,8 @@ button {
   top: 128px;
   height: auto;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-rows: auto auto max-content max-content;
+  /* 방문 기록 행은 창 높이가 아니라 내용 높이에 맞춥니다. */
+  grid-template-rows: repeat(4, max-content);
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
